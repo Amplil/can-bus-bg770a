@@ -132,10 +132,15 @@ bool WioCAN::receive(unsigned long* id, unsigned char* buf) {
 }
 
 void WioCAN::debugMode() {
+  String inputBuffer = "";
   while(Serial.available()) {
-    canSerial->write(Serial.read());
+    char inkey = Serial.read();
+    inputBuffer += inkey;
+    canSerial->write(inkey);
   }
-  
+  if (inputBuffer.length()) {
+    Serial.println(inputBuffer);
+  }
   while(canSerial->available()) {
     Serial.write(canSerial->read());
   }

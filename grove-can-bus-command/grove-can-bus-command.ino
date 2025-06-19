@@ -58,13 +58,6 @@ void loop() {
   // Example: Request engine RPM every 5 seconds using OBD-II
   static unsigned long lastSend = 0;
   static int sendInterval=5000;
-  //static unsigned long lastCommand = 0; // 最後にコマンド確認をした時間
-  //static int commandInterval=100;
-
-  while (Serial.available() > 0) {
-    char inkey = Serial.read();
-    Serial.print(inkey);
-  }
   
   if(millis() - lastSend > sendInterval) {
     // OBD-II request for Engine RPM (PID 0x0C)
@@ -103,7 +96,7 @@ void loop() {
   }
   // Optional: Enable debug mode by sending commands through Serial monitor
   // Uncomment the following line to enable debug mode
-  //can.debugMode();
+  can.debugMode();
 
   delay( 100 );
 

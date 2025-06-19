@@ -88,6 +88,16 @@ bool WioCAN::send(unsigned long id, unsigned char ext, unsigned char rtr, unsign
   return true;
 }
 
+void WioCAN::sendPid(unsigned char __pid) {
+    unsigned char tmp[8] = {0x02, 0x01, __pid, 0, 0, 0, 0, 0};
+    
+#if STANDARD_CAN_11BIT
+    this->send(CAN_ID_PID, 0, 0, 8, tmp);   // SEND TO ID:0X55
+#else
+    this->send(CAN_ID_PID, 1, 0, 8, tmp);   // SEND TO ID:0X55
+#endif
+}
+
 bool WioCAN::receive(unsigned long* id, unsigned char* buf) {
   if(!canSerial->available()) {
     return false;
@@ -137,6 +147,27 @@ void WioCAN::debugMode() {
     char inkey = Serial.read();
     inputBuffer += inkey;
     canSerial->write(inkey);
+  }
+  if (inputBuffer.length()) {
+    Serial.println(inputBuffer);
+  }
+  while(canSerial->available()) {
+    Serial.write(canSerial->read());
+  }
+}
+
+void WioCAN::debugPID() {
+  String inputBuffer = "";
+  while(Serial.available()) {
+    char inkey = Serial.read();
+    inputBuffer += inkey;
+  }
+  if (inputBuffer.length() > 2 && inputBuffer.startsWith("0x")) {
+    //inputBuffer.remove(0, 2); // Remove the "0x" prefix
+    String pidStr = inputBuffer.substring(2); // "0x"以降を取得
+    sendPid(strtol(pidStr.c_str(), nullptr, 16));
+    Serial.print("Sent PID: ");
+    Serial.println(strtol(pidStr.c_str(), nullptr, 16));
   }
   if (inputBuffer.length()) {
     Serial.println(inputBuffer);

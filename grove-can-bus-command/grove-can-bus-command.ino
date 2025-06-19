@@ -58,13 +58,14 @@ void loop() {
   // Example: Request engine RPM every 5 seconds using OBD-II
   static unsigned long lastSend = 0;
   static int sendInterval=5000;
+  unsigned char cmd=PID_ENGIN_PRM;
   
   if(millis() - lastSend > sendInterval) {
     // OBD-II request for Engine RPM (PID 0x0C)
-    // Format: [Number of additional bytes, Mode, PID, unused bytes...]
-    unsigned char rpmRequest[8] = {0x02, 0x01, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00};
-    can.send(0x7DF, 0, 0, 8, rpmRequest);  // 0x7DF is broadcast request ID
-    Serial.println("Sent OBD-II Engine RPM request (PID: 0x0C)");
+    can.sendPid(cmd);
+    Serial.print("Sent OBD-II Engine RPM request (PID: 0x");
+    Serial.print(cmd, HEX);
+    Serial.println(")");
     lastSend = millis();
   }
   
@@ -96,7 +97,8 @@ void loop() {
   }
   // Optional: Enable debug mode by sending commands through Serial monitor
   // Uncomment the following line to enable debug mode
-  can.debugMode();
+  //can.debugMode();
+  can.debugPID();
 
   delay( 100 );
 

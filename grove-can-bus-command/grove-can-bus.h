@@ -28,6 +28,18 @@
 #define CAN_RATE_666    17
 #define CAN_RATE_1000   18
 
+#define STANDARD_CAN_11BIT      1       // That depands on your car. some 1 some 0. 
+
+#define PID_ENGIN_PRM       0x0C
+#define PID_VEHICLE_SPEED   0x0D
+#define PID_COOLANT_TEMP    0x05
+
+#if STANDARD_CAN_11BIT
+#define CAN_ID_PID          0x7DF
+#else
+#define CAN_ID_PID          0x18db33f1
+#endif
+
 // CAN Module class for Grove CAN BUS Module based on GD32E103
 class WioCAN {
 private:
@@ -43,8 +55,10 @@ public:
   void begin();
   bool setCanRate(unsigned char rate);
   bool send(unsigned long id, unsigned char ext, unsigned char rtr, unsigned char len, const unsigned char* buf);
+  void sendPid(unsigned char __pid);
   bool receive(unsigned long* id, unsigned char* buf);
   void debugMode();
+  void debugPID();
 };
 
 #endif // WIOCAN_H

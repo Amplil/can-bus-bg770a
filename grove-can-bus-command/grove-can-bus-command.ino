@@ -45,12 +45,14 @@ void setup() {
   delay(1000);
   // Initialize CAN module
   can.begin();
+  /*
   // Set CAN bus rate to 500kbps (commonly used)
   if(can.setCanRate(CAN_RATE_500)) {
     Serial.println("CAN bus rate set to 500kbps: OK");
   } else {
     Serial.println("CAN bus rate set to 500kbps: FAILED");
   }
+  */
   digitalWrite(LED_BUILTIN, LOW);
 }
 

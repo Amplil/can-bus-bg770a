@@ -59,6 +59,8 @@ public:
   bool receive(unsigned long* id, unsigned char* buf);
   void debugMode();
   void debugPID();
+  bool setMask(uint8_t n, uint8_t ext, unsigned long value);
+  bool setFilt(uint8_t n, uint8_t ext, unsigned long value);
 };
 
 #endif // WIOCAN_H

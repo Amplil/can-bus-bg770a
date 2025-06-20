@@ -52,6 +52,15 @@ void setup() {
   } else {
     Serial.println("CAN bus rate set to 500kbps: FAILED");
   }
+
+  // --- set mask and filter (standard frame) ---
+  // Mask0: 0x7FC, Mask1: 0x7FC
+  can.setMask(0, 0, 0x000007FC); // Mask0, standard
+  can.setMask(1, 0, 0x000007FC); // Mask1, standard
+  // Filt0-5: 0x7E8 (ECU response ID)
+  for (int i = 0; i < 6; ++i) {
+    can.setFilt(i, 0, 0x000007E8); // FiltN, standard
+  }
   */
   digitalWrite(LED_BUILTIN, LOW);
 }

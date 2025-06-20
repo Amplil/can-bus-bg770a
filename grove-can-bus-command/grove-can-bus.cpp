@@ -176,3 +176,20 @@ void WioCAN::debugPID() {
     Serial.write(canSerial->read());
   }
 }
+
+bool WioCAN::setMask(uint8_t n, uint8_t ext, unsigned long value) {
+  enterConfigMode();
+  // valueは8桁の16進数で送る必要がある
+  sprintf(tempBuffer, "AT+M=%d%d%08lX\r\n", n, ext, value);
+  bool ret = sendCommand(tempBuffer);
+  exitConfigMode();
+  return ret;
+}
+
+bool WioCAN::setFilt(uint8_t n, uint8_t ext, unsigned long value) {
+  enterConfigMode();
+  sprintf(tempBuffer, "AT+F=%d%d%08lX\r\n", n, ext, value);
+  bool ret = sendCommand(tempBuffer);
+  exitConfigMode();
+  return ret;
+}

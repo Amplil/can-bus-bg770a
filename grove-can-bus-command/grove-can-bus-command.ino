@@ -45,7 +45,6 @@ void setup() {
   delay(1000);
   // Initialize CAN module
   can.begin();
-  /*
   // Set CAN bus rate to 500kbps (commonly used)
   if(can.setCanRate(CAN_RATE_500)) {
     Serial.println("CAN bus rate set to 500kbps: OK");
@@ -55,8 +54,47 @@ void setup() {
 
   // --- set mask and filter (standard frame) ---
   // Mask0: 0x7FC, Mask1: 0x7FC
-  can.setMask(0, 0, 0x000007FC); // Mask0, standard
-  can.setMask(1, 0, 0x000007FC); // Mask1, standard
+  if (can.setMask(0, 0, 0x00000000)) {
+    Serial.println("Mask0 set: OK");
+  } else {
+    Serial.println("Mask0 set: FAILED");
+  }
+  if (can.setMask(1, 0, 0x00000000)) {
+    Serial.println("Mask1 set: OK");
+  } else {
+    Serial.println("Mask1 set: FAILED");
+  }
+  if (can.setMask(2, 0, 0x00000000)) {
+    Serial.println("Mask2 set: OK");
+  } else {
+    Serial.println("Mask2 set: FAILED");
+  }
+  if (can.setMask(3, 0, 0x00000000)) {
+    Serial.println("Mask3 set: OK");
+  } else {
+    Serial.println("Mask3 set: FAILED");
+  }
+  if (can.setMask(4, 0, 0x00000000)) {
+    Serial.println("Mask4 set: OK");
+  } else {
+    Serial.println("Mask4 set: FAILED");
+  }
+  if (can.setMask(5, 0, 0x00000000)) {
+    Serial.println("Mask5 set: OK");
+  } else {
+    Serial.println("Mask5 set: FAILED");
+  }
+  if (can.setMask(6, 0, 0x00000000)) {
+    Serial.println("Mask6 set: OK");
+  } else {
+    Serial.println("Mask6 set: FAILED");
+  }
+  if (can.setMask(7, 0, 0x00000000)) {
+    Serial.println("Mask7 set: OK");
+  } else {
+    Serial.println("Mask7 set: FAILED");
+  }
+  /*
   // Filt0-5: 0x7E8 (ECU response ID)
   for (int i = 0; i < 6; ++i) {
     can.setFilt(i, 0, 0x000007E8); // FiltN, standard

@@ -64,6 +64,7 @@ void setup() {
   } else {
     Serial.println("Mask1 set: FAILED");
   }
+  /*
   if (can.setMask(2, 0, 0x00000000)) {
     Serial.println("Mask2 set: OK");
   } else {
@@ -94,6 +95,49 @@ void setup() {
   } else {
     Serial.println("Mask7 set: FAILED");
   }
+  */
+  if (can.setFilt(0, 0, 0x00000000)) {
+    Serial.println("Filt0 set: OK");
+  } else {
+    Serial.println("Filt0 set: FAILED");
+  }
+  if (can.setFilt(1, 0, 0x00000000)) {
+    Serial.println("Filt1 set: OK");
+  } else {
+    Serial.println("Filt1 set: FAILED");
+  }
+  if (can.setFilt(2, 0, 0x00000000)) {
+    Serial.println("Filt2 set: OK");
+  } else {
+    Serial.println("Filt2 set: FAILED");
+  }
+  if (can.setFilt(3, 0, 0x00000000)) {
+    Serial.println("Filt3 set: OK");
+  } else {
+    Serial.println("Filt3 set: FAILED");
+  }
+  if (can.setFilt(4, 0, 0x00000000)) {
+    Serial.println("Filt4 set: OK");
+  } else {
+    Serial.println("Filt4 set: FAILED");
+  }
+  if (can.setFilt(5, 0, 0x00000000)) {
+    Serial.println("Filt5 set: OK");
+  } else {
+    Serial.println("Filt5 set: FAILED");
+  }
+  /*
+  if (can.setFilt(6, 0, 0x00000000)) {
+    Serial.println("Filt6 set: OK");
+  } else {
+    Serial.println("Filt6 set: FAILED");
+  }
+  if (can.setFilt(7, 0, 0x00000000)) {
+    Serial.println("Filt7 set: OK");
+  } else {
+    Serial.println("Filt7 set: FAILED");
+  }
+  */
   /*
   // Filt0-5: 0x7E8 (ECU response ID)
   for (int i = 0; i < 6; ++i) {

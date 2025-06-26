@@ -55,11 +55,7 @@ void WioCAN::begin() {
 
 bool WioCAN::setCanRate(unsigned char rate) {
   enterConfigMode();
-  if(rate < 10) {
-    sprintf(tempBuffer, "AT+C=0%d\r\n", rate);
-  } else {
-    sprintf(tempBuffer, "AT+C=%d\r\n", rate);
-  }
+  sprintf(tempBuffer, "AT+C=%d\r\n", rate);
   
   bool ret = sendCommand(tempBuffer);
   exitConfigMode();
@@ -112,7 +108,7 @@ bool WioCAN::receive(unsigned long* id, unsigned char* buf) {
       data[len++] = canSerial->read();
       if(len == 12) break;
       
-      if((millis() - timer_s) > 10) {
+      if((millis() - timer_s) > 100) {
         canSerial->flush();
         return false;
       }
@@ -134,7 +130,7 @@ bool WioCAN::receive(unsigned long* id, unsigned char* buf) {
       return true;
     }
     
-    if((millis() - timer_s) > 10) {
+    if((millis() - timer_s) > 100) {
       canSerial->flush();
       return false;
     }

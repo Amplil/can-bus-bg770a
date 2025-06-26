@@ -53,97 +53,49 @@ void setup() {
   }
 
   // --- set mask and filter (standard frame) ---
-  // Mask0: 0x7FC, Mask1: 0x7FC
-  if (can.setMask(0, 0, 0x00000000)) {
+  // Mask設定: 0x7F8でOBD-II応答範囲（0x7E8-0x7EF）をカバー
+  if (can.setMask(0, 0, 0x000007F8)) {
     Serial.println("Mask0 set: OK");
   } else {
     Serial.println("Mask0 set: FAILED");
   }
-  if (can.setMask(1, 0, 0x00000000)) {
+  if (can.setMask(1, 0, 0x000007F8)) {
     Serial.println("Mask1 set: OK");
   } else {
     Serial.println("Mask1 set: FAILED");
   }
-  /*
-  if (can.setMask(2, 0, 0x00000000)) {
-    Serial.println("Mask2 set: OK");
-  } else {
-    Serial.println("Mask2 set: FAILED");
-  }
-  if (can.setMask(3, 0, 0x00000000)) {
-    Serial.println("Mask3 set: OK");
-  } else {
-    Serial.println("Mask3 set: FAILED");
-  }
-  if (can.setMask(4, 0, 0x00000000)) {
-    Serial.println("Mask4 set: OK");
-  } else {
-    Serial.println("Mask4 set: FAILED");
-  }
-  if (can.setMask(5, 0, 0x00000000)) {
-    Serial.println("Mask5 set: OK");
-  } else {
-    Serial.println("Mask5 set: FAILED");
-  }
-  if (can.setMask(6, 0, 0x00000000)) {
-    Serial.println("Mask6 set: OK");
-  } else {
-    Serial.println("Mask6 set: FAILED");
-  }
-  if (can.setMask(7, 0, 0x00000000)) {
-    Serial.println("Mask7 set: OK");
-  } else {
-    Serial.println("Mask7 set: FAILED");
-  }
-  */
-  if (can.setFilt(0, 0, 0x00000000)) {
+  
+  // Filter設定: OBD-II応答ID（0x7E8-0x7EF）を受信
+  if (can.setFilt(0, 0, 0x000007E8)) {
     Serial.println("Filt0 set: OK");
   } else {
     Serial.println("Filt0 set: FAILED");
   }
-  if (can.setFilt(1, 0, 0x00000000)) {
+  if (can.setFilt(1, 0, 0x000007E9)) {
     Serial.println("Filt1 set: OK");
   } else {
     Serial.println("Filt1 set: FAILED");
   }
-  if (can.setFilt(2, 0, 0x00000000)) {
+  if (can.setFilt(2, 0, 0x000007EA)) {
     Serial.println("Filt2 set: OK");
   } else {
     Serial.println("Filt2 set: FAILED");
   }
-  if (can.setFilt(3, 0, 0x00000000)) {
+  if (can.setFilt(3, 0, 0x000007EB)) {
     Serial.println("Filt3 set: OK");
   } else {
     Serial.println("Filt3 set: FAILED");
   }
-  if (can.setFilt(4, 0, 0x00000000)) {
+  if (can.setFilt(4, 0, 0x000007EC)) {
     Serial.println("Filt4 set: OK");
   } else {
     Serial.println("Filt4 set: FAILED");
   }
-  if (can.setFilt(5, 0, 0x00000000)) {
+  if (can.setFilt(5, 0, 0x000007ED)) {
     Serial.println("Filt5 set: OK");
   } else {
     Serial.println("Filt5 set: FAILED");
   }
-  /*
-  if (can.setFilt(6, 0, 0x00000000)) {
-    Serial.println("Filt6 set: OK");
-  } else {
-    Serial.println("Filt6 set: FAILED");
-  }
-  if (can.setFilt(7, 0, 0x00000000)) {
-    Serial.println("Filt7 set: OK");
-  } else {
-    Serial.println("Filt7 set: FAILED");
-  }
-  */
-  /*
-  // Filt0-5: 0x7E8 (ECU response ID)
-  for (int i = 0; i < 6; ++i) {
-    can.setFilt(i, 0, 0x000007E8); // FiltN, standard
-  }
-  */
   digitalWrite(LED_BUILTIN, LOW);
 }
 
@@ -160,6 +112,13 @@ void loop() {
     Serial.print(cmd, HEX);
     Serial.println(")");
     lastSend = millis();
+  }
+  
+  // シリアルデータの状況をチェック
+  if(Serial1.available()) {
+    Serial.print("Serial1 data available: ");
+    Serial.print(Serial1.available());
+    Serial.println(" bytes");
   }
   
   // Listen for OBD-II responses (Engine RPM and other data)

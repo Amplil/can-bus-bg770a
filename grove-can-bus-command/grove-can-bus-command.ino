@@ -115,7 +115,6 @@ void loop() {
   static unsigned long lastSend = 0;
   static int sendInterval = 5000;
   unsigned char cmd = PID_ENGIN_PRM;
-  
   if(millis() - lastSend > sendInterval) {
     // OBD-II request for Engine RPM (PID 0x0C)
     can.sendPid(cmd);
@@ -124,7 +123,8 @@ void loop() {
     Serial.println(")");
     lastSend = millis();
   }
-  
+  /*
+
   // 統計情報の表示
   if(millis() - lastStatsTime > statsInterval) {
     Serial.println("=== CAN Bus Statistics ===");
@@ -142,7 +142,7 @@ void loop() {
     Serial.print(Serial1.available());
     Serial.println(" bytes");
   }
-  
+  */
   // すべてのCAN信号を受信・表示
   unsigned long id = 0;
   unsigned char data[8];
@@ -222,5 +222,5 @@ void loop() {
   //can.debugMode();
   can.debugPID();
 
-  delay(10); // より高頻度でチェック
+  delay(10);
 }

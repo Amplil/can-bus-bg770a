@@ -134,7 +134,7 @@ void setup() {
   JsonDoc["session_start"] = millis();
   JsonDoc["device_id"] = "WIO_BG770A_001";
   JsonDoc["can_messages"] = JsonArray();
-  JsonDoc["vehicle_data"] = JsonObject();
+  JsonDoc["vehicle_data"].to<JsonObject>();
   
   Serial.println();
   Serial.println("=== CAN Bus Initialization Complete ===");
@@ -186,6 +186,8 @@ void loop() {
     
     // タイムスタンプごとにJSONに蓄積
     addCANMessageToJSON(id, data, millis());
+    // OBD2データを車両データとしても記録
+    updateVehicleData(data[2], data, millis());
     
     // 受信メッセージの詳細表示
     Serial.print("[");
@@ -213,8 +215,6 @@ void loop() {
         Serial.print(" | PID: 0x");
         Serial.print(data[2], HEX);
         
-        // OBD2データを車両データとしても記録
-        updateVehicleData(data[2], data, millis());
         
         // 特定のPIDの解釈
         switch(data[2]) {
@@ -336,8 +336,19 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
 
 // 車両データを時系列で更新
 void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
-  JsonObject vehicleData = JsonDoc["vehicle_data"];
-  vehicleData["raw_data"]["data"] = data;
+  JsonObject vehicleData = JsonDoc["vehicle_data"].to<JsonObject>();
+  
+  // raw_data オブジェクトが存在しない場合は作成
+  if (!vehicleData["raw_data"].is<JsonObject>()) {
+    vehicleData["raw_data"].to<JsonObject>();
+  }
+  
+  JsonArray rawDataArray = vehicleData["raw_data"]["data"].to<JsonArray>();
+  // 既存のデータをクリア
+  rawDataArray.clear();
+  for(int i = 0; i < 8; i++) {
+    rawDataArray.add(data[i]);
+  }
   vehicleData["raw_data"]["pid"] = pid;
   vehicleData["raw_data"]["timestamp"] = timestamp;
 
@@ -345,55 +356,75 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
     case 0x0C: // Engine RPM
       if(data[0] >= 4) {
         unsigned int rpm = ((data[3] * 256) + data[4]) / 4;
-        vehicleData["engine_rpm"]["value"] = rpm;
-        vehicleData["engine_rpm"]["unit"] = "rpm";
-        vehicleData["engine_rpm"]["timestamp"] = timestamp;
+        JsonObject rpmObj = vehicleData["engine_rpm"].to<JsonObject>();
+        rpmObj["value"] = rpm;
+        rpmObj["unit"] = "rpm";
+        rpmObj["timestamp"] = timestamp;
       }
       break;
       
     case 0x0D: // Vehicle Speed
-      vehicleData["vehicle_speed"]["value"] = data[3];
-      vehicleData["vehicle_speed"]["unit"] = "km/h";
-      vehicleData["vehicle_speed"]["timestamp"] = timestamp;
+      {
+        JsonObject speedObj = vehicleData["vehicle_speed"].to<JsonObject>();
+        speedObj["value"] = data[3];
+        speedObj["unit"] = "km/h";
+        speedObj["timestamp"] = timestamp;
+      }
       break;
       
     case 0x05: // Coolant Temperature
-      vehicleData["coolant_temp"]["value"] = data[3] - 40;
-      vehicleData["coolant_temp"]["unit"] = "°C";
-      vehicleData["coolant_temp"]["timestamp"] = timestamp;
+      {
+        JsonObject coolantObj = vehicleData["coolant_temp"].to<JsonObject>();
+        coolantObj["value"] = data[3] - 40;
+        coolantObj["unit"] = "°C";
+        coolantObj["timestamp"] = timestamp;
+      }
       break;
       
     case 0x04: // Engine Load
-      vehicleData["engine_load"]["value"] = data[3] * 100.0 / 255.0;
-      vehicleData["engine_load"]["unit"] = "%";
-      vehicleData["engine_load"]["timestamp"] = timestamp;
+      {
+        JsonObject loadObj = vehicleData["engine_load"].to<JsonObject>();
+        loadObj["value"] = data[3] * 100.0 / 255.0;
+        loadObj["unit"] = "%";
+        loadObj["timestamp"] = timestamp;
+      }
       break;
       
     case 0x0F: // Intake Air Temperature
-      vehicleData["intake_air_temp"]["value"] = data[3] - 40;
-      vehicleData["intake_air_temp"]["unit"] = "°C";
-      vehicleData["intake_air_temp"]["timestamp"] = timestamp;
+      {
+        JsonObject intakeObj = vehicleData["intake_air_temp"].to<JsonObject>();
+        intakeObj["value"] = data[3] - 40;
+        intakeObj["unit"] = "°C";
+        intakeObj["timestamp"] = timestamp;
+      }
       break;
       
     case 0x11: // Throttle Position
-      vehicleData["throttle_position"]["value"] = data[3] * 100.0 / 255.0;
-      vehicleData["throttle_position"]["unit"] = "%";
-      vehicleData["throttle_position"]["timestamp"] = timestamp;
+      {
+        JsonObject throttleObj = vehicleData["throttle_position"].to<JsonObject>();
+        throttleObj["value"] = data[3] * 100.0 / 255.0;
+        throttleObj["unit"] = "%";
+        throttleObj["timestamp"] = timestamp;
+      }
       break;
       
     case 0x42: // Control Module Voltage
       if(data[0] >= 4) {
         float voltage = ((data[3] * 256) + data[4]) / 1000.0;
-        vehicleData["control_module_voltage"]["value"] = voltage;
-        vehicleData["control_module_voltage"]["unit"] = "V";
-        vehicleData["control_module_voltage"]["timestamp"] = timestamp;
+        JsonObject voltageObj = vehicleData["control_module_voltage"].to<JsonObject>();
+        voltageObj["value"] = voltage;
+        voltageObj["unit"] = "V";
+        voltageObj["timestamp"] = timestamp;
       }
       break;
       
     case 0x46: // Ambient Air Temperature
-      vehicleData["ambient_air_temp"]["value"] = data[3] - 40;
-      vehicleData["ambient_air_temp"]["unit"] = "°C";
-      vehicleData["ambient_air_temp"]["timestamp"] = timestamp;
+      {
+        JsonObject ambientObj = vehicleData["ambient_air_temp"].to<JsonObject>();
+        ambientObj["value"] = data[3] - 40;
+        ambientObj["unit"] = "°C";  
+        ambientObj["timestamp"] = timestamp;
+      }
       break;
   }
 }

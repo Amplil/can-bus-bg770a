@@ -8,7 +8,22 @@
 #include <Adafruit_TinyUSB.h>
 #include <csignal>
 #include <WioCellular.h>
-#include "grove-can-bus.h"
+#include <grove-can-bus.h>
+#include <Adafruit_TinyUSB.h>
+#include <csignal>
+#include <WioCellular.h>
+#include <ArduinoJson.h>
+
+#define SEARCH_ACCESS_TECHNOLOGY (WioCellularNetwork::SearchAccessTechnology::LTEM)  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
+#define LTEM_BAND (WioCellularNetwork::NTTDOCOMO_LTEM_BAND)        
+                  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
+static const char APN[] = "soracom.io";
+static const char HOST[] = "uni.soracom.io";
+static constexpr int PORT = 23080;
+static constexpr int POWER_ON_TIMEOUT = 1000 * 20;     // [ms]
+static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 3;  // [ms]
+static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // [ms]
+static JsonDocument JsonDoc;
 
 WioCAN can;
 
@@ -40,7 +55,27 @@ void setup() {
   Serial.println("=====================================");
 
   digitalWrite(LED_BUILTIN, HIGH);
+
+  // Network configuration
+  WioNetwork.config.searchAccessTechnology = SEARCH_ACCESS_TECHNOLOGY;
+  WioNetwork.config.ltemBand = LTEM_BAND;
+  WioNetwork.config.apn = APN;
+
   WioCellular.begin();
+  // Power on the cellular module
+  if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) abort();
+  WioNetwork.begin();
+
+  // Wait for communication available
+  if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) abort();
+  Serial.println("initialized");
+  {
+    const auto start = millis();
+    while (!Serial && millis() - start < 5000) {
+      delay(2);
+    }
+  }
+
   digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_ON);
   delay(1000);
   // Initialize CAN module
@@ -98,6 +133,12 @@ void setup() {
   }
   digitalWrite(LED_BUILTIN, LOW);
   
+  // Initialize JSON document structure
+  JsonDoc["session_start"] = millis();
+  JsonDoc["device_id"] = "WIO_BG770A_001";
+  JsonDoc["can_messages"] = JsonArray();
+  JsonDoc["vehicle_data"] = JsonObject();
+  
   Serial.println();
   Serial.println("=== CAN Bus Initialization Complete ===");
   Serial.println("Listening for ALL CAN messages...");
@@ -109,12 +150,14 @@ void loop() {
   // 統計情報用の変数
   static unsigned long totalMessages = 0;
   static unsigned long lastStatsTime = 0;
-  static unsigned long statsInterval = 10000; // 10秒ごとに統計表示
   
   // Example: Request engine RPM every 5 seconds using OBD-II
   static unsigned long lastSend = 0;
-  static int sendInterval = 5000;
+  static int sendInterval = 1000;
   unsigned char cmd = PID_ENGIN_PRM;
+  static unsigned long lastCellularSend = 0;
+  static int cellularSendInterval = 10000;
+
   if(millis() - lastSend > sendInterval) {
     // OBD-II request for Engine RPM (PID 0x0C)
     can.sendPid(cmd);
@@ -123,31 +166,14 @@ void loop() {
     Serial.println(")");
     lastSend = millis();
   }
-  /*
-
-  // 統計情報の表示
-  if(millis() - lastStatsTime > statsInterval) {
-    Serial.println("=== CAN Bus Statistics ===");
-    Serial.print("Total messages received: ");
-    Serial.println(totalMessages);
-    Serial.print("Messages per second: ");
-    Serial.println(totalMessages * 1000.0 / (millis() - lastStatsTime + statsInterval));
-    Serial.println("==========================");
-    lastStatsTime = millis();
-  }
-  
-  // シリアルデータの状況をチェック
-  if(Serial1.available()) {
-    Serial.print("Serial1 data available: ");
-    Serial.print(Serial1.available());
-    Serial.println(" bytes");
-  }
-  */
   // すべてのCAN信号を受信・表示
   unsigned long id = 0;
   unsigned char data[8];
   if(can.receive(&id, data)) {
     totalMessages++;
+    
+    // タイムスタンプごとにJSONに蓄積
+    addCANMessageToJSON(id, data, millis());
     
     // 受信メッセージの詳細表示
     Serial.print("[");
@@ -174,6 +200,9 @@ void loop() {
       if(data[0] >= 2 && data[1] == 0x41) {
         Serial.print(" | PID: 0x");
         Serial.print(data[2], HEX);
+        
+        // OBD2データを車両データとしても記録
+        updateVehicleData(data[2], data, millis());
         
         // 特定のPIDの解釈
         switch(data[2]) {
@@ -212,9 +241,15 @@ void loop() {
     }
     else {
       Serial.print("Unknown Frame Type");
-    }
-    
+    }    
     Serial.println();
+  }
+
+  if(millis() - lastCellularSend > cellularSendInterval) {
+    cellularSend(JsonDoc);
+    // 送信後、古いメッセージデータをクリア（最新のvehicle_dataは保持）
+    cleanupOldMessages();
+    lastCellularSend = millis();
   }
   
   // Optional: Enable debug mode by sending commands through Serial monitor
@@ -223,4 +258,148 @@ void loop() {
   can.debugPID();
 
   delay(10);
+}
+
+// CANメッセージをタイムスタンプ付きでJSONに追加
+void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long timestamp) {
+  JsonArray messages = JsonDoc["can_messages"];
+  
+  // 新しいメッセージオブジェクトを作成
+  JsonObject message = messages.add<JsonObject>();
+  message["timestamp"] = timestamp;
+  message["can_id"] = "0x" + String(id, HEX);
+  
+  // データ配列を追加
+  JsonArray dataArray = message["data"].to<JsonArray>();
+  for(int i = 0; i < 8; i++) {
+    dataArray.add(data[i]);
+  }
+  
+  // メッセージタイプの判定
+  if(id >= 0x7E8 && id <= 0x7EF) {
+    message["type"] = "OBD2_Response";
+    message["ecu_id"] = id - 0x7E8;
+    
+    if(data[0] >= 2 && data[1] == 0x41) {
+      message["pid"] = "0x" + String(data[2], HEX);
+    }
+  } else if(id >= 0x100 && id <= 0x1FF) {
+    message["type"] = "Engine_Control";
+  } else if(id >= 0x200 && id <= 0x2FF) {
+    message["type"] = "Transmission_Control";
+  } else if(id >= 0x300 && id <= 0x3FF) {
+    message["type"] = "Body_Control";
+  } else {
+    message["type"] = "Unknown";
+  }
+  
+  // メッセージ数が多すぎる場合は古いものを削除（メモリ管理）
+  if(messages.size() > 50) {
+    messages.remove(0);  // 最古のメッセージを削除
+  }
+}
+
+// 車両データを時系列で更新
+void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
+  JsonObject vehicleData = JsonDoc["vehicle_data"];
+  
+  switch(pid) {
+    case 0x0C: // Engine RPM
+      if(data[0] >= 4) {
+        unsigned int rpm = ((data[3] * 256) + data[4]) / 4;
+        vehicleData["engine_rpm"]["value"] = rpm;
+        vehicleData["engine_rpm"]["unit"] = "rpm";
+        vehicleData["engine_rpm"]["timestamp"] = timestamp;
+      }
+      break;
+      
+    case 0x0D: // Vehicle Speed
+      vehicleData["vehicle_speed"]["value"] = data[3];
+      vehicleData["vehicle_speed"]["unit"] = "km/h";
+      vehicleData["vehicle_speed"]["timestamp"] = timestamp;
+      break;
+      
+    case 0x05: // Coolant Temperature
+      vehicleData["coolant_temp"]["value"] = data[3] - 40;
+      vehicleData["coolant_temp"]["unit"] = "°C";
+      vehicleData["coolant_temp"]["timestamp"] = timestamp;
+      break;
+      
+    case 0x04: // Engine Load
+      vehicleData["engine_load"]["value"] = data[3] * 100.0 / 255.0;
+      vehicleData["engine_load"]["unit"] = "%";
+      vehicleData["engine_load"]["timestamp"] = timestamp;
+      break;
+  }
+}
+
+// 古いメッセージをクリーンアップ（メモリ管理）
+void cleanupOldMessages() {
+  JsonArray messages = JsonDoc["can_messages"];
+  
+  // メッセージ配列をクリア（送信後なので）
+  while(messages.size() > 0) {
+    messages.remove(0);
+  }
+  
+  Serial.println("Cleaned up old CAN messages after transmission");
+}
+
+static bool cellularSend(const JsonDocument &doc) {
+  Serial.println("### Sending Time-Series JSON Data");
+  Serial.print("Messages in queue: ");
+  Serial.println(doc["can_messages"].size());
+  Serial.print("Vehicle data entries: ");
+  Serial.println(doc["vehicle_data"].size());
+
+  Serial.print("Connecting ");
+  Serial.print(HOST);
+  Serial.print(":");
+  Serial.println(PORT);
+
+  {
+    WioCellularTcpClient2<WioCellularModule> client{ WioCellular };
+    if (!client.open(WioNetwork.config.pdpContextId, HOST, PORT)) {
+      Serial.printf("ERROR: Failed to open %s\n", WioCellularResultToString(client.getLastResult()));
+      return false;
+    }
+
+    if (!client.waitForConnect()) {
+      Serial.printf("ERROR: Failed to connect %s\n", WioCellularResultToString(client.getLastResult()));
+      return false;
+    }
+
+    Serial.print("Sending ");
+    std::string str;
+    serializeJson(doc, str);
+    printData(Serial, str.data(), str.size());
+    Serial.println();
+    if (!client.send(str.data(), str.size())) {
+      Serial.printf("ERROR: Failed to send socket %s\n", WioCellularResultToString(client.getLastResult()));
+      return false;
+    }
+
+    Serial.println("Receiving");
+    static uint8_t recvData[WioCellular.RECEIVE_SOCKET_SIZE_MAX];
+    size_t recvSize;
+    if (!client.receive(recvData, sizeof(recvData), &recvSize, RECEIVE_TIMEOUT)) {
+      Serial.printf("ERROR: Failed to receive socket %s\n", WioCellularResultToString(client.getLastResult()));
+      return false;
+    }
+
+    printData(Serial, recvData, recvSize);
+    Serial.println();
+  }
+
+  Serial.println("### Completed");
+
+  return true;
+}
+
+template<typename T>
+void printData(T &stream, const void *data, size_t size) {
+  auto p = static_cast<const char *>(data);
+
+  for (; size > 0; --size, ++p)
+    stream.write(0x20 <= *p && *p <= 0x7f ? *p : '.');
 }

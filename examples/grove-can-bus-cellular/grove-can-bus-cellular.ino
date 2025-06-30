@@ -9,9 +9,6 @@
 #include <csignal>
 #include <WioCellular.h>
 #include <grove-can-bus.h>
-#include <Adafruit_TinyUSB.h>
-#include <csignal>
-#include <WioCellular.h>
 #include <ArduinoJson.h>
 
 #define SEARCH_ACCESS_TECHNOLOGY (WioCellularNetwork::SearchAccessTechnology::LTEM)  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html

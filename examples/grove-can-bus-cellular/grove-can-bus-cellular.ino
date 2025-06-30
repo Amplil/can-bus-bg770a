@@ -151,19 +151,34 @@ void loop() {
   static unsigned long totalMessages = 0;
   static unsigned long lastStatsTime = 0;
   
-  // Example: Request engine RPM every 5 seconds using OBD-II
+  // OBD-II PID要求を複数種類順番に送信
   static unsigned long lastSend = 0;
   static int sendInterval = 1000;
-  unsigned char cmd = PID_ENGIN_PRM;
   static unsigned long lastCellularSend = 0;
   static int cellularSendInterval = 10000;
+  
+  // 送信するPIDの配列
+  static unsigned char obdPids[] = {0x0C, 0x0D, 0x05, 0x04, 0x0F, 0x11, 0x42, 0x46};
+  static const char* obdPidNames[] = {
+    "Engine RPM", "Vehicle Speed", "Coolant Temperature", "Engine Load",
+    "Intake Air Temperature", "Throttle Position", "Control Module Voltage", "Ambient Air Temperature"
+  };
+  static int currentPidIndex = 0;
+  static int numPids = sizeof(obdPids) / sizeof(obdPids[0]);
 
   if(millis() - lastSend > sendInterval) {
-    // OBD-II request for Engine RPM (PID 0x0C)
+    // 現在のPIDを送信
+    unsigned char cmd = obdPids[currentPidIndex];
     can.sendPid(cmd);
-    Serial.print("Sent OBD-II Engine RPM request (PID: 0x");
+    Serial.print("Sent OBD-II ");
+    Serial.print(obdPidNames[currentPidIndex]);
+    Serial.print(" request (PID: 0x");
+    if(cmd < 0x10) Serial.print("0");
     Serial.print(cmd, HEX);
     Serial.println(")");
+    
+    // 次のPIDに移動（循環）
+    currentPidIndex = (currentPidIndex + 1) % numPids;
     lastSend = millis();
   }
   // すべてのCAN信号を受信・表示
@@ -228,6 +243,29 @@ void loop() {
             Serial.print(" | Engine Load: ");
             Serial.print(data[3] * 100.0 / 255.0);
             Serial.print(" %");
+            break;
+          case 0x0F: // Intake Air Temperature
+            Serial.print(" | Intake Air Temp: ");
+            Serial.print(data[3] - 40);
+            Serial.print(" °C");
+            break;
+          case 0x11: // Throttle Position
+            Serial.print(" | Throttle Position: ");
+            Serial.print(data[3] * 100.0 / 255.0);
+            Serial.print(" %");
+            break;
+          case 0x42: // Control Module Voltage
+            if(data[0] >= 4) {
+              float voltage = ((data[3] * 256) + data[4]) / 1000.0;
+              Serial.print(" | Control Module Voltage: ");
+              Serial.print(voltage);
+              Serial.print(" V");
+            }
+            break;
+          case 0x46: // Ambient Air Temperature
+            Serial.print(" | Ambient Air Temp: ");
+            Serial.print(data[3] - 40);
+            Serial.print(" °C");
             break;
         }
       }
@@ -302,7 +340,10 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
 // 車両データを時系列で更新
 void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
   JsonObject vehicleData = JsonDoc["vehicle_data"];
-  
+  vehicleData["raw_data"]["data"] = data;
+  vehicleData["raw_data"]["pid"] = pid;
+  vehicleData["raw_data"]["timestamp"] = timestamp;
+
   switch(pid) {
     case 0x0C: // Engine RPM
       if(data[0] >= 4) {
@@ -329,6 +370,33 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       vehicleData["engine_load"]["value"] = data[3] * 100.0 / 255.0;
       vehicleData["engine_load"]["unit"] = "%";
       vehicleData["engine_load"]["timestamp"] = timestamp;
+      break;
+      
+    case 0x0F: // Intake Air Temperature
+      vehicleData["intake_air_temp"]["value"] = data[3] - 40;
+      vehicleData["intake_air_temp"]["unit"] = "°C";
+      vehicleData["intake_air_temp"]["timestamp"] = timestamp;
+      break;
+      
+    case 0x11: // Throttle Position
+      vehicleData["throttle_position"]["value"] = data[3] * 100.0 / 255.0;
+      vehicleData["throttle_position"]["unit"] = "%";
+      vehicleData["throttle_position"]["timestamp"] = timestamp;
+      break;
+      
+    case 0x42: // Control Module Voltage
+      if(data[0] >= 4) {
+        float voltage = ((data[3] * 256) + data[4]) / 1000.0;
+        vehicleData["control_module_voltage"]["value"] = voltage;
+        vehicleData["control_module_voltage"]["unit"] = "V";
+        vehicleData["control_module_voltage"]["timestamp"] = timestamp;
+      }
+      break;
+      
+    case 0x46: // Ambient Air Temperature
+      vehicleData["ambient_air_temp"]["value"] = data[3] - 40;
+      vehicleData["ambient_air_temp"]["unit"] = "°C";
+      vehicleData["ambient_air_temp"]["timestamp"] = timestamp;
       break;
   }
 }

@@ -1,0 +1,54 @@
+#######################################
+# Syntax Coloring Map For BG770A CAN Bus Module
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+BG770A_CAN	KEYWORD1
+BG770A	KEYWORD1
+CAN	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+begin	KEYWORD2
+send	KEYWORD2
+recv	KEYWORD2
+receive	KEYWORD2
+setCanRate	KEYWORD2
+enableCAN	KEYWORD2
+disableCAN	KEYWORD2
+setMask	KEYWORD2
+setFilt	KEYWORD2
+sendPid	KEYWORD2
+debugMode	KEYWORD2
+debugPID	KEYWORD2
+isCANEnabled	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+CAN_RATE_5	LITERAL1
+CAN_RATE_10	LITERAL1
+CAN_RATE_20	LITERAL1
+CAN_RATE_25	LITERAL1
+CAN_RATE_31_2	LITERAL1
+CAN_RATE_33	LITERAL1
+CAN_RATE_40	LITERAL1
+CAN_RATE_50	LITERAL1
+CAN_RATE_80	LITERAL1
+CAN_RATE_83_3	LITERAL1
+CAN_RATE_95	LITERAL1
+CAN_RATE_100	LITERAL1
+CAN_RATE_125	LITERAL1
+CAN_RATE_200	LITERAL1
+CAN_RATE_250	LITERAL1
+CAN_RATE_500	LITERAL1
+CAN_RATE_666	LITERAL1
+CAN_RATE_1000	LITERAL1
+STANDARD_CAN_11BIT	LITERAL1
+PID_ENGIN_PRM	LITERAL1
+PID_VEHICLE_SPEED	LITERAL1
+PID_COOLANT_TEMP	LITERAL1
+CAN_ID_PID	LITERAL1

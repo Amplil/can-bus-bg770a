@@ -76,15 +76,15 @@ void setup() {
     // Enable CAN functionality
     if(can.enableCAN()) {
         Serial.println("CAN enabled successfully");
-    }
-    
+}
+
     // Set CAN baudrate to 500kbps
     can.setCanRate(CAN_RATE_500);
 }
 
 void loop() {
     unsigned char data[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
-    
+
     // Send CAN frame: ID=0x123, Standard frame, Data frame, 8 bytes
     if(can.send(0x123, 0, 0, 8, data)) {
         Serial.println("CAN message sent successfully");

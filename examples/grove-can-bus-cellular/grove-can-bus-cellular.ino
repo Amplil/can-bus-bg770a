@@ -155,10 +155,13 @@ void loop() {
   static int cellularSendInterval = 10000;
   
   // 送信するPIDの配列
-  static unsigned char obdPids[] = {0x0C, 0x0D, 0x05, 0x04, 0x0F, 0x11, 0x42, 0x46};
+  static unsigned char obdPids[] = {
+    PID_ENGIN_PRM, PID_VEHICLE_SPEED, PID_COOLANT_TEMP, PID_ENGINE_LOAD, PID_INTAKE_AIR_TEMP,
+    PID_THROTTLE_POS, PID_DISTANCE_TRAVELED, PID_CONTROL_MODULE_VOLTAGE, PID_AMBIENT_AIR_TEMP
+  };
   static const char* obdPidNames[] = {
     "Engine RPM", "Vehicle Speed", "Coolant Temperature", "Engine Load",
-    "Intake Air Temperature", "Throttle Position", "Control Module Voltage", "Ambient Air Temperature"
+    "Intake Air Temperature", "Throttle Position", "Distance Traveled", "Control Module Voltage", "Ambient Air Temperature"
   };
   static int currentPidIndex = 0;
   static int numPids = sizeof(obdPids) / sizeof(obdPids[0]);
@@ -218,7 +221,7 @@ void loop() {
         
         // 特定のPIDの解釈
         switch(data[2]) {
-          case 0x0C: // Engine RPM
+          case PID_ENGIN_PRM: // Engine RPM
             if(data[0] >= 4) {
               unsigned int rpm = ((data[3] * 256) + data[4]) / 4;
               Serial.print(" | Engine RPM: ");
@@ -226,32 +229,40 @@ void loop() {
               Serial.print(" rpm");
             }
             break;
-          case 0x0D: // Vehicle Speed
+          case PID_VEHICLE_SPEED: // Vehicle Speed
             Serial.print(" | Vehicle Speed: ");
             Serial.print(data[3]);
             Serial.print(" km/h");
             break;
-          case 0x05: // Coolant Temperature
+          case PID_COOLANT_TEMP: // Coolant Temperature
             Serial.print(" | Coolant Temp: ");
             Serial.print(data[3] - 40);
             Serial.print(" °C");
             break;
-          case 0x04: // Engine Load
+          case PID_ENGINE_LOAD: // Engine Load
             Serial.print(" | Engine Load: ");
             Serial.print(data[3] * 100.0 / 255.0);
             Serial.print(" %");
             break;
-          case 0x0F: // Intake Air Temperature
+          case PID_INTAKE_AIR_TEMP: // Intake Air Temperature
             Serial.print(" | Intake Air Temp: ");
             Serial.print(data[3] - 40);
             Serial.print(" °C");
             break;
-          case 0x11: // Throttle Position
+          case PID_THROTTLE_POS: // Throttle Position
             Serial.print(" | Throttle Position: ");
             Serial.print(data[3] * 100.0 / 255.0);
             Serial.print(" %");
             break;
-          case 0x42: // Control Module Voltage
+          case PID_DISTANCE_TRAVELED: // Distance Traveled
+            if(data[0] >= 4) {
+              unsigned int distance = (data[3] * 256) + data[4];
+              Serial.print(" | Distance Traveled: ");
+              Serial.print(distance);
+              Serial.print(" km");
+            }
+            break;
+          case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
             if(data[0] >= 4) {
               float voltage = ((data[3] * 256) + data[4]) / 1000.0;
               Serial.print(" | Control Module Voltage: ");
@@ -259,7 +270,7 @@ void loop() {
               Serial.print(" V");
             }
             break;
-          case 0x46: // Ambient Air Temperature
+          case PID_AMBIENT_AIR_TEMP: // Ambient Air Temperature
             Serial.print(" | Ambient Air Temp: ");
             Serial.print(data[3] - 40);
             Serial.print(" °C");
@@ -353,7 +364,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
   vehicleData["raw_data"]["timestamp"] = timestamp;
 
   switch(pid) {
-    case 0x0C: // Engine RPM
+    case PID_ENGIN_PRM: // Engine RPM
       if(data[0] >= 4) {
         unsigned int rpm = ((data[3] * 256) + data[4]) / 4;
         JsonObject rpmObj = vehicleData["engine_rpm"].to<JsonObject>();
@@ -363,7 +374,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       }
       break;
       
-    case 0x0D: // Vehicle Speed
+    case PID_VEHICLE_SPEED: // Vehicle Speed
       {
         JsonObject speedObj = vehicleData["vehicle_speed"].to<JsonObject>();
         speedObj["value"] = data[3];
@@ -372,7 +383,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       }
       break;
       
-    case 0x05: // Coolant Temperature
+    case PID_COOLANT_TEMP: // Coolant Temperature
       {
         JsonObject coolantObj = vehicleData["coolant_temp"].to<JsonObject>();
         coolantObj["value"] = data[3] - 40;
@@ -381,7 +392,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       }
       break;
       
-    case 0x04: // Engine Load
+    case PID_ENGINE_LOAD: // Engine Load
       {
         JsonObject loadObj = vehicleData["engine_load"].to<JsonObject>();
         loadObj["value"] = data[3] * 100.0 / 255.0;
@@ -390,7 +401,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       }
       break;
       
-    case 0x0F: // Intake Air Temperature
+    case PID_INTAKE_AIR_TEMP: // Intake Air Temperature
       {
         JsonObject intakeObj = vehicleData["intake_air_temp"].to<JsonObject>();
         intakeObj["value"] = data[3] - 40;
@@ -399,7 +410,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       }
       break;
       
-    case 0x11: // Throttle Position
+    case PID_THROTTLE_POS: // Throttle Position
       {
         JsonObject throttleObj = vehicleData["throttle_position"].to<JsonObject>();
         throttleObj["value"] = data[3] * 100.0 / 255.0;
@@ -408,7 +419,17 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       }
       break;
       
-    case 0x42: // Control Module Voltage
+    case PID_DISTANCE_TRAVELED: // Distance Traveled
+      if(data[0] >= 4) {
+        unsigned int distance = (data[3] * 256) + data[4];
+        JsonObject distanceObj = vehicleData["distance_traveled"].to<JsonObject>();
+        distanceObj["value"] = distance;
+        distanceObj["unit"] = "km";
+        distanceObj["timestamp"] = timestamp;
+      }
+      break;
+      
+    case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
       if(data[0] >= 4) {
         float voltage = ((data[3] * 256) + data[4]) / 1000.0;
         JsonObject voltageObj = vehicleData["control_module_voltage"].to<JsonObject>();
@@ -418,7 +439,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       }
       break;
       
-    case 0x46: // Ambient Air Temperature
+    case PID_AMBIENT_AIR_TEMP: // Ambient Air Temperature
       {
         JsonObject ambientObj = vehicleData["ambient_air_temp"].to<JsonObject>();
         ambientObj["value"] = data[3] - 40;

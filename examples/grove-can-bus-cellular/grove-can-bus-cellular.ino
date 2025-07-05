@@ -148,7 +148,7 @@ void loop() {
   static unsigned long totalMessages = 0;
   static unsigned long lastStatsTime = 0;
   
-  // OBD-II PID要求を複数種類順番に送信
+  // OBD-II PID要求を複数種類一括送信
   static unsigned long lastSend = 0;
   static int sendInterval = 1000;
   static unsigned long lastCellularSend = 0;
@@ -163,29 +163,39 @@ void loop() {
     "Engine RPM", "Vehicle Speed", "Coolant Temperature", "Engine Load",
     "Intake Air Temperature", "Throttle Position", "Distance Traveled", "Control Module Voltage", "Ambient Air Temperature"
   };
-  static int currentPidIndex = 0;
   static int numPids = sizeof(obdPids) / sizeof(obdPids[0]);
 
   if(millis() - lastSend > sendInterval) {
-    // 現在のPIDを送信
-    unsigned char cmd = obdPids[currentPidIndex];
-    can.sendPid(cmd);
-    Serial.print("Sent OBD-II ");
-    Serial.print(obdPidNames[currentPidIndex]);
-    Serial.print(" request (PID: 0x");
-    if(cmd < 0x10) Serial.print("0");
-    Serial.print(cmd, HEX);
-    Serial.println(")");
+    Serial.println("=== Sending all OBD-II PID requests ===");
     
-    // 次のPIDに移動（循環）
-    currentPidIndex = (currentPidIndex + 1) % numPids;
+    // すべてのPIDを順次送信
+    for(int i = 0; i < numPids; i++) {
+      unsigned char cmd = obdPids[i];
+      can.sendPid(cmd);
+      Serial.print("Sent OBD-II ");
+      Serial.print(obdPidNames[i]);
+      Serial.print(" request (PID: 0x");
+      if(cmd < 0x10) Serial.print("0");
+      Serial.print(cmd, HEX);
+      Serial.println(")");
+      
+      // 各PID送信間に短い遅延を入れて、応答を待つ
+      delay(50);
+    }
+    
+    Serial.println("=== All PID requests sent ===");
     lastSend = millis();
   }
-  // すべてのCAN信号を受信・表示
+  
+  // すべてのCAN信号を受信・表示（複数メッセージを処理）
   unsigned long id = 0;
   unsigned char data[8];
-  if(can.receive(&id, data)) {
+  int receivedCount = 0;
+  
+  // 複数のメッセージを受信（バッファをクリア）
+  while(can.receive(&id, data) && receivedCount < 20) {  // 最大20メッセージまで処理
     totalMessages++;
+    receivedCount++;
     
     // タイムスタンプごとにJSONに蓄積
     addCANMessageToJSON(id, data, millis());
@@ -289,6 +299,13 @@ void loop() {
       Serial.print("Unknown Frame Type");
     }    
     Serial.println();
+  }
+  
+  // 受信したメッセージ数を表示
+  if(receivedCount > 0) {
+    Serial.print("Received ");
+    Serial.print(receivedCount);
+    Serial.println(" CAN messages in this loop");
   }
 
   if(millis() - lastCellularSend > cellularSendInterval) {

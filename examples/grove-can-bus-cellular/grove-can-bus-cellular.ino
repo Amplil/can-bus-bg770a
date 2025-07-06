@@ -152,7 +152,7 @@ void loop() {
   static unsigned long lastSend = 0;
   static int sendInterval = 50;
   static unsigned long lastCellularSend = 0;
-  static int cellularSendInterval = 10000;
+  static int cellularSendInterval = 20000;
   static unsigned long lastRotateSend = 0;
   static int rotateSendInterval = 2000;
   // 送信するPIDの配列
@@ -185,6 +185,7 @@ void loop() {
     }
     if(currentPidIndex == 0) {
       lastRotateSend = millis();
+      Serial.println("--------------------------------");
     }
   }
   // すべてのCAN信号を受信・表示

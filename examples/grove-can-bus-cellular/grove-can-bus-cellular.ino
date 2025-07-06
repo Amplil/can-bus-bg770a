@@ -150,10 +150,11 @@ void loop() {
   
   // OBD-II PID要求を複数種類順番に送信
   static unsigned long lastSend = 0;
-  static int sendInterval = 1000;
+  static int sendInterval = 50;
   static unsigned long lastCellularSend = 0;
   static int cellularSendInterval = 10000;
-  
+  static unsigned long lastRotateSend = 0;
+  static int rotateSendInterval = 2000;
   // 送信するPIDの配列
   static unsigned char obdPids[] = {
     PID_ENGIN_PRM, PID_VEHICLE_SPEED, PID_COOLANT_TEMP, PID_ENGINE_LOAD, PID_INTAKE_AIR_TEMP,
@@ -166,20 +167,25 @@ void loop() {
   static int currentPidIndex = 0;
   static int numPids = sizeof(obdPids) / sizeof(obdPids[0]);
 
-  if(millis() - lastSend > sendInterval) {
-    // 現在のPIDを送信
-    unsigned char cmd = obdPids[currentPidIndex];
-    can.sendPid(cmd);
-    Serial.print("Sent OBD-II ");
-    Serial.print(obdPidNames[currentPidIndex]);
-    Serial.print(" request (PID: 0x");
-    if(cmd < 0x10) Serial.print("0");
-    Serial.print(cmd, HEX);
-    Serial.println(")");
-    
-    // 次のPIDに移動（循環）
-    currentPidIndex = (currentPidIndex + 1) % numPids;
-    lastSend = millis();
+  if(millis() - lastRotateSend > rotateSendInterval) {
+    if(millis() - lastSend > sendInterval) {
+      // 現在のPIDを送信
+      unsigned char cmd = obdPids[currentPidIndex];
+      can.sendPid(cmd);
+      Serial.print("Sent OBD-II ");
+      Serial.print(obdPidNames[currentPidIndex]);
+      Serial.print(" request (PID: 0x");
+      if(cmd < 0x10) Serial.print("0");
+      Serial.print(cmd, HEX);
+      Serial.println(")");
+      
+      // 次のPIDに移動（循環）
+      currentPidIndex = (currentPidIndex + 1) % numPids;
+      lastSend = millis();
+    }
+    if(currentPidIndex == 0) {
+      lastRotateSend = millis();
+    }
   }
   // すべてのCAN信号を受信・表示
   unsigned long id = 0;

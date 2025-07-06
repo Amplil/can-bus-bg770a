@@ -168,7 +168,7 @@ void loop() {
   if(millis() - lastSend > sendInterval) {
     Serial.println("=== Sending all OBD-II PID requests ===");
     
-    // すべてのPIDを順次送信
+    // すべてのPIDを順次送信し、各送信後に応答を受信
     for(int i = 0; i < numPids; i++) {
       unsigned char cmd = obdPids[i];
       can.sendPid(cmd);
@@ -179,133 +179,136 @@ void loop() {
       Serial.print(cmd, HEX);
       Serial.println(")");
       
-      // 各PID送信間に短い遅延を入れて、応答を待つ
-      delay(50);
-    }
-    
-    Serial.println("=== All PID requests sent ===");
-    lastSend = millis();
-  }
-  
-  // すべてのCAN信号を受信・表示（複数メッセージを処理）
-  unsigned long id = 0;
-  unsigned char data[8];
-  int receivedCount = 0;
-  
-  // 複数のメッセージを受信（バッファをクリア）
-  while(can.receive(&id, data) && receivedCount < 20) {  // 最大20メッセージまで処理
-    totalMessages++;
-    receivedCount++;
-    
-    // タイムスタンプごとにJSONに蓄積
-    addCANMessageToJSON(id, data, millis());
-    // OBD2データを車両データとしても記録
-    updateVehicleData(data[2], data, millis());
-    
-    // 受信メッセージの詳細表示
-    Serial.print("[");
-    Serial.print(millis());
-    Serial.print("ms] CAN ID: 0x");
-    if(id < 0x100) Serial.print("0");
-    if(id < 0x10) Serial.print("0");
-    Serial.print(id, HEX);
-    Serial.print(" | Data: ");
-    
-    for(int i = 0; i < 8; i++) {
-      if(data[i] < 0x10) Serial.print("0");
-      Serial.print(data[i], HEX);
-      if(i < 7) Serial.print(" ");
-    }
-    
-    // データの解釈を試行
-    Serial.print(" | ");
-    
-    // OBD-II応答の場合
-    if((id >= 0x7E8 && id <= 0x7EF)) {
-      Serial.print("OBD-II Response from ECU ");
-      Serial.print(id - 0x7E8);
-      if(data[0] >= 2 && data[1] == 0x41) {
-        Serial.print(" | PID: 0x");
-        Serial.print(data[2], HEX);
+      // 応答を待機して受信
+      unsigned long startTime = millis();
+      bool responseReceived = false;
+      
+      while(millis() - startTime < 200 && !responseReceived) {  // 最大200ms待機
+        unsigned long id = 0;
+        unsigned char data[8];
         
-        
-        // 特定のPIDの解釈
-        switch(data[2]) {
-          case PID_ENGIN_PRM: // Engine RPM
-            if(data[0] >= 4) {
-              unsigned int rpm = ((data[3] * 256) + data[4]) / 4;
-              Serial.print(" | Engine RPM: ");
-              Serial.print(rpm);
-              Serial.print(" rpm");
+        if(can.receive(&id, data)) {
+          totalMessages++;
+          responseReceived = true;
+          
+          // タイムスタンプごとにJSONに蓄積
+          addCANMessageToJSON(id, data, millis());
+          // OBD2データを車両データとしても記録
+          updateVehicleData(data[2], data, millis());
+          
+          // 受信メッセージの詳細表示
+          Serial.print("  [");
+          Serial.print(millis());
+          Serial.print("ms] CAN ID: 0x");
+          if(id < 0x100) Serial.print("0");
+          if(id < 0x10) Serial.print("0");
+          Serial.print(id, HEX);
+          Serial.print(" | Data: ");
+          
+          for(int j = 0; j < 8; j++) {
+            if(data[j] < 0x10) Serial.print("0");
+            Serial.print(data[j], HEX);
+            if(j < 7) Serial.print(" ");
+          }
+          
+          // データの解釈を試行
+          Serial.print(" | ");
+          
+          // OBD-II応答の場合
+          if((id >= 0x7E8 && id <= 0x7EF)) {
+            Serial.print("OBD-II Response from ECU ");
+            Serial.print(id - 0x7E8);
+            if(data[0] >= 2 && data[1] == 0x41) {
+              Serial.print(" | PID: 0x");
+              Serial.print(data[2], HEX);
+              
+              // 特定のPIDの解釈
+              switch(data[2]) {
+                case PID_ENGIN_PRM: // Engine RPM
+                  if(data[0] >= 4) {
+                    unsigned int rpm = ((data[3] * 256) + data[4]) / 4;
+                    Serial.print(" | Engine RPM: ");
+                    Serial.print(rpm);
+                    Serial.print(" rpm");
+                  }
+                  break;
+                case PID_VEHICLE_SPEED: // Vehicle Speed
+                  Serial.print(" | Vehicle Speed: ");
+                  Serial.print(data[3]);
+                  Serial.print(" km/h");
+                  break;
+                case PID_COOLANT_TEMP: // Coolant Temperature
+                  Serial.print(" | Coolant Temp: ");
+                  Serial.print(data[3] - 40);
+                  Serial.print(" °C");
+                  break;
+                case PID_ENGINE_LOAD: // Engine Load
+                  Serial.print(" | Engine Load: ");
+                  Serial.print(data[3] * 100.0 / 255.0);
+                  Serial.print(" %");
+                  break;
+                case PID_INTAKE_AIR_TEMP: // Intake Air Temperature
+                  Serial.print(" | Intake Air Temp: ");
+                  Serial.print(data[3] - 40);
+                  Serial.print(" °C");
+                  break;
+                case PID_THROTTLE_POS: // Throttle Position
+                  Serial.print(" | Throttle Position: ");
+                  Serial.print(data[3] * 100.0 / 255.0);
+                  Serial.print(" %");
+                  break;
+                case PID_DISTANCE_TRAVELED: // Distance Traveled
+                  if(data[0] >= 4) {
+                    unsigned int distance = (data[3] * 256) + data[4];
+                    Serial.print(" | Distance Traveled: ");
+                    Serial.print(distance);
+                    Serial.print(" km");
+                  }
+                  break;
+                case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
+                  if(data[0] >= 4) {
+                    float voltage = ((data[3] * 256) + data[4]) / 1000.0;
+                    Serial.print(" | Control Module Voltage: ");
+                    Serial.print(voltage);
+                    Serial.print(" V");
+                  }
+                  break;
+                case PID_AMBIENT_AIR_TEMP: // Ambient Air Temperature
+                  Serial.print(" | Ambient Air Temp: ");
+                  Serial.print(data[3] - 40);
+                  Serial.print(" °C");
+                  break;
+              }
             }
-            break;
-          case PID_VEHICLE_SPEED: // Vehicle Speed
-            Serial.print(" | Vehicle Speed: ");
-            Serial.print(data[3]);
-            Serial.print(" km/h");
-            break;
-          case PID_COOLANT_TEMP: // Coolant Temperature
-            Serial.print(" | Coolant Temp: ");
-            Serial.print(data[3] - 40);
-            Serial.print(" °C");
-            break;
-          case PID_ENGINE_LOAD: // Engine Load
-            Serial.print(" | Engine Load: ");
-            Serial.print(data[3] * 100.0 / 255.0);
-            Serial.print(" %");
-            break;
-          case PID_INTAKE_AIR_TEMP: // Intake Air Temperature
-            Serial.print(" | Intake Air Temp: ");
-            Serial.print(data[3] - 40);
-            Serial.print(" °C");
-            break;
-          case PID_THROTTLE_POS: // Throttle Position
-            Serial.print(" | Throttle Position: ");
-            Serial.print(data[3] * 100.0 / 255.0);
-            Serial.print(" %");
-            break;
-          case PID_DISTANCE_TRAVELED: // Distance Traveled
-            if(data[0] >= 4) {
-              unsigned int distance = (data[3] * 256) + data[4];
-              Serial.print(" | Distance Traveled: ");
-              Serial.print(distance);
-              Serial.print(" km");
-            }
-            break;
-          case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
-            if(data[0] >= 4) {
-              float voltage = ((data[3] * 256) + data[4]) / 1000.0;
-              Serial.print(" | Control Module Voltage: ");
-              Serial.print(voltage);
-              Serial.print(" V");
-            }
-            break;
-          case PID_AMBIENT_AIR_TEMP: // Ambient Air Temperature
-            Serial.print(" | Ambient Air Temp: ");
-            Serial.print(data[3] - 40);
-            Serial.print(" °C");
-            break;
+          }
+          // その他の一般的なCAN IDの場合
+          else if(id >= 0x100 && id <= 0x7FF) {
+            Serial.print("Standard CAN Frame");
+          }
+          else if(id >= 0x18000000) {
+            Serial.print("Extended CAN Frame");
+          }
+          else {
+            Serial.print("Unknown Frame Type");
+          }    
+          Serial.println();
         }
+        delay(10);  // 短い遅延
       }
+      
+      // 応答が受信できなかった場合
+      if(!responseReceived) {
+        Serial.print("  No response received for PID: 0x");
+        if(cmd < 0x10) Serial.print("0");
+        Serial.println(cmd, HEX);
+      }
+      
+      // 次のPID送信前に短い遅延
+      delay(100);
     }
-    // その他の一般的なCAN IDの場合
-    else if(id >= 0x100 && id <= 0x7FF) {
-      Serial.print("Standard CAN Frame");
-    }
-    else if(id >= 0x18000000) {
-      Serial.print("Extended CAN Frame");
-    }
-    else {
-      Serial.print("Unknown Frame Type");
-    }    
-    Serial.println();
-  }
-  
-  // 受信したメッセージ数を表示
-  if(receivedCount > 0) {
-    Serial.print("Received ");
-    Serial.print(receivedCount);
-    Serial.println(" CAN messages in this loop");
+    
+    Serial.println("=== All PID requests completed ===");
+    lastSend = millis();
   }
 
   if(millis() - lastCellularSend > cellularSendInterval) {

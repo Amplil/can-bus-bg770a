@@ -21,11 +21,12 @@ static constexpr int POWER_ON_TIMEOUT = 1000 * 20;     // [ms]
 static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 3;  // [ms]
 static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // [ms]
 static JsonDocument JsonDoc;
+JsonArray rootArray = JsonDoc.to<JsonArray>();
 // Initialize JSON document structure
 //JsonDoc["session_start"] = millis();
 //JsonDoc["device_id"] = "WIO_BG770A_001";
-JsonArray canMessages = JsonDoc["can_messages"].to<JsonArray>();
-JsonArray vehicleData = JsonDoc["vehicle_data"].to<JsonArray>();
+//JsonArray canMessages = JsonDoc["can_messages"].to<JsonArray>();
+//JsonArray vehicleData = JsonDoc["vehicle_data"].to<JsonArray>();
 
 WioCAN can;
 
@@ -194,7 +195,7 @@ void loop() {
     //totalMessages++;
     
     // タイムスタンプごとにJSONに蓄積
-    addCANMessageToJSON(id, data, millis());
+    //addCANMessageToJSON(id, data, millis());
     // OBD2データを車両データとしても記録
     updateVehicleData(data[2], data, millis());
     
@@ -311,12 +312,11 @@ void loop() {
 
   delay(10);
 }
-
+/*
 // CANメッセージをタイムスタンプ付きでJSONに追加
 void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long timestamp) {
   //JsonArray messages = JsonDoc["can_messages"];
-    
-  JsonObject message = canMessages.add<JsonObject>();
+  JsonObject message = rootArray.add<JsonObject>();
   message["timestamp"] = timestamp;
   message["can_id"] = "0x" + String(id, HEX);
   
@@ -343,110 +343,97 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
   } else {
     message["type"] = "Unknown";
   }
-  /*
-  // メッセージ数が多すぎる場合は古いものを削除（メモリ管理）
-  if(messages.size() > 50) {
-    messages.remove(0);  // 最古のメッセージを削除
-  }
-  */
 }
+*/
 
 // 車両データを時系列で更新
 void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
-  JsonObject dataObj = vehicleData.add<JsonObject>();
-  dataObj["raw_data"].to<JsonObject>();
-  
-  JsonArray rawDataArray = dataObj["raw_data"]["data"].to<JsonArray>();
+  JsonObject dataObj = rootArray.add<JsonObject>();
+  JsonArray rawDataArray = dataObj["raw_data"].to<JsonArray>();
   // 既存のデータをクリア
   //rawDataArray.clear();
   for(int i = 0; i < 8; i++) {
     rawDataArray.add(data[i]);
   }
-  dataObj["raw_data"]["pid"] = pid;
-  dataObj["raw_data"]["timestamp"] = timestamp;
+  dataObj["pid"] = pid;
+  dataObj["timestamp"] = timestamp;
 
   switch(pid) {
     case PID_ENGIN_PRM: // Engine RPM
       if(data[0] >= 4) {
         unsigned int rpm = ((data[3] * 256) + data[4]) / 4;
-        JsonObject rpmObj = dataObj["engine_rpm"].to<JsonObject>();
-        rpmObj["value"] = rpm;
-        rpmObj["unit"] = "rpm";
-        rpmObj["timestamp"] = timestamp;
+        dataObj["engine_rpm"] = rpm;
       }
       break;
       
     case PID_VEHICLE_SPEED: // Vehicle Speed
       {
-        JsonObject speedObj = dataObj["vehicle_speed"].to<JsonObject>();
-        speedObj["value"] = data[3];
-        speedObj["unit"] = "km/h";
-        speedObj["timestamp"] = timestamp;
+        dataObj["vehicle_speed"] = data[3];
       }
       break;
       
     case PID_COOLANT_TEMP: // Coolant Temperature
       {
-        JsonObject coolantObj = dataObj["coolant_temp"].to<JsonObject>();
-        coolantObj["value"] = data[3] - 40;
-        coolantObj["unit"] = "°C";
-        coolantObj["timestamp"] = timestamp;
+        dataObj["coolant_temp"] = data[3] - 40;
+        //coolantObj["value"] = data[3] - 40;
+        //coolantObj["unit"] = "°C";
+        //coolantObj["timestamp"] = timestamp;
       }
       break;
       
     case PID_ENGINE_LOAD: // Engine Load
       {
-        JsonObject loadObj = dataObj["engine_load"].to<JsonObject>();
-        loadObj["value"] = data[3] * 100.0 / 255.0;
-        loadObj["unit"] = "%";
-        loadObj["timestamp"] = timestamp;
+        dataObj["engine_load"] = data[3] * 100.0 / 255.0;
+        //loadObj["value"] = data[3] * 100.0 / 255.0;
+        //loadObj["unit"] = "%";
+        //loadObj["timestamp"] = timestamp;
       }
       break;
       
     case PID_INTAKE_AIR_TEMP: // Intake Air Temperature
       {
-        JsonObject intakeObj = dataObj["intake_air_temp"].to<JsonObject>();
-        intakeObj["value"] = data[3] - 40;
-        intakeObj["unit"] = "°C";
-        intakeObj["timestamp"] = timestamp;
+        dataObj["intake_air_temp"] = data[3] - 40;
+        //intakeObj["value"] = data[3] - 40;
+        //intakeObj["unit"] = "°C";
+        //intakeObj["timestamp"] = timestamp;
       }
       break;
       
     case PID_THROTTLE_POS: // Throttle Position
       {
-        JsonObject throttleObj = dataObj["throttle_position"].to<JsonObject>();
-        throttleObj["value"] = data[3] * 100.0 / 255.0;
-        throttleObj["unit"] = "%";
-        throttleObj["timestamp"] = timestamp;
+        dataObj["throttle_position"] = data[3] * 100.0 / 255.0;
+        //throttleObj["value"] = data[3] * 100.0 / 255.0;
+        //throttleObj["unit"] = "%";
+        //throttleObj["timestamp"] = timestamp;
       }
       break;
       
     case PID_DISTANCE_TRAVELED: // Distance Traveled
       if(data[0] >= 4) {
         unsigned int distance = (data[3] * 256) + data[4];
-        JsonObject distanceObj = dataObj["distance_traveled"].to<JsonObject>();
-        distanceObj["value"] = distance;
-        distanceObj["unit"] = "km";
-        distanceObj["timestamp"] = timestamp;
+        dataObj["distance_traveled"] = distance;
+        //distanceObj["value"] = distance;
+        //distanceObj["unit"] = "km";
+        //distanceObj["timestamp"] = timestamp;
       }
       break;
       
     case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
       if(data[0] >= 4) {
         float voltage = ((data[3] * 256) + data[4]) / 1000.0;
-        JsonObject voltageObj = dataObj["control_module_voltage"].to<JsonObject>();
-        voltageObj["value"] = voltage;
-        voltageObj["unit"] = "V";
-        voltageObj["timestamp"] = timestamp;
+        dataObj["control_module_voltage"] = voltage;
+        //voltageObj["value"] = voltage;
+        //voltageObj["unit"] = "V";
+        //voltageObj["timestamp"] = timestamp;
       }
       break;
       
     case PID_AMBIENT_AIR_TEMP: // Ambient Air Temperature
       {
-        JsonObject ambientObj = dataObj["ambient_air_temp"].to<JsonObject>();
-        ambientObj["value"] = data[3] - 40;
-        ambientObj["unit"] = "°C";  
-        ambientObj["timestamp"] = timestamp;
+        dataObj["ambient_air_temp"] = data[3] - 40;
+        //ambientObj["value"] = data[3] - 40;
+        //ambientObj["unit"] = "°C";  
+        //ambientObj["timestamp"] = timestamp;
       }
       break;
   }
@@ -454,17 +441,18 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
 
 // 古いメッセージをクリーンアップ（メモリ管理）
 void cleanupOldMessages() {
-  canMessages.clear();
-  vehicleData.clear();
+  //canMessages.clear();
+  //vehicleData.clear();
+  rootArray.clear();
   Serial.println("Cleaned up CAN data messages after transmission");
 }
 
 static bool cellularSend(const JsonDocument &doc) {
   Serial.println("### Sending Time-Series JSON Data");
-  Serial.print("Messages in queue: ");
-  Serial.println(doc["can_messages"].size());
-  Serial.print("Vehicle data entries: ");
-  Serial.println(doc["vehicle_data"].size());
+  //Serial.print("Messages in queue: ");
+  //Serial.println(doc["can_messages"].size());
+  //Serial.print("Vehicle data entries: ");
+  //Serial.println(doc["vehicle_data"].size());
 
   Serial.print("Connecting ");
   Serial.print(HOST);

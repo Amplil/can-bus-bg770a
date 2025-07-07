@@ -21,6 +21,11 @@ static constexpr int POWER_ON_TIMEOUT = 1000 * 20;     // [ms]
 static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 3;  // [ms]
 static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // [ms]
 static JsonDocument JsonDoc;
+// Initialize JSON document structure
+//JsonDoc["session_start"] = millis();
+//JsonDoc["device_id"] = "WIO_BG770A_001";
+JsonArray can_messages = JsonDoc.createNestedArray("can_messages");
+JsonArray vehicle_data = JsonDoc.createNestedArray("vehicle_data");
 
 WioCAN can;
 
@@ -129,13 +134,7 @@ void setup() {
     Serial.println("Filt5 set: FAILED");
   }
   digitalWrite(LED_BUILTIN, LOW);
-  
-  // Initialize JSON document structure
-  JsonDoc["session_start"] = millis();
-  JsonDoc["device_id"] = "WIO_BG770A_001";
-  JsonDoc["can_messages"] = JsonArray();
-  JsonDoc["vehicle_data"].to<JsonObject>();
-  
+    
   Serial.println();
   Serial.println("=== CAN Bus Initialization Complete ===");
   Serial.println("Listening for ALL CAN messages...");
@@ -145,7 +144,7 @@ void setup() {
 
 void loop() {
   // 統計情報用の変数
-  static unsigned long totalMessages = 0;
+  //static unsigned long totalMessages = 0;
   static unsigned long lastStatsTime = 0;
   
   // OBD-II PID要求を複数種類順番に送信
@@ -192,7 +191,7 @@ void loop() {
   unsigned long id = 0;
   unsigned char data[8];
   if(can.receive(&id, data)) {
-    totalMessages++;
+    //totalMessages++;
     
     // タイムスタンプごとにJSONに蓄積
     addCANMessageToJSON(id, data, millis());
@@ -315,10 +314,9 @@ void loop() {
 
 // CANメッセージをタイムスタンプ付きでJSONに追加
 void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long timestamp) {
-  JsonArray messages = JsonDoc["can_messages"];
-  
-  // 新しいメッセージオブジェクトを作成
-  JsonObject message = messages.add<JsonObject>();
+  //JsonArray messages = JsonDoc["can_messages"];
+    
+  JsonObject message = can_messages.add<JsonObject>();
   message["timestamp"] = timestamp;
   message["can_id"] = "0x" + String(id, HEX);
   
@@ -345,16 +343,17 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
   } else {
     message["type"] = "Unknown";
   }
-  
+  /*
   // メッセージ数が多すぎる場合は古いものを削除（メモリ管理）
   if(messages.size() > 50) {
     messages.remove(0);  // 最古のメッセージを削除
   }
+  */
 }
 
 // 車両データを時系列で更新
 void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
-  JsonObject vehicleData = JsonDoc["vehicle_data"].to<JsonObject>();
+  //JsonObject vehicleData = JsonDoc["vehicle_data"].to<JsonObject>();
   
   // raw_data オブジェクトが存在しない場合は作成
   if (!vehicleData["raw_data"].is<JsonObject>()) {
@@ -363,7 +362,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
   
   JsonArray rawDataArray = vehicleData["raw_data"]["data"].to<JsonArray>();
   // 既存のデータをクリア
-  rawDataArray.clear();
+  //rawDataArray.clear();
   for(int i = 0; i < 8; i++) {
     rawDataArray.add(data[i]);
   }
@@ -459,14 +458,9 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
 
 // 古いメッセージをクリーンアップ（メモリ管理）
 void cleanupOldMessages() {
-  JsonArray messages = JsonDoc["can_messages"];
-  
-  // メッセージ配列をクリア（送信後なので）
-  while(messages.size() > 0) {
-    messages.remove(0);
-  }
-  
-  Serial.println("Cleaned up old CAN messages after transmission");
+  can_messages.clear();
+  vehicle_data.clear();
+  Serial.println("Cleaned up CAN data messages after transmission");
 }
 
 static bool cellularSend(const JsonDocument &doc) {

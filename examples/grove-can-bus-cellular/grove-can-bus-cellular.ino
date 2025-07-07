@@ -24,8 +24,8 @@ static JsonDocument JsonDoc;
 // Initialize JSON document structure
 //JsonDoc["session_start"] = millis();
 //JsonDoc["device_id"] = "WIO_BG770A_001";
-JsonArray can_messages = JsonDoc.createNestedArray("can_messages");
-JsonArray vehicle_data = JsonDoc.createNestedArray("vehicle_data");
+JsonArray canMessages = JsonDoc["can_messages"].to<JsonArray>();
+JsonArray vehicleData = JsonDoc["vehicle_data"].to<JsonArray>();
 
 WioCAN can;
 
@@ -316,7 +316,7 @@ void loop() {
 void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long timestamp) {
   //JsonArray messages = JsonDoc["can_messages"];
     
-  JsonObject message = can_messages.add<JsonObject>();
+  JsonObject message = canMessages.add<JsonObject>();
   message["timestamp"] = timestamp;
   message["can_id"] = "0x" + String(id, HEX);
   
@@ -353,27 +353,23 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
 
 // 車両データを時系列で更新
 void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
-  //JsonObject vehicleData = JsonDoc["vehicle_data"].to<JsonObject>();
+  JsonObject dataObj = vehicleData.add<JsonObject>();
+  dataObj["raw_data"].to<JsonObject>();
   
-  // raw_data オブジェクトが存在しない場合は作成
-  if (!vehicleData["raw_data"].is<JsonObject>()) {
-    vehicleData["raw_data"].to<JsonObject>();
-  }
-  
-  JsonArray rawDataArray = vehicleData["raw_data"]["data"].to<JsonArray>();
+  JsonArray rawDataArray = dataObj["raw_data"]["data"].to<JsonArray>();
   // 既存のデータをクリア
   //rawDataArray.clear();
   for(int i = 0; i < 8; i++) {
     rawDataArray.add(data[i]);
   }
-  vehicleData["raw_data"]["pid"] = pid;
-  vehicleData["raw_data"]["timestamp"] = timestamp;
+  dataObj["raw_data"]["pid"] = pid;
+  dataObj["raw_data"]["timestamp"] = timestamp;
 
   switch(pid) {
     case PID_ENGIN_PRM: // Engine RPM
       if(data[0] >= 4) {
         unsigned int rpm = ((data[3] * 256) + data[4]) / 4;
-        JsonObject rpmObj = vehicleData["engine_rpm"].to<JsonObject>();
+        JsonObject rpmObj = dataObj["engine_rpm"].to<JsonObject>();
         rpmObj["value"] = rpm;
         rpmObj["unit"] = "rpm";
         rpmObj["timestamp"] = timestamp;
@@ -382,7 +378,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       
     case PID_VEHICLE_SPEED: // Vehicle Speed
       {
-        JsonObject speedObj = vehicleData["vehicle_speed"].to<JsonObject>();
+        JsonObject speedObj = dataObj["vehicle_speed"].to<JsonObject>();
         speedObj["value"] = data[3];
         speedObj["unit"] = "km/h";
         speedObj["timestamp"] = timestamp;
@@ -391,7 +387,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       
     case PID_COOLANT_TEMP: // Coolant Temperature
       {
-        JsonObject coolantObj = vehicleData["coolant_temp"].to<JsonObject>();
+        JsonObject coolantObj = dataObj["coolant_temp"].to<JsonObject>();
         coolantObj["value"] = data[3] - 40;
         coolantObj["unit"] = "°C";
         coolantObj["timestamp"] = timestamp;
@@ -400,7 +396,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       
     case PID_ENGINE_LOAD: // Engine Load
       {
-        JsonObject loadObj = vehicleData["engine_load"].to<JsonObject>();
+        JsonObject loadObj = dataObj["engine_load"].to<JsonObject>();
         loadObj["value"] = data[3] * 100.0 / 255.0;
         loadObj["unit"] = "%";
         loadObj["timestamp"] = timestamp;
@@ -409,7 +405,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       
     case PID_INTAKE_AIR_TEMP: // Intake Air Temperature
       {
-        JsonObject intakeObj = vehicleData["intake_air_temp"].to<JsonObject>();
+        JsonObject intakeObj = dataObj["intake_air_temp"].to<JsonObject>();
         intakeObj["value"] = data[3] - 40;
         intakeObj["unit"] = "°C";
         intakeObj["timestamp"] = timestamp;
@@ -418,7 +414,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       
     case PID_THROTTLE_POS: // Throttle Position
       {
-        JsonObject throttleObj = vehicleData["throttle_position"].to<JsonObject>();
+        JsonObject throttleObj = dataObj["throttle_position"].to<JsonObject>();
         throttleObj["value"] = data[3] * 100.0 / 255.0;
         throttleObj["unit"] = "%";
         throttleObj["timestamp"] = timestamp;
@@ -428,7 +424,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
     case PID_DISTANCE_TRAVELED: // Distance Traveled
       if(data[0] >= 4) {
         unsigned int distance = (data[3] * 256) + data[4];
-        JsonObject distanceObj = vehicleData["distance_traveled"].to<JsonObject>();
+        JsonObject distanceObj = dataObj["distance_traveled"].to<JsonObject>();
         distanceObj["value"] = distance;
         distanceObj["unit"] = "km";
         distanceObj["timestamp"] = timestamp;
@@ -438,7 +434,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
     case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
       if(data[0] >= 4) {
         float voltage = ((data[3] * 256) + data[4]) / 1000.0;
-        JsonObject voltageObj = vehicleData["control_module_voltage"].to<JsonObject>();
+        JsonObject voltageObj = dataObj["control_module_voltage"].to<JsonObject>();
         voltageObj["value"] = voltage;
         voltageObj["unit"] = "V";
         voltageObj["timestamp"] = timestamp;
@@ -447,7 +443,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       
     case PID_AMBIENT_AIR_TEMP: // Ambient Air Temperature
       {
-        JsonObject ambientObj = vehicleData["ambient_air_temp"].to<JsonObject>();
+        JsonObject ambientObj = dataObj["ambient_air_temp"].to<JsonObject>();
         ambientObj["value"] = data[3] - 40;
         ambientObj["unit"] = "°C";  
         ambientObj["timestamp"] = timestamp;
@@ -458,8 +454,8 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
 
 // 古いメッセージをクリーンアップ（メモリ管理）
 void cleanupOldMessages() {
-  can_messages.clear();
-  vehicle_data.clear();
+  canMessages.clear();
+  vehicleData.clear();
   Serial.println("Cleaned up CAN data messages after transmission");
 }
 

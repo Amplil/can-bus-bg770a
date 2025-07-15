@@ -349,12 +349,15 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
 // 車両データを時系列で更新
 void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
   JsonObject dataObj = rootArray.add<JsonObject>();
-  JsonArray rawDataArray = dataObj["raw_data"].to<JsonArray>();
-  // 既存のデータをクリア
-  //rawDataArray.clear();
+  
+  // raw_dataを文字列として格納
+  String rawDataString = "";
   for(int i = 0; i < 8; i++) {
-    rawDataArray.add(data[i]);
+    if(data[i] < 0x10) rawDataString += "0";
+    rawDataString += String(data[i], HEX);
+    if(i < 7) rawDataString += " ";
   }
+  dataObj["raw_data"] = rawDataString;
   dataObj["pid"] = pid;
   dataObj["timestamp"] = timestamp;
 

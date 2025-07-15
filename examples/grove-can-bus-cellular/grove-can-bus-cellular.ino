@@ -158,11 +158,11 @@ void loop() {
   // 送信するPIDの配列
   static unsigned char obdPids[] = {
     PID_ENGIN_PRM, PID_VEHICLE_SPEED, PID_COOLANT_TEMP, PID_ENGINE_LOAD, PID_INTAKE_AIR_TEMP,
-    PID_THROTTLE_POS, PID_DISTANCE_TRAVELED, PID_CONTROL_MODULE_VOLTAGE, PID_AMBIENT_AIR_TEMP
+    PID_THROTTLE_POS, PID_DISTANCE_TRAVELED, PID_ODOMETER, PID_CONTROL_MODULE_VOLTAGE, PID_AMBIENT_AIR_TEMP
   };
   static const char* obdPidNames[] = {
     "Engine RPM", "Vehicle Speed", "Coolant Temperature", "Engine Load",
-    "Intake Air Temperature", "Throttle Position", "Distance Traveled", "Control Module Voltage", "Ambient Air Temperature"
+    "Intake Air Temperature", "Throttle Position", "Distance Traveled", "Odometer", "Control Module Voltage", "Ambient Air Temperature"
   };
   static int currentPidIndex = 0;
   static int numPids = sizeof(obdPids) / sizeof(obdPids[0]);
@@ -261,15 +261,23 @@ void loop() {
             Serial.print(data[3] * 100.0 / 255.0);
             Serial.print(" %");
             break;
-          case PID_DISTANCE_TRAVELED: // Distance Traveled
-            if(data[0] >= 4) {
-              unsigned int distance = (data[3] * 256) + data[4];
-              Serial.print(" | Distance Traveled: ");
-              Serial.print(distance);
-              Serial.print(" km");
-            }
-            break;
-          case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
+                          case PID_DISTANCE_TRAVELED: // Distance Traveled
+                  if(data[0] >= 4) {
+                    unsigned int distance = (data[3] * 256) + data[4];
+                    Serial.print(" | Distance Traveled: ");
+                    Serial.print(distance);
+                    Serial.print(" km");
+                  }
+                  break;
+                case PID_ODOMETER: // Odometer
+                  if(data[0] >= 6) {
+                    unsigned long odometer = ((unsigned long)data[3] << 24) + ((unsigned long)data[4] << 16) + ((unsigned long)data[5] << 8) + data[6];
+                    Serial.print(" | Odometer: ");
+                    Serial.print(odometer * 0.1);
+                    Serial.print(" km");
+                  }
+                  break;
+                case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
             if(data[0] >= 4) {
               float voltage = ((data[3] * 256) + data[4]) / 1000.0;
               Serial.print(" | Control Module Voltage: ");
@@ -403,6 +411,13 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       if(data[0] >= 4) {
         unsigned int distance = (data[3] * 256) + data[4];
         vehicleData["distance_traveled"] = distance;
+      }
+      break;
+      
+    case PID_ODOMETER: // Odometer
+      if(data[0] >= 6) {
+        unsigned long odometer = ((unsigned long)data[3] << 24) + ((unsigned long)data[4] << 16) + ((unsigned long)data[5] << 8) + data[6];
+        vehicleData["odometer"] = odometer * 0.1;
       }
       break;
       

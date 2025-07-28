@@ -94,6 +94,16 @@ void WioCAN::sendPid(unsigned char __pid) {
 #endif
 }
 
+void WioCAN::sendDtc(unsigned char __dtc_mode) {
+    unsigned char tmp[8] = {0x01, __dtc_mode, 0, 0, 0, 0, 0, 0};
+    
+#if STANDARD_CAN_11BIT
+    this->send(CAN_ID_PID, 0, 0, 8, tmp);   // SEND TO ID:0X55
+#else
+    this->send(CAN_ID_PID, 1, 0, 8, tmp);   // SEND TO ID:0X55
+#endif
+}
+
 bool WioCAN::receive(unsigned long* id, unsigned char* buf) {
   if(!canSerial->available()) {
     return false;

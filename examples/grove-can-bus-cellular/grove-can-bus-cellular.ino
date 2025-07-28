@@ -166,6 +166,10 @@ void loop() {
   };
   static int currentPidIndex = 0;
   static int numPids = sizeof(obdPids) / sizeof(obdPids[0]);
+  
+  // DTC関連の変数
+  static unsigned long lastDtcSend = 0;
+  static int dtcSendInterval = 30000; // 30秒ごとにDTCを取得
 
   if(millis() - lastRotateSend > rotateSendInterval) {
     if(millis() - lastSend > sendInterval) {
@@ -188,16 +192,26 @@ void loop() {
       Serial.println("--------------------------------");
     }
   }
+  
+  // DTC送信タイミング
+  if(millis() - lastDtcSend > dtcSendInterval) {
+    sendDtcRequest();
+    lastDtcSend = millis();
+  }
+  
   // すべてのCAN信号を受信・表示
   unsigned long id = 0;
   unsigned char data[8];
   if(can.receive(&id, data)) {
     //totalMessages++;
     
-    // タイムスタンプごとにJSONに蓄積
-    //addCANMessageToJSON(id, data, millis());
-    // OBD2データを車両データとしても記録
-    updateVehicleData(data[2], data, millis());
+    // DTCレスポンスかどうかをチェック
+    if(id >= 0x7E8 && id <= 0x7EF && data[0] >= 3 && data[1] == 0x43) {
+      processDtcData(data, millis());
+    } else {
+      // OBD2データを車両データとしても記録
+      updateVehicleData(data[2], data, millis());
+    }
     
     // 受信メッセージの詳細表示
     Serial.print("[");
@@ -221,7 +235,14 @@ void loop() {
     if((id >= 0x7E8 && id <= 0x7EF)) {
       Serial.print("OBD-II Response from ECU ");
       Serial.print(id - 0x7E8);
-      if(data[0] >= 2 && data[1] == 0x41) {
+      
+      // DTCレスポンスの場合
+      if(data[0] >= 3 && data[1] == 0x43) {
+        Serial.print(" | DTC Response | Count: ");
+        Serial.print(data[2]);
+      }
+      // 通常のPIDレスポンスの場合
+      else if(data[0] >= 2 && data[1] == 0x41) {
         Serial.print(" | PID: 0x");
         Serial.print(data[2], HEX);
         
@@ -320,6 +341,77 @@ void loop() {
 
   delay(10);
 }
+
+// DTC送信機能
+void sendDtcRequest() {
+  can.sendDtc(PID_DTC_READ);
+  Serial.println("Sent DTC request");
+}
+
+// DTCコードを文字列に変換
+String dtcToString(unsigned char highByte, unsigned char lowByte) {
+  String dtcType = "";
+  String dtcNumber = "";
+  
+  // DTCタイプの判定（上位2ビット）
+  unsigned char type = (highByte >> 6) & 0x03;
+  switch(type) {
+    case 0x00: dtcType = "P"; break;
+    case 0x01: dtcType = "C"; break;
+    case 0x02: dtcType = "B"; break;
+    case 0x03: dtcType = "U"; break;
+  }
+  
+  // DTCナンバーの取得（14ビット）
+  unsigned int number = ((highByte & 0x3F) << 8) | lowByte;
+  dtcNumber = String(number, HEX);
+  dtcNumber.toUpperCase();
+  
+  // 4桁になるように0埋め
+  while(dtcNumber.length() < 4) {
+    dtcNumber = "0" + dtcNumber;
+  }
+  
+  return dtcType + dtcNumber;
+}
+
+// DTCデータを処理
+void processDtcData(unsigned char* data, unsigned long timestamp) {
+  if(data[0] >= 3 && data[1] == 0x43) { // DTCレスポンス
+    unsigned char numDtc = data[2];
+    Serial.print("DTC Count: ");
+    Serial.println(numDtc);
+    
+    if(numDtc > 0) {
+      // DTCデータを配列に格納
+      String dtcCodes = "";
+      for(int i = 0; i < numDtc && i < 3; i++) { // 最大3つのDTCを処理
+        if(data[0] >= (3 + i*2 + 1)) {
+          String dtcCode = dtcToString(data[3 + i*2], data[4 + i*2]);
+          Serial.print("DTC ");
+          Serial.print(i+1);
+          Serial.print(": ");
+          Serial.println(dtcCode);
+          
+          if(dtcCodes.length() > 0) dtcCodes += ",";
+          dtcCodes += dtcCode;
+        }
+      }
+      
+      // JSONデータに追加
+      vehicleData["dtc_codes"] = dtcCodes;
+      vehicleData["dtc_count"] = numDtc;
+      vehicleData["dtc_timestamp"] = timestamp;
+    } else {
+      // DTCなし
+      vehicleData["dtc_codes"] = "";
+      vehicleData["dtc_count"] = 0;
+      vehicleData["dtc_timestamp"] = timestamp;
+      Serial.println("No DTCs found");
+    }
+  }
+}
+
 /*
 // CANメッセージをタイムスタンプ付きでJSONに追加
 void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long timestamp) {

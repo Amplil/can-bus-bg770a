@@ -41,6 +41,12 @@
 #define PID_CONTROL_MODULE_VOLTAGE 0x42
 #define PID_AMBIENT_AIR_TEMP 0x46
 
+// DTC (Diagnostic Trouble Code) PIDs
+#define PID_DTC_READ 0x03
+#define PID_DTC_CLEAR 0x04
+#define PID_DTC_PENDING 0x07
+#define PID_DTC_PERMANENT 0x0A
+
 #if STANDARD_CAN_11BIT
 #define CAN_ID_PID          0x7DF
 #else
@@ -63,6 +69,7 @@ public:
   bool setCanRate(unsigned char rate);
   bool send(unsigned long id, unsigned char ext, unsigned char rtr, unsigned char len, const unsigned char* buf);
   void sendPid(unsigned char __pid);
+void sendDtc(unsigned char __dtc_mode);
   bool receive(unsigned long* id, unsigned char* buf);
   void debugMode();
   void debugPID();

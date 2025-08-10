@@ -362,15 +362,12 @@ String dtcToString(unsigned char highByte, unsigned char lowByte) {
     case 0x03: dtcType = "U"; break;
   }
   
-  // DTCナンバーの取得（14ビット）
-  unsigned int number = ((highByte & 0x3F) << 8) | lowByte;
-  dtcNumber = String(number, HEX);
-  dtcNumber.toUpperCase();
-  
-  // 4桁になるように0埋め
-  while(dtcNumber.length() < 4) {
-    dtcNumber = "0" + dtcNumber;
-  }
+  // DTCナンバーの取得（14ビット、10進数）
+  uint8_t d2 = (highByte >> 4) & 0x03; // only 2 bits valid per spec
+  uint8_t d3 = highByte & 0x0F;
+  uint8_t d4 = (lowByte >> 4) & 0x0F;
+  uint8_t d5 = lowByte & 0x0F;
+  dtcNumber = String(d2) + String(d3) + String(d4) + String(d5);
   
   return dtcType + dtcNumber;
 }

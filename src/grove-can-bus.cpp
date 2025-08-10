@@ -95,7 +95,9 @@ void WioCAN::sendPid(unsigned char __pid) {
 }
 
 void WioCAN::sendDtc(unsigned char __dtc_mode) {
-    unsigned char tmp[8] = {0x01, __dtc_mode, 0, 0, 0, 0, 0, 0};
+    // OBD-II Mode 03 request should be sent as a Single Frame with length 0x02 and a padding byte 0x00
+    // Example: 0x02, 0x03, 0x00, 0x00, ...
+    unsigned char tmp[8] = {0x02, __dtc_mode, 0x00, 0, 0, 0, 0, 0};
     
 #if STANDARD_CAN_11BIT
     this->send(CAN_ID_PID, 0, 0, 8, tmp);   // SEND TO ID:0X55

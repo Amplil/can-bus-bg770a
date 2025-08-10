@@ -282,23 +282,23 @@ void loop() {
             Serial.print(data[3] * 100.0 / 255.0);
             Serial.print(" %");
             break;
-                          case PID_DISTANCE_TRAVELED: // Distance Traveled
-                  if(data[0] >= 4) {
-                    unsigned int distance = (data[3] * 256) + data[4];
-                    Serial.print(" | Distance Traveled: ");
-                    Serial.print(distance);
-                    Serial.print(" km");
-                  }
-                  break;
-                case PID_ODOMETER: // Odometer
-                  if(data[0] >= 6) {
-                    unsigned long odometer = ((unsigned long)data[3] << 24) + ((unsigned long)data[4] << 16) + ((unsigned long)data[5] << 8) + data[6];
-                    Serial.print(" | Odometer: ");
-                    Serial.print(odometer * 0.1);
-                    Serial.print(" km");
-                  }
-                  break;
-                case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
+          case PID_DISTANCE_TRAVELED: // Distance Traveled
+            if(data[0] >= 4) {
+              unsigned int distance = (data[3] * 256) + data[4];
+              Serial.print(" | Distance Traveled: ");
+              Serial.print(distance);
+              Serial.print(" km");
+            }
+            break;
+          case PID_ODOMETER: // Odometer
+            if(data[0] >= 6) {
+              unsigned long odometer = ((unsigned long)data[3] << 24) + ((unsigned long)data[4] << 16) + ((unsigned long)data[5] << 8) + data[6];
+              Serial.print(" | Odometer: ");
+              Serial.print(odometer * 0.1);
+              Serial.print(" km");
+            }
+            break;
+          case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
             if(data[0] >= 4) {
               float voltage = ((data[3] * 256) + data[4]) / 1000.0;
               Serial.print(" | Control Module Voltage: ");
@@ -377,38 +377,55 @@ String dtcToString(unsigned char highByte, unsigned char lowByte) {
 
 // DTCデータを処理
 void processDtcData(unsigned char* data, unsigned long timestamp) {
-  if(data[0] >= 3 && data[1] == 0x43) { // DTCレスポンス
-    unsigned char numDtc = data[2];
-    Serial.print("DTC Count: ");
-    Serial.println(numDtc);
-    
-    if(numDtc > 0) {
-      // DTCデータを配列に格納
-      String dtcCodes = "";
-      for(int i = 0; i < numDtc && i < 3; i++) { // 最大3つのDTCを処理
-        if(data[0] >= (3 + i*2 + 1)) {
-          String dtcCode = dtcToString(data[3 + i*2], data[4 + i*2]);
-          Serial.print("DTC ");
-          Serial.print(i+1);
-          Serial.print(": ");
-          Serial.println(dtcCode);
-          
-          if(dtcCodes.length() > 0) dtcCodes += ",";
-          dtcCodes += dtcCode;
-        }
-      }
-      
-      // JSONデータに追加
-      vehicleData["dtc_codes"] = dtcCodes;
-      vehicleData["dtc_count"] = numDtc;
-      vehicleData["dtc_timestamp"] = timestamp;
-    } else {
-      // DTCなし
+  // ISO-TP PCI 判定
+  const uint8_t pciType = data[0] & 0xF0;   // 0x0? = SingleFrame, 0x1? = FirstFrame, 0x2? = Consecutive, 0x3? = Flow
+  const uint8_t sfPayloadLen = data[0] & 0x0F; // SingleFrame のペイロード長
+
+  // Single Frame 以外（マルチフレーム）は未対応（今後再組立てが必要）
+  if (pciType == 0x10) {
+    // First Frame of multi-frame response for DTCs
+    Serial.println("DTC response is multi-frame (not reassembled). Skipping for now.");
+    vehicleData["dtc_codes"] = "MULTI";  // マルチフレームは未対応のため FALSE を格納
+    vehicleData["dtc_count"] = 0;
+    return;
+  }
+  if (pciType != 0x00) {
+    Serial.println("pciType != 0x00");
+    return; // 未対応フレーム
+  }
+
+  // 期待: data[1] = 0x43 (Mode 03 Response)
+  if (sfPayloadLen >= 3 && data[1] == 0x43) {
+    // 以降はDTCの2バイトペアの列
+    // このフレーム内で実際に載っているDTC数（Single Frameに収まる分のみ）
+    const uint8_t bytesAfterService = sfPayloadLen - 1; // service(0x43) を除いたバイト数
+    uint8_t dtcPairsInFrame = bytesAfterService / 2;
+    // フレーム上の位置の上限（データは data[2]～data[7]）
+    dtcPairsInFrame = min<uint8_t>(dtcPairsInFrame, 3);
+
+    if (dtcPairsInFrame == 0) {
       vehicleData["dtc_codes"] = "";
       vehicleData["dtc_count"] = 0;
-      vehicleData["dtc_timestamp"] = timestamp;
-      Serial.println("No DTCs found");
+      Serial.println("No DTCs found in single-frame response");
+      return;
     }
+
+    String dtcCodes = "";
+    for (uint8_t i = 0; i < dtcPairsInFrame; i++) {
+      const uint8_t hi = data[2 + i * 2];
+      const uint8_t lo = data[3 + i * 2];
+      String dtcCode = dtcToString(hi, lo);
+      Serial.print("DTC ");
+      Serial.print(i + 1);
+      Serial.print(": ");
+      Serial.println(dtcCode);
+      if (dtcCodes.length() > 0) dtcCodes += ",";
+      dtcCodes += dtcCode;
+    }
+
+    vehicleData["dtc_codes"] = dtcCodes;
+    vehicleData["dtc_count"] = dtcPairsInFrame; // Single Frame内で取得できた件数
+    //vehicleData["dtc_timestamp"] = timestamp;
   }
 }
 

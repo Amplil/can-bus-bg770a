@@ -13,8 +13,7 @@
 #include <time.h>
 
 #define SEARCH_ACCESS_TECHNOLOGY (WioCellularNetwork::SearchAccessTechnology::LTEM)  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
-#define LTEM_BAND (WioCellularNetwork::NTTDOCOMO_LTEM_BAND)        
-                  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
+#define LTEM_BAND (WioCellularNetwork::NTTDOCOMO_LTEM_BAND) // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
 static const char APN[] = "soracom.io";
 static const char HOST[] = "uni.soracom.io";
 static constexpr int PORT = 23080;
@@ -23,17 +22,16 @@ static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 3;  // [ms]
 static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // [ms]
 static JsonDocument JsonDoc;
 //JsonObject vehicleData = JsonDoc.to<JsonObject>();
-// Initialize JSON document structure
-//JsonDoc["session_start"] = millis();
-//JsonDoc["device_id"] = "WIO_BG770A_001";
-//JsonArray canMessages = JsonDoc["can_messages"].to<JsonArray>();
-JsonArray dataArray = JsonDoc.to<JsonArray>();
-JsonObject vehicleData = dataArray.add<JsonObject>();
+JsonArray dataArray = JsonDoc["data"].to<JsonArray>();
+JsonObject vehicleData; // dataArrayに追加するJsonObject
+char initializeTime[64]; // 初期化時の時刻を保存するための変数
+unsigned long initializeMillis = 0; // 初期化時のmillis()値
+
 static constexpr int OBD_COMMAND_INTERVAL = 50; // [ms] 1つずつのOBD-IIコマンドを送信する間隔
 static constexpr int OBD_INTERVAL = 5000; // [ms] OBD-IIのデータ取得のためのコマンド群を送信する間隔
 //static constexpr int CELLULAR_INTERVAL = 60000; // [ms] セルラーデータの送信間隔
-static constexpr int CELLULAR_INTERVAL = 35000; // [ms] セルラーデータの送信間隔
-static constexpr int DTC_INTERVAL = 30000; // [ms] DTCのデータ取得のためのコマンドを送信する間隔
+static constexpr int CELLULAR_INTERVAL = 20000; // [ms] セルラーデータの送信間隔
+static constexpr int DTC_INTERVAL = 15000; // [ms] DTCのデータ取得のためのコマンドを送信する間隔
 
 static constexpr int PSM_INTERVAL = 1000 * 60 * 5;        // [ms]
 static constexpr int PSM_PERIOD = 60 * 6;                 // [s] モジュールがスリープ状態に入るまでの待機期間
@@ -146,6 +144,21 @@ void setup() {
   } else {
     Serial.println("Filt5 set: FAILED");
   }
+
+  const auto start_time = millis();
+  // Initialize JSON schema for vehicleData
+  if(GetTime(initializeTime)) {
+    const auto end_time = millis();
+    Serial.print("時刻(ISO8601):");
+    Serial.println(formatTime(initializeTime));
+    Serial.print("時刻を取得するのにかかった時間(ms):");
+    Serial.println(end_time - start_time);
+    initializeMillis = millis(); // 時刻取得成功時のmillis()を記録
+  } else {
+    Serial.println("時刻を取得できませんでした。");
+    abort();
+  }
+  initializeVehicleDataSchema();
   digitalWrite(LED_BUILTIN, LOW);
     
   Serial.println();
@@ -201,7 +214,8 @@ void loop() {
     }
     if(currentPidIndex == 0) {
       lastRotateSend = millis();
-      vehicleData = dataArray.add<JsonObject>(); // 配列に新しいデータを追加できるよう初期化
+      //vehicleData = dataArray.add<JsonObject>(); // 配列に新しいデータを追加できるよう初期化
+      initializeVehicleDataSchema();
       Serial.println("--------------------------------");
     }
   }
@@ -428,7 +442,7 @@ void processDtcData(unsigned char* data) {
       Serial.print(i + 1);
       Serial.print(": ");
       Serial.println(dtcCode);
-      if (dtcCodes.length() > 0) dtcCodes += ",";
+      if (dtcCodes.length() > 0) dtcCodes += " ";
       dtcCodes += dtcCode;
     }
 
@@ -438,44 +452,10 @@ void processDtcData(unsigned char* data) {
   }
 }
 
-/*
-// CANメッセージをタイムスタンプ付きでJSONに追加
-void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long timestamp) {
-  //JsonArray messages = JsonDoc["can_messages"];
-  JsonObject message = rootArray.add<JsonObject>();
-  message["timestamp"] = timestamp;
-  message["can_id"] = "0x" + String(id, HEX);
-  
-  // データ配列を追加
-  JsonArray dataArray = message["data"].to<JsonArray>();
-  for(int i = 0; i < 8; i++) {
-    dataArray.add(data[i]);
-  }
-  
-  // メッセージタイプの判定
-  if(id >= 0x7E8 && id <= 0x7EF) {
-    message["type"] = "OBD2_Response";
-    message["ecu_id"] = id - 0x7E8;
-    
-    if(data[0] >= 2 && data[1] == 0x41) {
-      message["pid"] = "0x" + String(data[2], HEX);
-    }
-  } else if(id >= 0x100 && id <= 0x1FF) {
-    message["type"] = "Engine_Control";
-  } else if(id >= 0x200 && id <= 0x2FF) {
-    message["type"] = "Transmission_Control";
-  } else if(id >= 0x300 && id <= 0x3FF) {
-    message["type"] = "Body_Control";
-  } else {
-    message["type"] = "Unknown";
-  }
-}
-*/
-
 // 車両データを単一オブジェクトに更新
 void updateVehicleData(unsigned char pid, unsigned char* data) {
   // 単一のオブジェクトに全データを格納
-  
+  /*
   // raw_dataを文字列として格納（最新のもので上書き）
   String rawDataString = "";
   for(int i = 0; i < 8; i++) {
@@ -483,15 +463,9 @@ void updateVehicleData(unsigned char pid, unsigned char* data) {
     rawDataString += String(data[i], HEX);
     if(i < 7) rawDataString += " ";
   }
-  //vehicleData["raw_data"] = rawDataString;
-  //vehicleData["pid"] = pid;
-  if (!vehicleData["time"].is<String>()) {
-    const auto start_time = millis();
-    vehicleData["time"] = GetTime();
-    const auto end_time = millis();
-    Serial.print("時刻を取得するのにかかった時間(ms):");
-    Serial.println(end_time - start_time);
-  }
+  vehicleData["raw_data"] = rawDataString;
+  vehicleData["pid"] = pid;
+  */
 
   switch(pid) {
     case PID_ENGIN_PRM: // Engine RPM
@@ -564,6 +538,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data) {
 void clearData() {
   // vehicleData.clear(); // 全データをクリアする場合
   dataArray.clear();
+  initializeVehicleDataSchema();
   Serial.println("dataArrayをクリアしました。");
 }
 
@@ -616,6 +591,73 @@ static bool cellularSend(const JsonDocument &doc) {
   return true;
 }
 
+static void initializeVehicleDataSchema() {
+  const auto now_millis = millis();
+  
+  // 経過時間を計算して現在時刻を生成
+  unsigned long elapsedSeconds = (now_millis - initializeMillis) / 1000;
+  
+  // initializeTimeから年月日時分秒を抽出
+  int Y, M, D, h, m, s;
+  if (sscanf(initializeTime, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) == 6) {
+    // 経過秒を加算
+    s += elapsedSeconds;
+    
+    // 秒の繰り上がり処理
+    while (s >= 60) {
+      s -= 60;
+      m++;
+    }
+    while (m >= 60) {
+      m -= 60;
+      h++;
+    }
+    while (h >= 24) {
+      h -= 24;
+      D++;
+    }
+    // 月末処理（簡易版）
+    int daysInMonth[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if ((Y % 4 == 0 && Y % 100 != 0) || (Y % 400 == 0)) {
+      daysInMonth[1] = 29; // うるう年
+    }
+    while (D > daysInMonth[M-1]) {
+      D -= daysInMonth[M-1];
+      M++;
+      if (M > 12) {
+        M = 1;
+        Y++;
+      }
+    }
+    
+    // 現在時刻をISO8601形式で生成
+    char currentTime[26];
+    snprintf(currentTime, sizeof(currentTime), "%04d-%02d-%02dT%02d:%02d:%02d+09:00",
+             Y, M, D, h, m, s);
+    
+    vehicleData = dataArray.add<JsonObject>(); // 配列に新しいデータを追加できるよう初期化
+    vehicleData["time"] = currentTime; // String (ISO8601)
+  } else {
+    // パース失敗時は初期時刻をそのまま使用
+    vehicleData = dataArray.add<JsonObject>();
+    vehicleData["time"] = initializeTime;
+  }
+  /*
+  vehicleData["engine_rpm"] = "NULL";                   // Number
+  vehicleData["vehicle_speed"] = "NULL";                // Number
+  vehicleData["coolant_temp"] = "NULL";                 // Number (°C)
+  vehicleData["engine_load"] = "NULL";                  // Number (%)
+  vehicleData["intake_air_temp"] = "NULL";              // Number (°C)
+  vehicleData["throttle_position"] = "NULL";            // Number (%)
+  vehicleData["distance_traveled"] = "NULL";            // Number (km)
+  vehicleData["odometer"] = "NULL";                     // Number (km)
+  vehicleData["control_module_voltage"] = "NULL";       // Number (V)
+  vehicleData["ambient_air_temp"] = "NULL";             // Number (°C)
+  vehicleData["dtc_codes"] = "";                   // String (comma-separated)
+  vehicleData["dtc_count"] = 0;                    // Number
+  */
+}
+
 template<typename T>
 void printData(T &stream, const void *data, size_t size) {
   auto p = static_cast<const char *>(data);
@@ -625,80 +667,103 @@ void printData(T &stream, const void *data, size_t size) {
 }
 
 // Get current JST time via worldtimeapi.org
-String GetTime() {
+bool GetTime(char* time) {
   const char* host = "worldtimeapi.org";
   const int port = 80;
+  const int maxRetries = 10;
+  
+  for (int retry = 0; retry < maxRetries; retry++) {
+    if (retry > 0) {
+      Serial.printf("Retrying time API request (%d/%d)\n", retry + 1, maxRetries);
+      delay(1000); // 1秒待機してからリトライ
+    }
+    
+    WioCellularTcpClient2<WioCellularModule> client{ WioCellular };
+    if (!client.open(WioNetwork.config.pdpContextId, host, port)) {
+      Serial.printf("ERROR: Open time API %s\n", WioCellularResultToString(client.getLastResult()));
+      continue; // 次のリトライへ
+    }
+    if (!client.waitForConnect()) {
+      Serial.printf("ERROR: Connect time API %s\n", WioCellularResultToString(client.getLastResult()));
+      continue; // 次のリトライへ
+    }
 
-  WioCellularTcpClient2<WioCellularModule> client{ WioCellular };
-  if (!client.open(WioNetwork.config.pdpContextId, host, port)) {
-    Serial.printf("ERROR: Open time API %s\n", WioCellularResultToString(client.getLastResult()));
-    return "";
-  }
-  if (!client.waitForConnect()) {
-    Serial.printf("ERROR: Connect time API %s\n", WioCellularResultToString(client.getLastResult()));
-    return "";
-  }
+    const char* req =
+      "GET /api/timezone/Asia/Tokyo HTTP/1.1\r\n"
+      "Host: worldtimeapi.org\r\n"
+      "Connection: close\r\n\r\n";
+    if (!client.send(req, strlen(req))) {
+      Serial.printf("ERROR: Send time API %s\n", WioCellularResultToString(client.getLastResult()));
+      continue; // 次のリトライへ
+    }
 
-  const char* req =
-    "GET /api/timezone/Asia/Tokyo HTTP/1.1\r\n"
-    "Host: worldtimeapi.org\r\n"
-    "Connection: close\r\n\r\n";
-  if (!client.send(req, strlen(req))) {
-    Serial.printf("ERROR: Send time API %s\n", WioCellularResultToString(client.getLastResult()));
-    return "";
-  }
+    static uint8_t buf[WioCellular.RECEIVE_SOCKET_SIZE_MAX];
+    size_t recvSize;
+    if (!client.receive(buf, sizeof(buf), &recvSize, RECEIVE_TIMEOUT)) {
+      Serial.printf("ERROR: Receive time API %s\n", WioCellularResultToString(client.getLastResult()));
+      continue; // 次のリトライへ
+    }
 
-  static uint8_t buf[WioCellular.RECEIVE_SOCKET_SIZE_MAX];
-  size_t recvSize;
-  if (!client.receive(buf, sizeof(buf), &recvSize, RECEIVE_TIMEOUT)) {
-    Serial.printf("ERROR: Receive time API %s\n", WioCellularResultToString(client.getLastResult()));
-    return "";
-  }
+    // Parse HTTP response: find JSON body
+    const char* resp = reinterpret_cast<const char*>(buf);
+    const char* body = strstr(resp, "\r\n\r\n");
+    if (!body) {
+      Serial.println("ERROR: HTTP response body not found");
+      continue; // 次のリトライへ
+    }
+    body += 4;
 
-  // Parse HTTP response: find JSON body
-  const char* resp = reinterpret_cast<const char*>(buf);
-  const char* body = strstr(resp, "\r\n\r\n");
-  if (!body) return "";
-  body += 4;
-
-  // JSON parse
-  JsonDocument jd;
-  auto err = deserializeJson(jd, body);
-  if (err) {
-    Serial.print("JSON parse error: ");
-    Serial.println(err.c_str());
-    return "";
-  }
-  if (jd["datetime"].is<const char*>()) {
-    // worldtimeapi datetime: 2024-08-11T10:23:45.123456+09:00
-    const char* dt = jd["datetime"];
-    int Y,M,D,h,m,s;
-    if (sscanf(dt, "%d-%d-%dT%d:%d:%d", &Y,&M,&D,&h,&m,&s) == 6) {
-      struct tm t{};
-      t.tm_year = Y - 1900;
-      t.tm_mon = M - 1;
-      t.tm_mday = D;
-      t.tm_hour = h;
-      t.tm_min = m;
-      t.tm_sec = s;
-      return jd["datetime"];
+    // JSON parse
+    JsonDocument jd;
+    auto err = deserializeJson(jd, body);
+    if (err) {
+      Serial.print("JSON parse error: ");
+      Serial.println(err.c_str());
+      continue; // 次のリトライへ
+    }
+    if (jd["datetime"].is<const char*>()) {
+      // worldtimeapi datetime: 2024-08-11T10:23:45.123456+09:00
+      const char* dt = jd["datetime"];
+      int Y,M,D,h,m,s;
+      if (sscanf(dt, "%d-%d-%dT%d:%d:%d", &Y,&M,&D,&h,&m,&s) == 6) {
+        struct tm t{};
+        t.tm_year = Y - 1900;
+        t.tm_mon = M - 1;
+        t.tm_mday = D;
+        t.tm_hour = h;
+        t.tm_min = m;
+        t.tm_sec = s;
+        /*
+        char formattedTime[26];
+        snprintf(formattedTime, sizeof(formattedTime), "%04d-%02d-%02dT%02d:%02d:%02d+09:00",
+                 Y, M, D, h, m, s);
+        */
+        strcpy(time, dt);
+        return true;
+      } else {
+        Serial.println("ERROR: Failed to parse datetime format");
+        continue; // 次のリトライへ
+      }
+    } else {
+      Serial.println("ERROR: datetime field not found in JSON");
+      continue; // 次のリトライへ
     }
   }
-  return "";
+  
+  Serial.printf("ERROR: Failed to get time after %d retries\n", maxRetries);
+  return false;
 }
-/*
-String timestamp() {
-  const auto start_time = millis();
-  time_t t;
-  GetTime(&t);
-  struct tm *tm_info = localtime(&t);
-  char jstTimeStr[25];
-  snprintf(jstTimeStr, sizeof(jstTimeStr), "%04d-%02d-%02dT%02d:%02d:%02d+09:00",
-           tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
-           tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
-  const auto end_time = millis();
-  Serial.print("時刻を取得するのにかかった時間(ms):");
-  Serial.println(end_time - start_time);
-  return jstTimeStr;
+
+String formatTime(char* dt) {
+  int Y,M,D,h,m,s;
+  if (sscanf(dt, "%d-%d-%dT%d:%d:%d", &Y,&M,&D,&h,&m,&s) == 6) {
+    char formattedTime[26];
+    snprintf(formattedTime, sizeof(formattedTime), "%04d-%02d-%02dT%02d:%02d:%02d+09:00",
+             Y, M, D, h, m, s);
+    return String(formattedTime);
+  }
+  else {
+    Serial.println("ERROR: Failed to parse datetime format");
+    return "";
+  }
 }
-*/

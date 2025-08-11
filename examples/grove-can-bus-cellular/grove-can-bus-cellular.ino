@@ -26,12 +26,12 @@ static JsonDocument JsonDoc;
 //JsonDoc["session_start"] = millis();
 //JsonDoc["device_id"] = "WIO_BG770A_001";
 //JsonArray canMessages = JsonDoc["can_messages"].to<JsonArray>();
-JsonArray dataArray = JsonDoc["data"].to<JsonArray>();
+JsonArray dataArray = JsonDoc.to<JsonArray>();
 JsonObject vehicleData = dataArray.add<JsonObject>();
 static constexpr int OBD_COMMAND_INTERVAL = 50; // [ms] 1つずつのOBD-IIコマンドを送信する間隔
 static constexpr int OBD_INTERVAL = 5000; // [ms] OBD-IIのデータ取得のためのコマンド群を送信する間隔
 //static constexpr int CELLULAR_INTERVAL = 60000; // [ms] セルラーデータの送信間隔
-static constexpr int CELLULAR_INTERVAL = 30000; // [ms] セルラーデータの送信間隔
+static constexpr int CELLULAR_INTERVAL = 35000; // [ms] セルラーデータの送信間隔
 static constexpr int DTC_INTERVAL = 30000; // [ms] DTCのデータ取得のためのコマンドを送信する間隔
 
 static constexpr int PSM_INTERVAL = 1000 * 60 * 5;        // [ms]
@@ -219,10 +219,10 @@ void loop() {
     
     // DTCレスポンスかどうかをチェック
     if(id >= 0x7E8 && id <= 0x7EF && data[0] >= 3 && data[1] == 0x43) {
-      processDtcData(data, millis());
+      processDtcData(data);
     } else {
       // OBD2データを車両データとしても記録
-      updateVehicleData(data[2], data, millis());
+      updateVehicleData(data[2], data);
     }
     
     // 受信メッセージの詳細表示
@@ -384,7 +384,7 @@ String dtcToString(unsigned char highByte, unsigned char lowByte) {
 }
 
 // DTCデータを処理
-void processDtcData(unsigned char* data, unsigned long timestamp) {
+void processDtcData(unsigned char* data) {
   // ISO-TP PCI 判定
   const uint8_t pciType = data[0] & 0xF0;   // 0x0? = SingleFrame, 0x1? = FirstFrame, 0x2? = Consecutive, 0x3? = Flow
   const uint8_t sfPayloadLen = data[0] & 0x0F; // SingleFrame のペイロード長
@@ -472,7 +472,7 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
 */
 
 // 車両データを単一オブジェクトに更新
-void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
+void updateVehicleData(unsigned char pid, unsigned char* data) {
   // 単一のオブジェクトに全データを格納
   
   // raw_dataを文字列として格納（最新のもので上書き）
@@ -482,9 +482,11 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
     rawDataString += String(data[i], HEX);
     if(i < 7) rawDataString += " ";
   }
-  vehicleData["raw_data"] = rawDataString;
-  vehicleData["pid"] = pid;
-  vehicleData["time"] = timestamp;
+  //vehicleData["raw_data"] = rawDataString;
+  //vehicleData["pid"] = pid;
+  if (!vehicleData.containsKey("time")) {
+    vehicleData["time"] = timestamp();
+  }
 
   switch(pid) {
     case PID_ENGIN_PRM: // Engine RPM
@@ -615,4 +617,14 @@ void printData(T &stream, const void *data, size_t size) {
 
   for (; size > 0; --size, ++p)
     stream.write(0x20 <= *p && *p <= 0x7f ? *p : '.');
+}
+
+String timestamp() {
+  time_t t = millis() / 1000;
+  struct tm *tm_info = localtime(&t);
+  char jstTimeStr[25];
+  snprintf(jstTimeStr, sizeof(jstTimeStr), "%04d-%02d-%02dT%02d:%02d:%02d+09:00",
+           tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+           tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+  return jstTimeStr;
 }

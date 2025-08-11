@@ -10,6 +10,7 @@
 #include <WioCellular.h>
 #include <grove-can-bus.h>
 #include <ArduinoJson.h>
+#include <time.h>
 
 #define SEARCH_ACCESS_TECHNOLOGY (WioCellularNetwork::SearchAccessTechnology::LTEM)  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
 #define LTEM_BAND (WioCellularNetwork::NTTDOCOMO_LTEM_BAND)        
@@ -484,8 +485,12 @@ void updateVehicleData(unsigned char pid, unsigned char* data) {
   }
   //vehicleData["raw_data"] = rawDataString;
   //vehicleData["pid"] = pid;
-  if (!vehicleData.containsKey("time")) {
-    vehicleData["time"] = timestamp();
+  if (!vehicleData["time"].is<String>()) {
+    const auto start_time = millis();
+    vehicleData["time"] = GetTime();
+    const auto end_time = millis();
+    Serial.print("時刻を取得するのにかかった時間(ms):");
+    Serial.println(end_time - start_time);
   }
 
   switch(pid) {
@@ -619,12 +624,81 @@ void printData(T &stream, const void *data, size_t size) {
     stream.write(0x20 <= *p && *p <= 0x7f ? *p : '.');
 }
 
+// Get current JST time via worldtimeapi.org
+String GetTime() {
+  const char* host = "worldtimeapi.org";
+  const int port = 80;
+
+  WioCellularTcpClient2<WioCellularModule> client{ WioCellular };
+  if (!client.open(WioNetwork.config.pdpContextId, host, port)) {
+    Serial.printf("ERROR: Open time API %s\n", WioCellularResultToString(client.getLastResult()));
+    return "";
+  }
+  if (!client.waitForConnect()) {
+    Serial.printf("ERROR: Connect time API %s\n", WioCellularResultToString(client.getLastResult()));
+    return "";
+  }
+
+  const char* req =
+    "GET /api/timezone/Asia/Tokyo HTTP/1.1\r\n"
+    "Host: worldtimeapi.org\r\n"
+    "Connection: close\r\n\r\n";
+  if (!client.send(req, strlen(req))) {
+    Serial.printf("ERROR: Send time API %s\n", WioCellularResultToString(client.getLastResult()));
+    return "";
+  }
+
+  static uint8_t buf[WioCellular.RECEIVE_SOCKET_SIZE_MAX];
+  size_t recvSize;
+  if (!client.receive(buf, sizeof(buf), &recvSize, RECEIVE_TIMEOUT)) {
+    Serial.printf("ERROR: Receive time API %s\n", WioCellularResultToString(client.getLastResult()));
+    return "";
+  }
+
+  // Parse HTTP response: find JSON body
+  const char* resp = reinterpret_cast<const char*>(buf);
+  const char* body = strstr(resp, "\r\n\r\n");
+  if (!body) return "";
+  body += 4;
+
+  // JSON parse
+  JsonDocument jd;
+  auto err = deserializeJson(jd, body);
+  if (err) {
+    Serial.print("JSON parse error: ");
+    Serial.println(err.c_str());
+    return "";
+  }
+  if (jd["datetime"].is<const char*>()) {
+    // worldtimeapi datetime: 2024-08-11T10:23:45.123456+09:00
+    const char* dt = jd["datetime"];
+    int Y,M,D,h,m,s;
+    if (sscanf(dt, "%d-%d-%dT%d:%d:%d", &Y,&M,&D,&h,&m,&s) == 6) {
+      struct tm t{};
+      t.tm_year = Y - 1900;
+      t.tm_mon = M - 1;
+      t.tm_mday = D;
+      t.tm_hour = h;
+      t.tm_min = m;
+      t.tm_sec = s;
+      return jd["datetime"];
+    }
+  }
+  return "";
+}
+/*
 String timestamp() {
-  time_t t = millis() / 1000;
+  const auto start_time = millis();
+  time_t t;
+  GetTime(&t);
   struct tm *tm_info = localtime(&t);
   char jstTimeStr[25];
   snprintf(jstTimeStr, sizeof(jstTimeStr), "%04d-%02d-%02dT%02d:%02d:%02d+09:00",
            tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
            tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+  const auto end_time = millis();
+  Serial.print("時刻を取得するのにかかった時間(ms):");
+  Serial.println(end_time - start_time);
   return jstTimeStr;
 }
+*/

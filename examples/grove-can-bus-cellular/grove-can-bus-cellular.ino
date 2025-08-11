@@ -21,12 +21,23 @@ static constexpr int POWER_ON_TIMEOUT = 1000 * 20;     // [ms]
 static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 3;  // [ms]
 static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // [ms]
 static JsonDocument JsonDoc;
-JsonObject vehicleData = JsonDoc.to<JsonObject>();
+//JsonObject vehicleData = JsonDoc.to<JsonObject>();
 // Initialize JSON document structure
 //JsonDoc["session_start"] = millis();
 //JsonDoc["device_id"] = "WIO_BG770A_001";
 //JsonArray canMessages = JsonDoc["can_messages"].to<JsonArray>();
-//JsonArray vehicleData = JsonDoc["vehicle_data"].to<JsonArray>();
+JsonArray dataArray = JsonDoc["data"].to<JsonArray>();
+JsonObject vehicleData = dataArray.add<JsonObject>();
+static constexpr int OBD_COMMAND_INTERVAL = 50; // [ms] 1つずつのOBD-IIコマンドを送信する間隔
+static constexpr int OBD_INTERVAL = 5000; // [ms] OBD-IIのデータ取得のためのコマンド群を送信する間隔
+//static constexpr int CELLULAR_INTERVAL = 60000; // [ms] セルラーデータの送信間隔
+static constexpr int CELLULAR_INTERVAL = 30000; // [ms] セルラーデータの送信間隔
+static constexpr int DTC_INTERVAL = 30000; // [ms] DTCのデータ取得のためのコマンドを送信する間隔
+
+static constexpr int PSM_INTERVAL = 1000 * 60 * 5;        // [ms]
+static constexpr int PSM_PERIOD = 60 * 6;                 // [s] モジュールがスリープ状態に入るまでの待機期間
+static constexpr int PSM_ACTIVE = 2;                      // [s] モジュールがスリープから復帰して、通信可能な状態である時間
+static constexpr int PSM_POWER_DOWN_TIMEOUT = 1000 * 60;  // [ms] PSMが電源OFFになるまでの時間
 
 WioCAN can;
 
@@ -150,11 +161,11 @@ void loop() {
   
   // OBD-II PID要求を複数種類順番に送信
   static unsigned long lastSend = 0;
-  static int sendInterval = 50;
+  //static int sendInterval = 50;
   static unsigned long lastCellularSend = 0;
-  static int cellularSendInterval = 20000;
+  //static int cellularSendInterval = 20000;
   static unsigned long lastRotateSend = 0;
-  static int rotateSendInterval = 20000;
+  //static int rotateSendInterval = 20000;
   // 送信するPIDの配列
   static unsigned char obdPids[] = {
     PID_ENGIN_PRM, PID_VEHICLE_SPEED, PID_COOLANT_TEMP, PID_ENGINE_LOAD, PID_INTAKE_AIR_TEMP,
@@ -169,10 +180,10 @@ void loop() {
   
   // DTC関連の変数
   static unsigned long lastDtcSend = 0;
-  static int dtcSendInterval = 30000; // 30秒ごとにDTCを取得
+  //static int dtcSendInterval = 30000; // 30秒ごとにDTCを取得
 
-  if(millis() - lastRotateSend > rotateSendInterval) {
-    if(millis() - lastSend > sendInterval) {
+  if(millis() - lastRotateSend > OBD_INTERVAL) {
+    if(millis() - lastSend > OBD_COMMAND_INTERVAL) {
       // 現在のPIDを送信
       unsigned char cmd = obdPids[currentPidIndex];
       can.sendPid(cmd);
@@ -189,12 +200,13 @@ void loop() {
     }
     if(currentPidIndex == 0) {
       lastRotateSend = millis();
+      vehicleData = dataArray.add<JsonObject>(); // 配列に新しいデータを追加できるよう初期化
       Serial.println("--------------------------------");
     }
   }
   
   // DTC送信タイミング
-  if(millis() - lastDtcSend > dtcSendInterval) {
+  if(millis() - lastDtcSend > DTC_INTERVAL) {
     sendDtcRequest();
     lastDtcSend = millis();
   }
@@ -327,17 +339,16 @@ void loop() {
     Serial.println();
   }
 
-  if(millis() - lastCellularSend > cellularSendInterval) {
+  if(millis() - lastCellularSend > CELLULAR_INTERVAL) {
     cellularSend(JsonDoc);
-    // 送信後、古いメッセージデータをクリア（最新のvehicle_dataは保持）
-    cleanupOldMessages();
+    clearData(); // 送信後、データをクリア
     lastCellularSend = millis();
   }
   
   // Optional: Enable debug mode by sending commands through Serial monitor
   // Uncomment the following line to enable debug mode
   //can.debugMode();
-  can.debugPID();
+  //can.debugPID();
 
   delay(10);
 }
@@ -473,7 +484,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
   }
   vehicleData["raw_data"] = rawDataString;
   vehicleData["pid"] = pid;
-  vehicleData["timestamp"] = timestamp;
+  vehicleData["time"] = timestamp;
 
   switch(pid) {
     case PID_ENGIN_PRM: // Engine RPM
@@ -543,12 +554,10 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
 }
 
 // 古いメッセージをクリーンアップ（メモリ管理）
-void cleanupOldMessages() {
-  // 単一オブジェクトの場合、通常はクリアしない
-  // 必要に応じて特定のフィールドのみクリア可能
+void clearData() {
   // vehicleData.clear(); // 全データをクリアする場合
-  
-  Serial.println("Vehicle data maintained for next transmission");
+  dataArray.clear();
+  Serial.println("dataArrayをクリアしました。");
 }
 
 static bool cellularSend(const JsonDocument &doc) {

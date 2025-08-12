@@ -27,16 +27,24 @@ JsonObject vehicleData; // dataArrayに追加するJsonObject
 char initializeTime[64]; // 初期化時の時刻を保存するための変数
 unsigned long initializeMillis = 0; // 初期化時のmillis()値
 
+//static bool dataEmptyWarningShown = false; // 警告表示フラグ
+static constexpr unsigned long DATA_EMPTY_TIMEOUT = 5 * 60 * 1000; // 5分 (ms)
+
 static constexpr int OBD_COMMAND_INTERVAL = 50; // [ms] 1つずつのOBD-IIコマンドを送信する間隔
 static constexpr int OBD_INTERVAL = 5000; // [ms] OBD-IIのデータ取得のためのコマンド群を送信する間隔
 //static constexpr int CELLULAR_INTERVAL = 60000; // [ms] セルラーデータの送信間隔
 static constexpr int CELLULAR_INTERVAL = 20000; // [ms] セルラーデータの送信間隔
 static constexpr int DTC_INTERVAL = 15000; // [ms] DTCのデータ取得のためのコマンドを送信する間隔
-
-static constexpr int PSM_INTERVAL = 1000 * 60 * 5;        // [ms]
+/*
+static constexpr int PSM_INTERVAL = 1000 * 60 * 10;        // [ms]
 static constexpr int PSM_PERIOD = 60 * 6;                 // [s] モジュールがスリープ状態に入るまでの待機期間
 static constexpr int PSM_ACTIVE = 2;                      // [s] モジュールがスリープから復帰して、通信可能な状態である時間、モジュールがスリープ状態から目覚めたあと、外部からの着信や通信要求を受け付けられる時間の長さ（秒単位）を制御します。この時間内だけモジュールは通信可能な状態を保ち、その後また省電力のスリープ状態に戻ります。
-static constexpr int PSM_POWER_DOWN_TIMEOUT = 1000 * 60;  // [ms] PSMが電源OFFになるまでの時間
+static constexpr int PSM_POWER_DOWN_TIMEOUT = 1000 * 60;  // [ms] PSMが電源OFFになるまでのタイムアウト時間
+*/
+static constexpr int POWER_OFF_INTERVAL = 1000 * 60 * 10;        // [ms]
+static constexpr int POWER_OFF_DELAY_TIME = 1000 * 3;  // [ms]
+
+static unsigned long lastDataReceivedTime = 0; // 最後にデータを受信した時刻
 
 WioCAN can;
 
@@ -169,8 +177,6 @@ void setup() {
 }
 
 void loop() {
-  // 統計情報用の変数
-  //static unsigned long totalMessages = 0;
   static unsigned long lastStatsTime = 0;
   
   // OBD-II PID要求を複数種類順番に送信
@@ -191,9 +197,7 @@ void loop() {
   };
   static int currentPidIndex = 0;
   static int numPids = sizeof(obdPids) / sizeof(obdPids[0]);
-  
-  // DTC関連の変数
-  static unsigned long lastDtcSend = millis();
+  static unsigned long lastDtcSend = millis(); // DTCのデータ取得のためのコマンドを送信する間隔
   //static int dtcSendInterval = 30000; // 30秒ごとにDTCを取得
 
   if(millis() - lastRotateSend > OBD_INTERVAL) {
@@ -543,8 +547,29 @@ void clearData() {
 
 static bool cellularSend(const JsonDocument &doc) {
   Serial.println("### Sending Combined Vehicle Data Object");
-  Serial.print("Object keys count: ");
-  Serial.println(doc.size());
+  if(arrayEmptyCheck(doc["data"])) {
+    Serial.println("doc data is empty.");
+    // 初回の空状態検出時に時刻を記録
+    if(lastDataReceivedTime == 0) {
+      lastDataReceivedTime = millis();
+    }
+    else {
+      unsigned long emptyDuration = millis() - lastDataReceivedTime;
+      if(emptyDuration > DATA_EMPTY_TIMEOUT) { // 5分経過チェック
+        Serial.print("OBD2受信データが");Serial.print(emptyDuration / 1000);Serial.println("秒間なかったためWioCellularをOFFにします。");
+        powerOffWait();
+        Serial.println("もう一度OBD2の受信データがあるかどうかを確かめ、なければWioCellularのOFFを継続します。");
+        return false; // データは送信しないまま終わらす
+      }
+    }
+  } else {
+    // DATA_EMPTY_TIMEOUT以上経過したあとで、そのあと受診データが確認された場合はpowerOnを開始する
+    if(millis() - lastDataReceivedTime > DATA_EMPTY_TIMEOUT) {
+      powerOnRestart();
+    }
+    // データがある場合は状態をリセット
+    lastDataReceivedTime = 0;
+  }
 
   Serial.print("Connecting ");
   Serial.print(HOST);
@@ -767,5 +792,101 @@ String addMillisTime() {
     // パース失敗時は初期時刻をそのまま使用
     vehicleData = dataArray.add<JsonObject>();
     return initializeTime;
+  }
+}
+
+bool arrayEmptyCheck(JsonArrayConst arr) { // doc["data"]のすべての要素がtimeしかないかどうかを調べる
+  for (JsonObjectConst obj : arr) {
+    Serial.print("obj size: ");Serial.println(obj.size());
+    if (obj.size() > 1) { // 要素が1より多くある場合はtime以外の要素もあることを示す
+      return false;
+    }
+  }
+  return true;
+}
+
+void powerOffWait() {
+  // Power off the cellular module
+  /*
+  bool powerDown = false;
+  if (WioNetwork.canCommunicate()) {
+    Serial.print("WioNetwork.canCommunicate is true");Serial.println(millis());
+    // Set PSM
+    if (WioCellular.setPsm(1, PSM_PERIOD, PSM_ACTIVE) != WioCellularResult::Ok) abort();
+    start = millis();
+    while (millis() - start < PSM_POWER_DOWN_TIMEOUT) {
+      //Serial.println("millis() - start < PSM_POWER_DOWN_TIMEOUT is true");
+      WioCellular.doWork(10);  // Spin
+      if (!WioCellular.getInterface().isActive()) {
+        Serial.print("PSMをONにしてからPSM powerDownするまで(ms)");Serial.println(millis() - start);
+        powerDown = true;
+        break;
+      }
+    }
+  }
+  if (!powerDown) {
+    Serial.println("powerDown is false: PSM_POWER_DOWN_TIMEOUT時間経ってもPSM powerDownしなかったため強制電源オフ。");
+    WioNetwork.end();
+    if (WioCellular.powerOff() != WioCellularResult::Ok) abort();
+  } else {
+    Serial.println("powerDown is true: PSM_POWER_DOWN_TIMEOUT時間内にPSM powerDownしたのでWioNetworkはオフにしない。");
+    Serial.print("WioNetwork.end(false)が開始されます。");start = millis();
+    Serial.println(start);
+    WioNetwork.end(false);
+    Serial.print("WioNetwork.end(false)完了にかかった時間(ms)");Serial.println(millis() - start);
+  }
+
+  start = millis();
+  Serial.print("WioCellular.doWorkUntil(INTERVAL)が開始されます。");Serial.println(start);
+
+  WioCellular.doWorkUntil(PSM_INTERVAL); // ここでモジュールをスリープ状態にする
+  */
+  // WioCellularがOFFになっているかどうか確かめる
+  if (!WioCellular.getInterface().isActive()) {
+    Serial.println("WioCellularはすでにOFFになっていたため、delay関数でPOWER_OFF_INTERVAL時間待ち、OFFを継続します。");
+    delay(POWER_OFF_INTERVAL);
+    return;
+  }
+  WioCellular.doWorkUntil(POWER_OFF_DELAY_TIME);
+  auto start = millis();
+  Serial.print("WioNetwork.end()が開始されます。");Serial.println(start);
+  WioNetwork.end();
+  Serial.print("WioNetwork.end()完了にかかった時間(ms)");Serial.println(millis() - start);
+
+  start = millis();
+  Serial.print("WioCellular.powerOff()が開始されます。");Serial.println(start);
+  if (WioCellular.powerOff() != WioCellularResult::Ok) abort();
+  Serial.print("WioCellular.powerOff()完了にかかった時間(ms)");Serial.println(millis() - start);
+
+  start = millis();
+  Serial.print("WioCellular.doWorkUntil(POWER_OFF_INTERVAL)が開始されます。");Serial.println(start);
+  WioCellular.doWorkUntil(POWER_OFF_INTERVAL);  
+  Serial.print("WioCellular.doWorkUntil(POWER_OFF_INTERVAL)完了にかかった時間(ms)");Serial.println(millis() - start);
+}
+
+void powerOnRestart() { // powerOnを開始する
+  // Power on the cellular module
+  auto start = millis(); // 計測用
+  Serial.print("powerOn開始");Serial.println(start);
+  if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) abort();
+  Serial.print("powerOn完了にかかった時間(ms)");Serial.println(millis() - start);
+  
+  WioNetwork.begin();
+  /*
+  start = millis();
+  Serial.print("Reset PSM開始");Serial.println(start);
+  // Reset PSM
+  if (WioCellular.setPsmEnteringIndicationUrc(true) != WioCellularResult::Ok) abort();
+  if (WioCellular.setPsm(0, PSM_PERIOD, PSM_ACTIVE) != WioCellularResult::Ok) abort();
+  Serial.print("Reset PSM完了にかかった時間(ms)");Serial.println(millis() - start);
+  */
+  start = millis();
+  Serial.print("ネットワーク再開を開始します。");Serial.println(start);
+  const bool networkFlag=WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT);
+  if (networkFlag) {
+    Serial.print("ネットワークが再開できるまでの時間(ms)");Serial.println(millis() - start);
+  }
+  else{
+    Serial.print("ERROR: ネットワークが再開できませんでした。");Serial.println(millis());
   }
 }

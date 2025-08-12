@@ -35,7 +35,7 @@ static constexpr int DTC_INTERVAL = 15000; // [ms] DTCのデータ取得のた�
 
 static constexpr int PSM_INTERVAL = 1000 * 60 * 5;        // [ms]
 static constexpr int PSM_PERIOD = 60 * 6;                 // [s] モジュールがスリープ状態に入るまでの待機期間
-static constexpr int PSM_ACTIVE = 2;                      // [s] モジュールがスリープから復帰して、通信可能な状態である時間
+static constexpr int PSM_ACTIVE = 2;                      // [s] モジュールがスリープから復帰して、通信可能な状態である時間、モジュールがスリープ状態から目覚めたあと、外部からの着信や通信要求を受け付けられる時間の長さ（秒単位）を制御します。この時間内だけモジュールは通信可能な状態を保ち、その後また省電力のスリープ状態に戻ります。
 static constexpr int PSM_POWER_DOWN_TIMEOUT = 1000 * 60;  // [ms] PSMが電源OFFになるまでの時間
 
 WioCAN can;
@@ -176,9 +176,9 @@ void loop() {
   // OBD-II PID要求を複数種類順番に送信
   static unsigned long lastSend = 0;
   //static int sendInterval = 50;
-  static unsigned long lastCellularSend = 0;
+  static unsigned long lastCellularSend = millis();
   //static int cellularSendInterval = 20000;
-  static unsigned long lastRotateSend = 0;
+  static unsigned long lastRotateSend = millis();
   //static int rotateSendInterval = 20000;
   // 送信するPIDの配列
   static unsigned char obdPids[] = {
@@ -193,7 +193,7 @@ void loop() {
   static int numPids = sizeof(obdPids) / sizeof(obdPids[0]);
   
   // DTC関連の変数
-  static unsigned long lastDtcSend = 0;
+  static unsigned long lastDtcSend = millis();
   //static int dtcSendInterval = 30000; // 30秒ごとにDTCを取得
 
   if(millis() - lastRotateSend > OBD_INTERVAL) {
@@ -536,10 +536,9 @@ void updateVehicleData(unsigned char pid, unsigned char* data) {
 
 // 古いメッセージをクリーンアップ（メモリ管理）
 void clearData() {
-  // vehicleData.clear(); // 全データをクリアする場合
   dataArray.clear();
-  initializeVehicleDataSchema();
   Serial.println("dataArrayをクリアしました。");
+  initializeVehicleDataSchema();
 }
 
 static bool cellularSend(const JsonDocument &doc) {
@@ -592,56 +591,8 @@ static bool cellularSend(const JsonDocument &doc) {
 }
 
 static void initializeVehicleDataSchema() {
-  const auto now_millis = millis();
-  
-  // 経過時間を計算して現在時刻を生成
-  unsigned long elapsedSeconds = (now_millis - initializeMillis) / 1000;
-  
-  // initializeTimeから年月日時分秒を抽出
-  int Y, M, D, h, m, s;
-  if (sscanf(initializeTime, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) == 6) {
-    // 経過秒を加算
-    s += elapsedSeconds;
-    
-    // 秒の繰り上がり処理
-    while (s >= 60) {
-      s -= 60;
-      m++;
-    }
-    while (m >= 60) {
-      m -= 60;
-      h++;
-    }
-    while (h >= 24) {
-      h -= 24;
-      D++;
-    }
-    // 月末処理（簡易版）
-    int daysInMonth[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    if ((Y % 4 == 0 && Y % 100 != 0) || (Y % 400 == 0)) {
-      daysInMonth[1] = 29; // うるう年
-    }
-    while (D > daysInMonth[M-1]) {
-      D -= daysInMonth[M-1];
-      M++;
-      if (M > 12) {
-        M = 1;
-        Y++;
-      }
-    }
-    
-    // 現在時刻をISO8601形式で生成
-    char currentTime[26];
-    snprintf(currentTime, sizeof(currentTime), "%04d-%02d-%02dT%02d:%02d:%02d+09:00",
-             Y, M, D, h, m, s);
-    
-    vehicleData = dataArray.add<JsonObject>(); // 配列に新しいデータを追加できるよう初期化
-    vehicleData["time"] = currentTime; // String (ISO8601)
-  } else {
-    // パース失敗時は初期時刻をそのまま使用
-    vehicleData = dataArray.add<JsonObject>();
-    vehicleData["time"] = initializeTime;
-  }
+  vehicleData = dataArray.add<JsonObject>(); // 配列に新しいデータを追加できるよう初期化
+  vehicleData["time"] = addMillisTime(); // 経過時間を計算して現在時刻を生成, String (ISO8601)
   /*
   vehicleData["engine_rpm"] = "NULL";                   // Number
   vehicleData["vehicle_speed"] = "NULL";                // Number
@@ -765,5 +716,56 @@ String formatTime(char* dt) {
   else {
     Serial.println("ERROR: Failed to parse datetime format");
     return "";
+  }
+}
+
+String addMillisTime() {
+  // 経過時間を計算して現在時刻を生成
+  const auto now_millis = millis();
+  unsigned long elapsedSeconds = (now_millis - initializeMillis) / 1000;
+  
+  // initializeTimeから年月日時分秒を抽出
+  int Y, M, D, h, m, s;
+  if (sscanf(initializeTime, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) == 6) {
+    // 経過秒を加算
+    s += elapsedSeconds;
+    
+    // 秒の繰り上がり処理
+    while (s >= 60) {
+      s -= 60;
+      m++;
+    }
+    while (m >= 60) {
+      m -= 60;
+      h++;
+    }
+    while (h >= 24) {
+      h -= 24;
+      D++;
+    }
+    // 月末処理（簡易版）
+    int daysInMonth[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if ((Y % 4 == 0 && Y % 100 != 0) || (Y % 400 == 0)) {
+      daysInMonth[1] = 29; // うるう年
+    }
+    while (D > daysInMonth[M-1]) {
+      D -= daysInMonth[M-1];
+      M++;
+      if (M > 12) {
+        M = 1;
+        Y++;
+      }
+    }
+    
+    // 現在時刻をISO8601形式で生成
+    char currentTime[26];
+    snprintf(currentTime, sizeof(currentTime), "%04d-%02d-%02dT%02d:%02d:%02d+09:00",
+             Y, M, D, h, m, s);
+    
+    return currentTime; // String (ISO8601)
+  } else {
+    // パース失敗時は初期時刻をそのまま使用
+    vehicleData = dataArray.add<JsonObject>();
+    return initializeTime;
   }
 }

@@ -1,7 +1,7 @@
 /*
  * grove-can-bus.ino
  * Grove - CAN BUS Module based on GD32E103 for Wio BG770A
- * Copyright (C) Seeed K.K.
+ * Copyright (C) AutoSystems, Inc.
  * MIT License
  */
 
@@ -27,24 +27,16 @@ JsonObject vehicleData; // dataArrayに追加するJsonObject
 char initializeTime[64]; // 初期化時の時刻を保存するための変数
 unsigned long initializeMillis = 0; // 初期化時のmillis()値
 
-//static bool dataEmptyWarningShown = false; // 警告表示フラグ
-static constexpr unsigned long DATA_EMPTY_TIMEOUT = 5 * 60 * 1000; // 5分 (ms)
-
 static constexpr int OBD_COMMAND_INTERVAL = 50; // [ms] 1つずつのOBD-IIコマンドを送信する間隔
 static constexpr int OBD_INTERVAL = 5000; // [ms] OBD-IIのデータ取得のためのコマンド群を送信する間隔
 //static constexpr int CELLULAR_INTERVAL = 60000; // [ms] セルラーデータの送信間隔
 static constexpr int CELLULAR_INTERVAL = 20000; // [ms] セルラーデータの送信間隔
 static constexpr int DTC_INTERVAL = 15000; // [ms] DTCのデータ取得のためのコマンドを送信する間隔
-/*
-static constexpr int PSM_INTERVAL = 1000 * 60 * 10;        // [ms]
-static constexpr int PSM_PERIOD = 60 * 6;                 // [s] モジュールがスリープ状態に入るまでの待機期間
-static constexpr int PSM_ACTIVE = 2;                      // [s] モジュールがスリープから復帰して、通信可能な状態である時間、モジュールがスリープ状態から目覚めたあと、外部からの着信や通信要求を受け付けられる時間の長さ（秒単位）を制御します。この時間内だけモジュールは通信可能な状態を保ち、その後また省電力のスリープ状態に戻ります。
-static constexpr int PSM_POWER_DOWN_TIMEOUT = 1000 * 60;  // [ms] PSMが電源OFFになるまでのタイムアウト時間
-*/
-static constexpr int POWER_OFF_INTERVAL = 1000 * 60 * 10;        // [ms]
-static constexpr int POWER_OFF_DELAY_TIME = 1000 * 3;  // [ms]
 
-static unsigned long lastDataReceivedTime = 0; // 最後にデータを受信した時刻
+static constexpr int POWER_OFF_INTERVAL = 1000 * 60 * 10; // スリープ時間[ms]（10分間）
+//static constexpr int POWER_OFF_INTERVAL = 1000 * 60 * 1; // スリープ時間[ms]（1分間）
+static constexpr int POWER_OFF_DELAY_TIME = 1000 * 3;  // [ms]
+static constexpr unsigned long DATA_EMPTY_TIMEOUT = 1 * 60 * 1000; // データの受信がなくなってからスリープに入るまでの時間 (ms)（1分間）
 
 WioCAN can;
 
@@ -77,85 +69,24 @@ void setup() {
 
   digitalWrite(LED_BUILTIN, HIGH);
 
+  Serial.println("Cellular bus initialized");
   // Network configuration
   WioNetwork.config.searchAccessTechnology = SEARCH_ACCESS_TECHNOLOGY;
   WioNetwork.config.ltemBand = LTEM_BAND;
   WioNetwork.config.apn = APN;
-
   WioCellular.begin();
   // Power on the cellular module
   if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) abort();
   WioNetwork.begin();
-
   // Wait for communication available
   if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) abort();
-  Serial.println("initialized");
-  {
-    const auto start = millis();
-    while (!Serial && millis() - start < 5000) {
-      delay(2);
-    }
-  }
 
-  digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_ON);
-  delay(1000);
-  // Initialize CAN module
-  can.begin();
-  // Set CAN bus rate to 500kbps (commonly used)
-  if(can.setCanRate(CAN_RATE_500)) {
-    Serial.println("CAN bus rate set to 500kbps: OK");
-  } else {
-    Serial.println("CAN bus rate set to 500kbps: FAILED");
-  }
-
-  // --- set mask and filter (standard frame) ---
-  // Mask設定: 0x00000000で全てのIDを通す（全通し）
-  if (can.setMask(0, 0, 0x00000000)) {
-    Serial.println("Mask0 set: OK (All pass)");
-  } else {
-    Serial.println("Mask0 set: FAILED");
-  }
-  if (can.setMask(1, 0, 0x00000000)) {
-    Serial.println("Mask1 set: OK (All pass)");
-  } else {
-    Serial.println("Mask1 set: FAILED");
-  }
-  
-  // Filter設定: 0x00000000で全てのIDを通す（全通し）
-  if (can.setFilt(0, 0, 0x00000000)) {
-    Serial.println("Filt0 set: OK (All pass)");
-  } else {
-    Serial.println("Filt0 set: FAILED");
-  }
-  if (can.setFilt(1, 0, 0x00000000)) {
-    Serial.println("Filt1 set: OK (All pass)");
-  } else {
-    Serial.println("Filt1 set: FAILED");
-  }
-  if (can.setFilt(2, 0, 0x00000000)) {
-    Serial.println("Filt2 set: OK (All pass)");
-  } else {
-    Serial.println("Filt2 set: FAILED");
-  }
-  if (can.setFilt(3, 0, 0x00000000)) {
-    Serial.println("Filt3 set: OK (All pass)");
-  } else {
-    Serial.println("Filt3 set: FAILED");
-  }
-  if (can.setFilt(4, 0, 0x00000000)) {
-    Serial.println("Filt4 set: OK (All pass)");
-  } else {
-    Serial.println("Filt4 set: FAILED");
-  }
-  if (can.setFilt(5, 0, 0x00000000)) {
-    Serial.println("Filt5 set: OK (All pass)");
-  } else {
-    Serial.println("Filt5 set: FAILED");
-  }
+  Serial.println("CAN bus initialized");
+  initCAN();
 
   const auto start_time = millis();
   // Initialize JSON schema for vehicleData
-  if(GetTime(initializeTime)) {
+  if(getTime(initializeTime)) {
     const auto end_time = millis();
     Serial.print("時刻(ISO8601):");
     Serial.println(formatTime(initializeTime));
@@ -170,7 +101,6 @@ void setup() {
   digitalWrite(LED_BUILTIN, LOW);
     
   Serial.println();
-  Serial.println("=== CAN Bus Initialization Complete ===");
   Serial.println("Listening for ALL CAN messages...");
   Serial.println("Format: [timestamp] CAN ID: 0xXXX | Data: XX XX XX XX XX XX XX XX | Description");
   Serial.println("========================================");
@@ -546,29 +476,34 @@ void clearData() {
 }
 
 static bool cellularSend(const JsonDocument &doc) {
+  static unsigned long lastDataReceivedTime = millis(); // 最後にデータを受信した時刻
   Serial.println("### Sending Combined Vehicle Data Object");
   if(arrayEmptyCheck(doc["data"])) {
     Serial.println("doc data is empty.");
+    /*
     // 初回の空状態検出時に時刻を記録
     if(lastDataReceivedTime == 0) {
       lastDataReceivedTime = millis();
     }
     else {
-      unsigned long emptyDuration = millis() - lastDataReceivedTime;
-      if(emptyDuration > DATA_EMPTY_TIMEOUT) { // 5分経過チェック
-        Serial.print("OBD2受信データが");Serial.print(emptyDuration / 1000);Serial.println("秒間なかったためWioCellularをOFFにします。");
-        powerOffWait();
-        Serial.println("もう一度OBD2の受信データがあるかどうかを確かめ、なければWioCellularのOFFを継続します。");
-        return false; // データは送信しないまま終わらす
-      }
+    */
+    unsigned long emptyDuration = millis() - lastDataReceivedTime;
+    if(emptyDuration > DATA_EMPTY_TIMEOUT) { // 5分経過チェック
+      Serial.print("OBD2の受信データが");Serial.print(emptyDuration / 1000);Serial.println("秒間なかったためWioCellularとCAN BUSをOFFにします。");
+      digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_OFF);
+      netPowerOffWait();
+      Serial.println("もう一度OBD2の受信データがあるかどうかを確かめ、なければスリープ状態を継続します。");
+      initCAN();
+      return false; // データは送信しないまま終わらす
     }
   } else {
+    Serial.println("doc data is ok.");
     // DATA_EMPTY_TIMEOUT以上経過したあとで、そのあと受診データが確認された場合はpowerOnを開始する
     if(millis() - lastDataReceivedTime > DATA_EMPTY_TIMEOUT) {
-      powerOnRestart();
+      netPowerOnRestart();
     }
     // データがある場合は状態をリセット
-    lastDataReceivedTime = 0;
+    lastDataReceivedTime = millis();
   }
 
   Serial.print("Connecting ");
@@ -643,7 +578,7 @@ void printData(T &stream, const void *data, size_t size) {
 }
 
 // Get current JST time via worldtimeapi.org
-bool GetTime(char* time) {
+bool getTime(char* time) {
   const char* host = "worldtimeapi.org";
   const int port = 80;
   const int maxRetries = 10;
@@ -805,42 +740,8 @@ bool arrayEmptyCheck(JsonArrayConst arr) { // doc["data"]のすべての要素�
   return true;
 }
 
-void powerOffWait() {
+void netPowerOffWait() {
   // Power off the cellular module
-  /*
-  bool powerDown = false;
-  if (WioNetwork.canCommunicate()) {
-    Serial.print("WioNetwork.canCommunicate is true");Serial.println(millis());
-    // Set PSM
-    if (WioCellular.setPsm(1, PSM_PERIOD, PSM_ACTIVE) != WioCellularResult::Ok) abort();
-    start = millis();
-    while (millis() - start < PSM_POWER_DOWN_TIMEOUT) {
-      //Serial.println("millis() - start < PSM_POWER_DOWN_TIMEOUT is true");
-      WioCellular.doWork(10);  // Spin
-      if (!WioCellular.getInterface().isActive()) {
-        Serial.print("PSMをONにしてからPSM powerDownするまで(ms)");Serial.println(millis() - start);
-        powerDown = true;
-        break;
-      }
-    }
-  }
-  if (!powerDown) {
-    Serial.println("powerDown is false: PSM_POWER_DOWN_TIMEOUT時間経ってもPSM powerDownしなかったため強制電源オフ。");
-    WioNetwork.end();
-    if (WioCellular.powerOff() != WioCellularResult::Ok) abort();
-  } else {
-    Serial.println("powerDown is true: PSM_POWER_DOWN_TIMEOUT時間内にPSM powerDownしたのでWioNetworkはオフにしない。");
-    Serial.print("WioNetwork.end(false)が開始されます。");start = millis();
-    Serial.println(start);
-    WioNetwork.end(false);
-    Serial.print("WioNetwork.end(false)完了にかかった時間(ms)");Serial.println(millis() - start);
-  }
-
-  start = millis();
-  Serial.print("WioCellular.doWorkUntil(INTERVAL)が開始されます。");Serial.println(start);
-
-  WioCellular.doWorkUntil(PSM_INTERVAL); // ここでモジュールをスリープ状態にする
-  */
   // WioCellularがOFFになっているかどうか確かめる
   if (!WioCellular.getInterface().isActive()) {
     Serial.println("WioCellularはすでにOFFになっていたため、delay関数でPOWER_OFF_INTERVAL時間待ち、OFFを継続します。");
@@ -864,7 +765,7 @@ void powerOffWait() {
   Serial.print("WioCellular.doWorkUntil(POWER_OFF_INTERVAL)完了にかかった時間(ms)");Serial.println(millis() - start);
 }
 
-void powerOnRestart() { // powerOnを開始する
+void netPowerOnRestart() { // powerOnを開始する
   // Power on the cellular module
   auto start = millis(); // 計測用
   Serial.print("powerOn開始");Serial.println(start);
@@ -872,14 +773,6 @@ void powerOnRestart() { // powerOnを開始する
   Serial.print("powerOn完了にかかった時間(ms)");Serial.println(millis() - start);
   
   WioNetwork.begin();
-  /*
-  start = millis();
-  Serial.print("Reset PSM開始");Serial.println(start);
-  // Reset PSM
-  if (WioCellular.setPsmEnteringIndicationUrc(true) != WioCellularResult::Ok) abort();
-  if (WioCellular.setPsm(0, PSM_PERIOD, PSM_ACTIVE) != WioCellularResult::Ok) abort();
-  Serial.print("Reset PSM完了にかかった時間(ms)");Serial.println(millis() - start);
-  */
   start = millis();
   Serial.print("ネットワーク再開を開始します。");Serial.println(start);
   const bool networkFlag=WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT);
@@ -888,5 +781,70 @@ void powerOnRestart() { // powerOnを開始する
   }
   else{
     Serial.print("ERROR: ネットワークが再開できませんでした。");Serial.println(millis());
+  }
+}
+
+void initCAN() {
+  {
+    const auto start = millis();
+    while (!Serial && millis() - start < 5000) {
+      delay(2);
+    }
+  }
+
+  digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_ON);
+  delay(1000);
+  // Initialize CAN module
+  can.begin();
+  // Set CAN bus rate to 500kbps (commonly used)
+  if(can.setCanRate(CAN_RATE_500)) {
+    Serial.println("CAN bus rate set to 500kbps: OK");
+  } else {
+    Serial.println("CAN bus rate set to 500kbps: FAILED");
+  }
+
+  // --- set mask and filter (standard frame) ---
+  // Mask設定: 0x00000000で全てのIDを通す（全通し）
+  if (can.setMask(0, 0, 0x00000000)) {
+    Serial.println("Mask0 set: OK (All pass)");
+  } else {
+    Serial.println("Mask0 set: FAILED");
+  }
+  if (can.setMask(1, 0, 0x00000000)) {
+    Serial.println("Mask1 set: OK (All pass)");
+  } else {
+    Serial.println("Mask1 set: FAILED");
+  }
+
+  // Filter設定: 0x00000000で全てのIDを通す（全通し）
+  if (can.setFilt(0, 0, 0x00000000)) {
+    Serial.println("Filt0 set: OK (All pass)");
+  } else {
+    Serial.println("Filt0 set: FAILED");
+  }
+  if (can.setFilt(1, 0, 0x00000000)) {
+    Serial.println("Filt1 set: OK (All pass)");
+  } else {
+    Serial.println("Filt1 set: FAILED");
+  }
+  if (can.setFilt(2, 0, 0x00000000)) {
+    Serial.println("Filt2 set: OK (All pass)");
+  } else {
+    Serial.println("Filt2 set: FAILED");
+  }
+  if (can.setFilt(3, 0, 0x00000000)) {
+    Serial.println("Filt3 set: OK (All pass)");
+  } else {
+    Serial.println("Filt3 set: FAILED");
+  }
+  if (can.setFilt(4, 0, 0x00000000)) {
+    Serial.println("Filt4 set: OK (All pass)");
+  } else {
+    Serial.println("Filt4 set: FAILED");
+  }
+  if (can.setFilt(5, 0, 0x00000000)) {
+    Serial.println("Filt5 set: OK (All pass)");
+  } else {
+    Serial.println("Filt5 set: FAILED");
   }
 }

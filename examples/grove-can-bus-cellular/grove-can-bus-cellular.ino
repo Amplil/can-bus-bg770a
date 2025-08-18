@@ -28,15 +28,18 @@ char initializeTime[64]; // 初期化時の時刻を保存するための変数
 unsigned long initializeMillis = 0; // 初期化時のmillis()値
 
 static constexpr int OBD_COMMAND_INTERVAL = 50; // [ms] 1つずつのOBD-IIコマンドを送信する間隔
-static constexpr int OBD_INTERVAL = 5000; // [ms] OBD-IIのデータ取得のためのコマンド群を送信する間隔
+static constexpr int OBD_INTERVAL = 10000; // [ms] OBD-IIのデータ取得のためのコマンド群を送信する間隔
 //static constexpr int CELLULAR_INTERVAL = 60000; // [ms] セルラーデータの送信間隔
-static constexpr int CELLULAR_INTERVAL = 20000; // [ms] セルラーデータの送信間隔
-static constexpr int DTC_INTERVAL = 15000; // [ms] DTCのデータ取得のためのコマンドを送信する間隔
+static constexpr int CELLULAR_INTERVAL = 30000; // [ms] セルラーデータの送信間隔
+static constexpr int DTC_INTERVAL = 60000; // [ms] DTCのデータ取得のためのコマンドを送信する間隔
 
 static constexpr int POWER_OFF_INTERVAL = 1000 * 60 * 10; // スリープ時間[ms]（10分間）
 //static constexpr int POWER_OFF_INTERVAL = 1000 * 60 * 1; // スリープ時間[ms]（1分間）
+//static constexpr int POWER_OFF_INTERVAL = 1000 * 60 * 2; // スリープ時間[ms]（2分間）
 static constexpr int POWER_OFF_DELAY_TIME = 1000 * 3;  // [ms]
-static constexpr unsigned long DATA_EMPTY_TIMEOUT = 1 * 60 * 1000; // データの受信がなくなってからスリープに入るまでの時間 (ms)（1分間）
+static constexpr unsigned long DATA_EMPTY_TIMEOUT = 60 * 1000 * 1; // データの受信がなくなってからスリープに入るまでの時間 (ms)
+static constexpr unsigned long ACK_INTERVAL = 60 * 60 * 1000; // スリープに入ってからも定期的にACKを送信する間隔 (ms)
+//static constexpr unsigned long ACK_INTERVAL = 1000 * 60 * 5; // スリープに入ってからも定期的にACKを送信する間隔 (ms)
 
 WioCAN can;
 
@@ -97,7 +100,7 @@ void setup() {
     Serial.println("時刻を取得できませんでした。");
     abort();
   }
-  initializeVehicleDataSchema();
+  //initializeVehicleDataSchema();
   digitalWrite(LED_BUILTIN, LOW);
     
   Serial.println();
@@ -129,9 +132,15 @@ void loop() {
   static int numPids = sizeof(obdPids) / sizeof(obdPids[0]);
   static unsigned long lastDtcSend = millis(); // DTCのデータ取得のためのコマンドを送信する間隔
   //static int dtcSendInterval = 30000; // 30秒ごとにDTCを取得
+  static unsigned long lastDataReceivedTime = millis(); // 最後にデータを受信した時刻
+  //static unsigned long lastDataReceivedDuration = 0; // 最後にデータを受信してからの経過時間
+  static unsigned long lastACKTime = millis(); // 最後にACKを送信した時刻
 
   if(millis() - lastRotateSend > OBD_INTERVAL) {
     if(millis() - lastSend > OBD_COMMAND_INTERVAL) {
+      if(currentPidIndex == 0) {
+        initializeVehicleDataSchema();
+      }
       // 現在のPIDを送信
       unsigned char cmd = obdPids[currentPidIndex];
       can.sendPid(cmd);
@@ -149,7 +158,7 @@ void loop() {
     if(currentPidIndex == 0) {
       lastRotateSend = millis();
       //vehicleData = dataArray.add<JsonObject>(); // 配列に新しいデータを追加できるよう初期化
-      initializeVehicleDataSchema();
+      //initializeVehicleDataSchema();
       Serial.println("--------------------------------");
     }
   }
@@ -165,6 +174,9 @@ void loop() {
   unsigned char data[8];
   if(can.receive(&id, data)) {
     //totalMessages++;
+    if(vehicleData.isNull()) {
+      initializeVehicleDataSchema();
+    }
     
     // DTCレスポンスかどうかをチェック
     if(id >= 0x7E8 && id <= 0x7EF && data[0] >= 3 && data[1] == 0x43) {
@@ -289,6 +301,36 @@ void loop() {
   }
 
   if(millis() - lastCellularSend > CELLULAR_INTERVAL) {
+    if(arrayEmptyCheck(JsonDoc["data"])) {
+      Serial.println("doc data is empty.");
+      unsigned long emptyDuration = millis() - lastDataReceivedTime;
+      if(emptyDuration > DATA_EMPTY_TIMEOUT) { // DATA_EMPTY_TIMEOUT時間経過チェック
+        unsigned long lastACKDuration = millis() - lastACKTime;
+        if(lastACKDuration > ACK_INTERVAL) {
+          Serial.print("最後の報告から");Serial.print(lastACKDuration / 1000);Serial.println("秒が経過したため生存報告で空データを送信します。");
+          lastACKTime = millis();
+          netPowerOnRestart();
+          cellularSend(JsonDoc);
+        }
+        Serial.print("OBD2の受信データが");Serial.print(emptyDuration / 1000);Serial.println("秒間なかったためWioCellularとCAN BUSをOFFにします。");
+        digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_OFF);
+        netPowerOffWait();
+        Serial.println("もう一度OBD2の受信データがあるかどうかを確かめ、なければスリープ状態を継続します。");
+        initCAN();
+        clearData(); // 送信後、データをクリア
+        lastCellularSend = millis();
+        //return false; // データは送信しないまま終わらす
+        return; // データは送信しないまま終わらす
+      }
+    }else {
+      Serial.println("doc data is ok.");
+      // DATA_EMPTY_TIMEOUT以上経過したあとで、そのあと受診データが確認された場合はpowerOnを開始する
+      if(millis() - lastDataReceivedTime > DATA_EMPTY_TIMEOUT) {
+        netPowerOnRestart();
+      }
+      lastDataReceivedTime = millis(); // 最後にデータを受信した時刻を更新
+      //lastDataReceivedDuration=0;
+    }
     cellularSend(JsonDoc);
     clearData(); // 送信後、データをクリア
     lastCellularSend = millis();
@@ -472,40 +514,10 @@ void updateVehicleData(unsigned char pid, unsigned char* data) {
 void clearData() {
   dataArray.clear();
   Serial.println("dataArrayをクリアしました。");
-  initializeVehicleDataSchema();
 }
 
 static bool cellularSend(const JsonDocument &doc) {
-  static unsigned long lastDataReceivedTime = millis(); // 最後にデータを受信した時刻
   Serial.println("### Sending Combined Vehicle Data Object");
-  if(arrayEmptyCheck(doc["data"])) {
-    Serial.println("doc data is empty.");
-    /*
-    // 初回の空状態検出時に時刻を記録
-    if(lastDataReceivedTime == 0) {
-      lastDataReceivedTime = millis();
-    }
-    else {
-    */
-    unsigned long emptyDuration = millis() - lastDataReceivedTime;
-    if(emptyDuration > DATA_EMPTY_TIMEOUT) { // 5分経過チェック
-      Serial.print("OBD2の受信データが");Serial.print(emptyDuration / 1000);Serial.println("秒間なかったためWioCellularとCAN BUSをOFFにします。");
-      digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_OFF);
-      netPowerOffWait();
-      Serial.println("もう一度OBD2の受信データがあるかどうかを確かめ、なければスリープ状態を継続します。");
-      initCAN();
-      return false; // データは送信しないまま終わらす
-    }
-  } else {
-    Serial.println("doc data is ok.");
-    // DATA_EMPTY_TIMEOUT以上経過したあとで、そのあと受診データが確認された場合はpowerOnを開始する
-    if(millis() - lastDataReceivedTime > DATA_EMPTY_TIMEOUT) {
-      netPowerOnRestart();
-    }
-    // データがある場合は状態をリセット
-    lastDataReceivedTime = millis();
-  }
-
   Serial.print("Connecting ");
   Serial.print(HOST);
   Serial.print(":");

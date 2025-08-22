@@ -40,20 +40,24 @@ static constexpr int POWER_OFF_DELAY_TIME = 1000 * 3;  // [ms]
 static constexpr unsigned long DATA_EMPTY_TIMEOUT = 60 * 1000 * 1; // データの受信がなくなってからスリープに入るまでの時間 (ms)
 static constexpr unsigned long ACK_INTERVAL = 60 * 60 * 1000; // スリープに入ってからも定期的にACKを送信する間隔 (ms)
 //static constexpr unsigned long ACK_INTERVAL = 1000 * 60 * 5; // スリープに入ってからも定期的にACKを送信する間隔 (ms)
+static constexpr unsigned long ABORT_TIME = 1000 * 60 * 5; // ABORTが発生してリセットがかかるまでの時間[ms]（5分間）
 
 WioCAN can;
 
 static void abortHandler(int sig) {
   Serial.printf("ABORT: Signal %d received\n", sig);
-  yield();
+  //yield();
 
-  vTaskSuspendAll();  // FreeRTOS
-  while (true) {
+  //vTaskSuspendAll();  // FreeRTOS
+  Serial.print(ABORT_TIME/1000);Serial.println("秒待ってリセットします。");
+  const auto start = millis();
+  while (millis()-start<ABORT_TIME) {
     ledOn(LED_BUILTIN);
     nrfx_coredep_delay_us(100000);  // Spin
     ledOff(LED_BUILTIN);
     nrfx_coredep_delay_us(100000);  // Spin
   }
+  NVIC_SystemReset();
 }
 
 void setup() {

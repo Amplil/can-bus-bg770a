@@ -26,6 +26,7 @@ JsonArray dataArray = JsonDoc["data"].to<JsonArray>();
 JsonObject vehicleData; // dataArrayに追加するJsonObject
 char initializeTime[64]; // 初期化時の時刻を保存するための変数
 unsigned long initializeMillis = 0; // 初期化時のmillis()値
+char deviceIMSI[20]; // SIMカードのIMSI情報を保存するための変数
 
 static constexpr int OBD_COMMAND_INTERVAL = 50; // [ms] 1つずつのOBD-IIコマンドを送信する間隔
 static constexpr int OBD_INTERVAL = 10000; // [ms] OBD-IIのデータ取得のためのコマンド群を送信する間隔
@@ -104,6 +105,18 @@ void setup() {
     Serial.println("時刻を取得できませんでした。");
     abort();
   }
+  
+  // Get IMSI for device identification
+  if(getIMSI(deviceIMSI)) {
+    Serial.print("端末識別用IMSI: ");
+    Serial.println(deviceIMSI);
+    // IMSIをJSONドキュメントのルートレベルに追加
+    JsonDoc["imsi"] = deviceIMSI;
+  } else {
+    Serial.println("IMSIを取得できませんでした。");
+    abort();
+  }
+  
   //initializeVehicleDataSchema();
   digitalWrite(LED_BUILTIN, LOW);
     
@@ -593,16 +606,36 @@ void printData(T &stream, const void *data, size_t size) {
     stream.write(0x20 <= *p && *p <= 0x7f ? *p : '.');
 }
 
+// Get IMSI from SIM card
+bool getIMSI(char* imsi) {
+  Serial.println("Getting IMSI...");
+  
+  // WioCellularライブラリのgetIMSI APIを使用してIMSIを取得
+  std::string imsiStr;
+  const auto result = WioCellular.getIMSI(&imsiStr);
+  
+  if (result == WioCellularResult::Ok && !imsiStr.empty()) {
+    strncpy(imsi, imsiStr.c_str(), 19);
+    imsi[19] = '\0';
+    Serial.print("IMSI: ");
+    Serial.println(imsi);
+    return true;
+  } else {
+    Serial.println("ERROR: Failed to get IMSI");
+    return false;
+  }
+}
+
 // Get current JST time via worldtimeapi.org
 bool getTime(char* time) {
   const char* host = "worldtimeapi.org";
   const int port = 80;
-  const int maxRetries = 10;
+  const int maxRetries = 20;
   
   for (int retry = 0; retry < maxRetries; retry++) {
     if (retry > 0) {
       Serial.printf("Retrying time API request (%d/%d)\n", retry + 1, maxRetries);
-      delay(1000); // 1秒待機してからリトライ
+      delay(5000); // 5秒待機してからリトライ
     }
     
     WioCellularTcpClient2<WioCellularModule> client{ WioCellular };

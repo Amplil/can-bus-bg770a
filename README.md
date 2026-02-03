@@ -174,44 +174,6 @@ void loop() {
 }
 ```
 
-## PC Simulation (No Hardware)
-
-If you don't have the embedded board or a vehicle available, you can still develop and test
-the parsing, validation, and packaging logic on a PC. This repo includes a lightweight
-simulator that emits realistic OBD-II PID responses so you can iterate quickly without
-physical hardware.
-
-### Windows setup
-
-1. Install **Python 3.11+** from https://www.python.org/downloads/
-2. Confirm Python is on your PATH:
-
-```bash
-python --version
-```
-
-### Run the simulator
-
-From the repo root:
-
-```bash
-python simulator/obd_simulator.py
-```
-
-This prints JSON on stdout containing:
-- raw OBD-II frames (`frames`)
-- decoded signal values (`signals`)
-- a `timestamp`
-
-You can pipe this output into your own tooling or use it to feed a local service.
-
-### Logic-only parsing helpers
-
-The `src/obd-logic.*` files provide pure parsing helpers (no Arduino dependencies) to
-convert PID response bytes into human-readable values (RPM, speed, temperatures, etc.).
-These helpers are intended to be reused in both the embedded firmware and your PC-side
-simulation tooling.
-
 ## License
 
 ```

@@ -10,6 +10,8 @@
 #include <WioCellular.h>
 #include <grove-can-bus.h>
 #include <ArduinoJson.h>
+#include <cmath>
+#include <string>
 #include <time.h>
 
 #define SEARCH_ACCESS_TECHNOLOGY (WioCellularNetwork::SearchAccessTechnology::LTEM)  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
@@ -482,7 +484,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data) {
       
     case PID_ENGINE_LOAD: // Engine Load
       {
-        vehicleData["engine_load"] = data[3] * 100.0 / 255.0;
+        vehicleData["engine_load"] = std::lround(static_cast<double>(data[3]) * 100.0 / 255.0);
       }
       break;
       
@@ -494,7 +496,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data) {
       
     case PID_THROTTLE_POS: // Throttle Position
       {
-        vehicleData["throttle_position"] = data[3] * 100.0 / 255.0;
+        vehicleData["throttle_position"] = std::lround(static_cast<double>(data[3]) * 100.0 / 255.0);
       }
       break;
       
@@ -508,7 +510,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data) {
     case PID_ODOMETER: // Odometer
       if(data[0] >= 6) {
         unsigned long odometer = ((unsigned long)data[3] << 24) + ((unsigned long)data[4] << 16) + ((unsigned long)data[5] << 8) + data[6];
-        vehicleData["odometer"] = odometer * 0.1;
+        vehicleData["odometer"] = std::lround(static_cast<double>(odometer) * 0.1);
       }
       break;
       
@@ -582,20 +584,19 @@ static bool cellularSend(const JsonDocument &doc) {
 static void initializeVehicleDataSchema() {
   vehicleData = dataArray.add<JsonObject>(); // 配列に新しいデータを追加できるよう初期化
   vehicleData["time"] = addMillisTime(); // 経過時間を計算して現在時刻を生成, String (ISO8601)
-  /*
-  vehicleData["engine_rpm"] = "NULL";                   // Number
-  vehicleData["vehicle_speed"] = "NULL";                // Number
-  vehicleData["coolant_temp"] = "NULL";                 // Number (°C)
-  vehicleData["engine_load"] = "NULL";                  // Number (%)
-  vehicleData["intake_air_temp"] = "NULL";              // Number (°C)
-  vehicleData["throttle_position"] = "NULL";            // Number (%)
-  vehicleData["distance_traveled"] = "NULL";            // Number (km)
-  vehicleData["odometer"] = "NULL";                     // Number (km)
-  vehicleData["control_module_voltage"] = "NULL";       // Number (V)
-  vehicleData["ambient_air_temp"] = "NULL";             // Number (°C)
-  vehicleData["dtc_codes"] = "";                   // String (comma-separated)
-  vehicleData["dtc_count"] = 0;                    // Number
-  */
+  // Ingest API (Zod) expects every key present on each record; OBD updates overwrite below.
+  vehicleData["engine_rpm"] = 0;
+  vehicleData["vehicle_speed"] = 0;
+  vehicleData["coolant_temp"] = 0;
+  vehicleData["engine_load"] = 0;
+  vehicleData["intake_air_temp"] = 0;
+  vehicleData["throttle_position"] = 0;
+  vehicleData["distance_traveled"] = 0;
+  vehicleData["odometer"] = 0;
+  vehicleData["control_module_voltage"] = 0;
+  vehicleData["ambient_air_temp"] = 0;
+  vehicleData["dtc_codes"] = "";
+  vehicleData["dtc_count"] = 0;
 }
 
 template<typename T>
@@ -626,8 +627,79 @@ bool getIMSI(char* imsi) {
   }
 }
 
-// Get current JST time via worldtimeapi.org
-bool getTime(char* time) {
+// +CCLK: "yy/MM/dd,hh:mm:ss±tz" の tz は 15分単位（+36 => +09:00）。ライブラリの getClock と同じ前提。
+static bool parseCclkLineToIso8601(const char* line, char* out, size_t cap, int* fullYearOut) {
+  const char* q = strstr(line, "+CCLK:");
+  if (!q) return false;
+  q = strchr(q, '"');
+  if (!q) return false;
+  q++;
+  int yy, mo, d, h, mi, se;
+  int n = 0;
+  if (sscanf(q, "%d/%d/%d,%d:%d:%d%n", &yy, &mo, &d, &h, &mi, &se, &n) != 6) return false;
+  const char* r = q + static_cast<size_t>(n);
+  int tzq = 0;
+  if (*r == '+' || *r == '-') {
+    tzq = atoi(r);
+  }
+  const int Y = (yy >= 80) ? (1900 + yy) : (2000 + yy);
+  if (fullYearOut) *fullYearOut = Y;
+  const int offMin = tzq * 15;
+  const char sign = offMin >= 0 ? '+' : '-';
+  const int absMin = offMin >= 0 ? offMin : -offMin;
+  const int oh = absMin / 60;
+  const int om = absMin % 60;
+  const int w = snprintf(out, cap, "%04d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d",
+                         Y, mo, d, h, mi, se, sign, oh, om);
+  return w > 0 && static_cast<size_t>(w) < cap;
+}
+
+// Quectel: PDP アクティブ後に AT+QNTP で RTC を合わせ、AT+CCLK? で読む（HTTP より安定しやすい）。
+static bool getTimeFromModemNtp(char* out, size_t cap) {
+  const int cid = WioNetwork.config.pdpContextId;
+  static const char* const kNtpHosts[] = { "ntp.nict.jp", "pool.ntp.org" };
+  bool qntpOk = false;
+  for (size_t hi = 0; hi < sizeof(kNtpHosts) / sizeof(kNtpHosts[0]); hi++) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+      char cmd[88];
+      snprintf(cmd, sizeof(cmd), "AT+QNTP=%d,\"%s\",123,1", cid, kNtpHosts[hi]);
+      const auto r = WioCellular.executeCommand(cmd, 130000);
+      if (r == WioCellularResult::Ok) {
+        qntpOk = true;
+        break;
+      }
+      Serial.printf("QNTP %s: %s\n", kNtpHosts[hi], WioCellularResultToString(r));
+      delay(2000);
+    }
+    if (qntpOk) break;
+  }
+
+  std::string cclkLine;
+  const auto qh = [&cclkLine](const std::string& response) -> bool {
+    if (response.compare(0, 7, "+CCLK: ") == 0) {
+      cclkLine = response;
+      return true;
+    }
+    return false;
+  };
+  if (WioCellular.queryCommand("AT+CCLK?", qh, 300) != WioCellularResult::Ok || cclkLine.empty()) {
+    return false;
+  }
+
+  int year = 0;
+  if (!parseCclkLineToIso8601(cclkLine.c_str(), out, cap, &year)) {
+    return false;
+  }
+  // NTP 失敗時は工場出荷時刻のままのことが多いので、明らかに古い年は却下（NITZ だけで合っている年は通す）
+  if (!qntpOk && year < 2023) {
+    Serial.println("CCLK year looks unset; NTP did not succeed");
+    return false;
+  }
+  return true;
+}
+
+// worldtimeapi: 1 回の receive では JSON が切れることがあるため複数回読み集める
+static bool getTimeFromWorldTimeApiHttp(char* time) {
   const char* host = "worldtimeapi.org";
   const int port = 80;
   const int maxRetries = 20;
@@ -658,13 +730,27 @@ bool getTime(char* time) {
     }
 
     static uint8_t buf[WioCellular.RECEIVE_SOCKET_SIZE_MAX];
-    size_t recvSize;
-    if (!client.receive(buf, sizeof(buf), &recvSize, RECEIVE_TIMEOUT)) {
-      Serial.printf("ERROR: Receive time API %s\n", WioCellularResultToString(client.getLastResult()));
-      continue; // 次のリトライへ
+    size_t total = 0;
+    const unsigned long deadline = millis() + 45000;
+    while (total + 1 < sizeof(buf) && millis() < deadline) {
+      size_t recvSize = 0;
+      if (!client.receive(buf + total, sizeof(buf) - 1 - total, &recvSize, RECEIVE_TIMEOUT)) {
+        break;
+      }
+      if (recvSize == 0) break;
+      total += recvSize;
+      buf[total] = '\0';
+      const char* hdrEnd = strstr(reinterpret_cast<const char*>(buf), "\r\n\r\n");
+      if (hdrEnd && strstr(hdrEnd, "\"datetime\"")) {
+        break;
+      }
     }
 
-    // Parse HTTP response: find JSON body
+    if (total == 0) {
+      Serial.printf("ERROR: Receive time API (no data) %s\n", WioCellularResultToString(client.getLastResult()));
+      continue;
+    }
+
     const char* resp = reinterpret_cast<const char*>(buf);
     const char* body = strstr(resp, "\r\n\r\n");
     if (!body) {
@@ -673,45 +759,38 @@ bool getTime(char* time) {
     }
     body += 4;
 
-    // JSON parse
     JsonDocument jd;
-    auto err = deserializeJson(jd, body);
+    const auto err = deserializeJson(jd, body);
     if (err) {
       Serial.print("JSON parse error: ");
       Serial.println(err.c_str());
       continue; // 次のリトライへ
     }
     if (jd["datetime"].is<const char*>()) {
-      // worldtimeapi datetime: 2024-08-11T10:23:45.123456+09:00
       const char* dt = jd["datetime"];
-      int Y,M,D,h,m,s;
-      if (sscanf(dt, "%d-%d-%dT%d:%d:%d", &Y,&M,&D,&h,&m,&s) == 6) {
-        struct tm t{};
-        t.tm_year = Y - 1900;
-        t.tm_mon = M - 1;
-        t.tm_mday = D;
-        t.tm_hour = h;
-        t.tm_min = m;
-        t.tm_sec = s;
-        /*
-        char formattedTime[26];
-        snprintf(formattedTime, sizeof(formattedTime), "%04d-%02d-%02dT%02d:%02d:%02d+09:00",
-                 Y, M, D, h, m, s);
-        */
-        strcpy(time, dt);
+      int Y, M, D, h, m, s;
+      if (sscanf(dt, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) == 6) {
+        strncpy(time, dt, 63);
+        time[63] = '\0';
         return true;
-      } else {
-        Serial.println("ERROR: Failed to parse datetime format");
-        continue; // 次のリトライへ
       }
-    } else {
-      Serial.println("ERROR: datetime field not found in JSON");
-      continue; // 次のリトライへ
+      Serial.println("ERROR: Failed to parse datetime format");
+      continue;
     }
+    Serial.println("ERROR: datetime field not found in JSON");
   }
-  
-  Serial.printf("ERROR: Failed to get time after %d retries\n", maxRetries);
+
+  Serial.printf("ERROR: Failed to get time after %d HTTP retries\n", maxRetries);
   return false;
+}
+
+bool getTime(char* time) {
+  Serial.println("Getting time: modem NTP (AT+QNTP) + CCLK ...");
+  if (getTimeFromModemNtp(time, 64)) {
+    return true;
+  }
+  Serial.println("Getting time: HTTP fallback (worldtimeapi.org) ...");
+  return getTimeFromWorldTimeApiHttp(time);
 }
 
 String formatTime(char* dt) {

@@ -1,0 +1,7 @@
+/tmp/
+**/.pio/
+**/.venv/
+**/__pycache__/
+**/.DS_Store
+**/*.kicad_prl
+**/~*.lck

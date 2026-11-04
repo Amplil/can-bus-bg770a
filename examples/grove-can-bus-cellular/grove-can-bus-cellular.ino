@@ -10,6 +10,9 @@
 #include <WioCellular.h>
 #include <grove-can-bus.h>
 #include <ArduinoJson.h>
+#include <gnss-session.h>
+#include <functional>
+#include <utility>
 
 #define SEARCH_ACCESS_TECHNOLOGY (WioCellularNetwork::SearchAccessTechnology::LTEM)  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
 #define LTEM_BAND (WioCellularNetwork::NTTDOCOMO_LTEM_BAND)        
@@ -23,6 +26,66 @@ static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // [ms]
 static JsonDocument JsonDoc;
 
 WioCAN can;
+static bg770a::GnssSession Gnss;
+using GnssHandler = decltype(std::declval<WioCellularModule&>().registerUrcHandler2(
+    std::declval<std::function<bool(const std::string&)>>()));
+static GnssHandler GnssUrcHandler;
+static bool TelemetryAttempted = false;
+static void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long timestamp);
+static void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp);
+static bool cellularSend(const JsonDocument& doc);
+static void cleanupOldMessages();
+template<typename T> void printData(T& stream, const void* data, size_t size);
+
+static void serviceGnss(bool allowStart = false) {
+  for (int i = 0; i < 4; ++i) WioCellular.doWork(0);
+  Gnss.tick(millis());
+  if (Gnss.state() == bg770a::GnssSession::State::ResetNeeded) {
+    // Only the reset pulse blocks (~102 ms); boot/re-registration are polled.
+    WioCellular.getInterface().reset();
+    Gnss.resetIssued(millis());
+  }
+  if (allowStart && TelemetryAttempted && Gnss.canSend())
+    Gnss.begin(millis());
+  const std::string command = Gnss.takeCommand();
+  if (!command.empty()) WioCellular.writeBinary(command.data(), command.size());
+}
+
+static void serviceCanDuringWait() {
+  unsigned long id = 0;
+  unsigned char data[8];
+  if (can.receive(&id, data)) {
+    addCANMessageToJSON(id, data, millis());
+    if (id >= 0x7E8 && id <= 0x7EF && data[0] >= 3 && data[1] == 0x41)
+      updateVehicleData(data[2], data, millis());
+  }
+}
+
+static void cooperativeDelay(uint32_t duration) {
+  const uint32_t start = millis();
+  do {
+    serviceGnss();
+    serviceCanDuringWait();
+    delay(1);
+  } while (uint32_t(millis() - start) < duration);
+}
+
+static void attachFreshLocation() {
+  JsonDoc.remove("location"); // Never reuse a previous payload's location.
+  const auto& fix = Gnss.fix();
+  if (!bg770a::isFresh(fix, millis())) return;
+  JsonObject location = JsonDoc["location"].to<JsonObject>();
+  location["latitude"] = fix.latitude;
+  location["longitude"] = fix.longitude;
+  location["altitude_m"] = fix.altitude;
+  location["hdop"] = fix.hdop;
+  location["fix_type"] = fix.fix;
+  location["satellites"] = fix.satellites;
+  location["utc_hhmmss"] = fix.utc;
+  location["date_ddmmyy"] = fix.date;
+  location["age_ms"] = uint32_t(millis() - fix.receivedMillis);
+  location["source"] = "gnss";
+}
 
 static void abortHandler(int sig) {
   Serial.printf("ABORT: Signal %d received\n", sig);
@@ -61,6 +124,10 @@ void setup() {
   WioCellular.begin();
   // Power on the cellular module
   if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) abort();
+  // Register before WioNetwork so both observers see registration URCs.
+  GnssUrcHandler = WioCellular.registerUrcHandler2([](const std::string& line) {
+    return Gnss.line(line, millis());
+  });
   WioNetwork.begin();
 
   // Wait for communication available
@@ -133,7 +200,7 @@ void setup() {
   // Initialize JSON document structure
   JsonDoc["session_start"] = millis();
   JsonDoc["device_id"] = "WIO_BG770A_001";
-  JsonDoc["can_messages"] = JsonArray();
+  JsonDoc["can_messages"].to<JsonArray>();
   JsonDoc["vehicle_data"].to<JsonObject>();
   
   Serial.println();
@@ -144,6 +211,8 @@ void setup() {
 }
 
 void loop() {
+  serviceGnss();
+  serviceCanDuringWait();
   // 統計情報用の変数
   static unsigned long totalMessages = 0;
   static unsigned long lastStatsTime = 0;
@@ -293,7 +362,8 @@ void loop() {
           }    
           Serial.println();
         }
-        delay(10);  // 短い遅延
+        serviceGnss();
+        delay(1);  // Keep AT acquisition moving while awaiting CAN replies.
       }
       
       // 応答が受信できなかった場合
@@ -304,30 +374,35 @@ void loop() {
       }
       
       // 次のPID送信前に短い遅延
-      delay(100);
+      cooperativeDelay(100);
     }
     
     Serial.println("=== All PID requests completed ===");
     lastSend = millis();
   }
 
-  if(millis() - lastCellularSend > cellularSendInterval) {
-    cellularSend(JsonDoc);
-    // 送信後、古いメッセージデータをクリア（最新のvehicle_dataは保持）
-    cleanupOldMessages();
+  if(millis() - lastCellularSend > cellularSendInterval && Gnss.canSend()) {
+    attachFreshLocation();
+    const bool sent = cellularSend(JsonDoc);
+    if (sent) cleanupOldMessages(); // Retain bounded CAN queue on failed sends.
+    JsonDoc.remove("location");
     lastCellularSend = millis();
+    TelemetryAttempted = true;
+    // Acquire after a telemetry attempt, never before the first normal send.
+    // No socket is alive here; GNSS and LTE share the modem exclusively.
+    serviceGnss(true);
   }
   
   // Optional: Enable debug mode by sending commands through Serial monitor
   // Uncomment the following line to enable debug mode
   //can.debugMode();
-  can.debugPID();
+  // debugPID() consumes CAN frames; the normal receiver above owns them.
 
-  delay(10);
+  cooperativeDelay(10);
 }
 
 // CANメッセージをタイムスタンプ付きでJSONに追加
-void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long timestamp) {
+static void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long timestamp) {
   JsonArray messages = JsonDoc["can_messages"];
   
   // 新しいメッセージオブジェクトを作成
@@ -366,7 +441,7 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
 }
 
 // 車両データを時系列で更新
-void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
+static void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
   JsonObject vehicleData = JsonDoc["vehicle_data"].to<JsonObject>();
   
   // raw_data オブジェクトが存在しない場合は作成
@@ -471,7 +546,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
 }
 
 // 古いメッセージをクリーンアップ（メモリ管理）
-void cleanupOldMessages() {
+static void cleanupOldMessages() {
   JsonArray messages = JsonDoc["can_messages"];
   
   // メッセージ配列をクリア（送信後なので）
@@ -508,6 +583,7 @@ static bool cellularSend(const JsonDocument &doc) {
 
     Serial.print("Sending ");
     std::string str;
+    attachFreshLocation(); // Connection setup may have outlived the fix.
     serializeJson(doc, str);
     printData(Serial, str.data(), str.size());
     Serial.println();

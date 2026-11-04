@@ -7,6 +7,10 @@
 - CANドライバ: `src/grove-can-bus.h` の `WioCAN`。Grove UARTを使う `Serial1` を占有します。
 - LTEライブラリ: Seeed WioCellular。cellularの例はSORACOMのAPNと宛先を使用します。
 
+## Optional GNSS
+
+cellular の例は、GNSS測位成功時のみ `location` を付け、未測位・アンテナなしでは位置なしで送信します。GNSS/LTE排他のため測位中は送信間隔が延びます。有限待ち・復帰・実機確認項目は [GNSS guide](docs/optional-gnss.md) を参照してください。
+
 ## License
 
 ```

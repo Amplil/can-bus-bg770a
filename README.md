@@ -7,6 +7,12 @@
 - CANドライバ: `src/grove-can-bus.h` の `WioCAN`。Grove UARTを使う `Serial1` を占有します。
 - LTEライブラリ: Seeed WioCellular。cellularの例はSORACOMのAPNと宛先を使用します。
 
+## LTE NTPによる日時付与
+
+cellular例ではGNSS/PPSを追加せず、LTE経由のNTP結果をUTC日時としてCAN記録へ付与します。従来の起動後ミリ秒タイムスタンプは保持します。未同期・古い同期・通信障害は区別し、日時の表示桁数を精度保証にはしません。
+
+設定・試験方法・実機検証前の制約は [LTE NTPの説明](docs/lte-ntp.md) を参照してください。PlatformIOのこの環境はcellular例のみを選択し、ホスト試験は `sh tests/ntp/run_tests.sh` で別途実行します。
+
 ## License
 
 ```

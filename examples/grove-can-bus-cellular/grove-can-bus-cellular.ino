@@ -10,6 +10,9 @@
 #include <WioCellular.h>
 #include <grove-can-bus.h>
 #include <ArduinoJson.h>
+#include <ntp-session.h>
+#include <functional>
+#include <utility>
 
 #define SEARCH_ACCESS_TECHNOLOGY (WioCellularNetwork::SearchAccessTechnology::LTEM)  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
 #define LTEM_BAND (WioCellularNetwork::NTTDOCOMO_LTEM_BAND)        
@@ -21,6 +24,48 @@ static constexpr int POWER_ON_TIMEOUT = 1000 * 20;     // [ms]
 static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 3;  // [ms]
 static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // [ms]
 static JsonDocument JsonDoc;
+
+// LTE NTP, not NITZ. Seconds resolution is not an accuracy guarantee.
+static const char NTP_SERVER[] = "time.cloudflare.com";
+static ntp_candidate::Uptime64 NtpUptime;
+static ntp_candidate::NtpClock NtpClock;
+static ntp_candidate::NtpSession NtpSession{NtpClock};
+using NtpHandler = decltype(std::declval<WioCellularModule&>().registerUrcHandler2(
+    std::declval<std::function<bool(const std::string&)>>()));
+static NtpHandler NtpUrcHandler;
+
+static uint64_t monotonicNow() { return NtpUptime.update(millis()); }
+
+static void serviceNtp(bool allowStart) {
+  // Existing public API dispatches all lines to registered URC handlers.
+  // Bound the number of lines handled per call; do not enter command wait loops.
+  for (int i = 0; i < 4; ++i) WioCellular.doWork(0);
+  const uint64_t now = monotonicNow();
+  NtpSession.tick(now);
+  if (!allowStart || !NtpSession.modemIdle() || !NtpClock.ready(now)) return;
+  if (WioNetwork.getNetworkState() != WioCellularNetwork::NetworkState::Connected) return;
+  if (!NtpSession.begin(now, WioNetwork.config.pdpContextId, NTP_SERVER)) return;
+  const std::string wire = NtpSession.command() + "\r";
+  WioCellular.writeBinary(wire.data(), wire.size());
+  // No echo/OK wait here. Future doWork(0) calls handle echo, final result and URC.
+  // UART transmit buffering/CTS still requires target-hardware verification.
+}
+
+static void addUtcFields(JsonObject object, unsigned long capturedMillis) {
+  const uint32_t low = millis();
+  const uint64_t now = NtpUptime.update(low);
+  const uint64_t eventTime = now - static_cast<uint32_t>(low - capturedMillis);
+  int64_t epoch;
+  object["time_sync_state"] = NtpClock.quality(now);
+  if (NtpClock.utc(eventTime, epoch)) {
+    object["utc_epoch_s"] = epoch;
+    object["time_source"] = "ntp";
+  } else {
+    object["utc_epoch_s"] = nullptr;
+    object["time_source"] = "unsynced";
+    object["time_sync_state"] = "unsynced";
+  }
+}
 
 WioCAN can;
 
@@ -66,6 +111,10 @@ void setup() {
   // Wait for communication available
   if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) abort();
   Serial.println("initialized");
+  NtpUrcHandler = WioCellular.registerUrcHandler2([](const std::string& line) {
+    return NtpSession.line(line, monotonicNow());
+  });
+  // First request starts in loop(), after CAN setup finishes.
   {
     const auto start = millis();
     while (!Serial && millis() - start < 5000) {
@@ -133,7 +182,7 @@ void setup() {
   // Initialize JSON document structure
   JsonDoc["session_start"] = millis();
   JsonDoc["device_id"] = "WIO_BG770A_001";
-  JsonDoc["can_messages"] = JsonArray();
+  JsonDoc["can_messages"].to<JsonArray>();
   JsonDoc["vehicle_data"].to<JsonObject>();
   
   Serial.println();
@@ -144,15 +193,15 @@ void setup() {
 }
 
 void loop() {
+  serviceNtp(true);
   // 統計情報用の変数
   static unsigned long totalMessages = 0;
-  static unsigned long lastStatsTime = 0;
   
   // OBD-II PID要求を複数種類一括送信
   static unsigned long lastSend = 0;
-  static int sendInterval = 1000;
+  static constexpr uint32_t sendInterval = 1000;
   static unsigned long lastCellularSend = 0;
-  static int cellularSendInterval = 10000;
+  static constexpr uint32_t cellularSendInterval = 10000;
   
   // 送信するPIDの配列
   static unsigned char obdPids[] = {
@@ -192,9 +241,10 @@ void loop() {
           responseReceived = true;
           
           // タイムスタンプごとにJSONに蓄積
-          addCANMessageToJSON(id, data, millis());
+          const unsigned long capturedMillis = millis();
+          addCANMessageToJSON(id, data, capturedMillis);
           // OBD2データを車両データとしても記録
-          updateVehicleData(data[2], data, millis());
+          updateVehicleData(data[2], data, capturedMillis);
           
           // 受信メッセージの詳細表示
           Serial.print("  [");
@@ -293,6 +343,7 @@ void loop() {
           }    
           Serial.println();
         }
+        serviceNtp(false);
         delay(10);  // 短い遅延
       }
       
@@ -311,7 +362,12 @@ void loop() {
     lastSend = millis();
   }
 
-  if(millis() - lastCellularSend > cellularSendInterval) {
+  if(NtpSession.modemIdle() &&
+     millis() - lastCellularSend > cellularSendInterval) {
+    const uint64_t syncNow = monotonicNow();
+    JsonDoc["clock"]["state"] = NtpClock.quality(syncNow);
+    JsonDoc["clock"]["last_error"] = NtpClock.lastError();
+    JsonDoc["clock"]["sync_age_s"] = NtpClock.ageSeconds(syncNow);
     cellularSend(JsonDoc);
     // 送信後、古いメッセージデータをクリア（最新のvehicle_dataは保持）
     cleanupOldMessages();
@@ -333,6 +389,7 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
   // 新しいメッセージオブジェクトを作成
   JsonObject message = messages.add<JsonObject>();
   message["timestamp"] = timestamp;
+  addUtcFields(message, timestamp);
   message["can_id"] = "0x" + String(id, HEX);
   
   // データ配列を追加
@@ -382,6 +439,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
   }
   vehicleData["raw_data"]["pid"] = pid;
   vehicleData["raw_data"]["timestamp"] = timestamp;
+  addUtcFields(vehicleData["raw_data"].as<JsonObject>(), timestamp);
 
   switch(pid) {
     case PID_ENGIN_PRM: // Engine RPM
@@ -391,6 +449,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
         rpmObj["value"] = rpm;
         rpmObj["unit"] = "rpm";
         rpmObj["timestamp"] = timestamp;
+        addUtcFields(rpmObj, timestamp);
       }
       break;
       
@@ -400,6 +459,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
         speedObj["value"] = data[3];
         speedObj["unit"] = "km/h";
         speedObj["timestamp"] = timestamp;
+        addUtcFields(speedObj, timestamp);
       }
       break;
       
@@ -409,6 +469,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
         coolantObj["value"] = data[3] - 40;
         coolantObj["unit"] = "°C";
         coolantObj["timestamp"] = timestamp;
+        addUtcFields(coolantObj, timestamp);
       }
       break;
       
@@ -418,6 +479,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
         loadObj["value"] = data[3] * 100.0 / 255.0;
         loadObj["unit"] = "%";
         loadObj["timestamp"] = timestamp;
+        addUtcFields(loadObj, timestamp);
       }
       break;
       
@@ -427,6 +489,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
         intakeObj["value"] = data[3] - 40;
         intakeObj["unit"] = "°C";
         intakeObj["timestamp"] = timestamp;
+        addUtcFields(intakeObj, timestamp);
       }
       break;
       
@@ -436,6 +499,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
         throttleObj["value"] = data[3] * 100.0 / 255.0;
         throttleObj["unit"] = "%";
         throttleObj["timestamp"] = timestamp;
+        addUtcFields(throttleObj, timestamp);
       }
       break;
       
@@ -446,6 +510,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
         distanceObj["value"] = distance;
         distanceObj["unit"] = "km";
         distanceObj["timestamp"] = timestamp;
+        addUtcFields(distanceObj, timestamp);
       }
       break;
       
@@ -456,6 +521,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
         voltageObj["value"] = voltage;
         voltageObj["unit"] = "V";
         voltageObj["timestamp"] = timestamp;
+        addUtcFields(voltageObj, timestamp);
       }
       break;
       
@@ -465,6 +531,7 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
         ambientObj["value"] = data[3] - 40;
         ambientObj["unit"] = "°C";  
         ambientObj["timestamp"] = timestamp;
+        addUtcFields(ambientObj, timestamp);
       }
       break;
   }

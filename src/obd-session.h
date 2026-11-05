@@ -7,6 +7,7 @@ enum class Support { Unknown, Unsupported, Supported };
 // Fixed standard Mode 01 telemetry only. No transport probing or control services.
 class ObdSession {
  public:
+  enum class Reject { None, NoPending, Responder, Ecu, Service, Pid, Length, Deadline, Invalid };
   explicit ObdSession(bool extended=false, bool allowUnknown=false)
       : allowUnknown_(allowUnknown), extended_(extended) {}
   uint32_t requestId() const { return extended_ ? 0x18DB33F1UL : 0x7DF; }
@@ -39,11 +40,11 @@ class ObdSession {
       if (!found) return false;
     }
     if(page_<6)++attempts_;
-    pending_=pid; waiting_=true; started_=true; last_=now; return true;
+    pending_=pid; timedOut_=false; waiting_=true; started_=true; last_=now; return true;
   }
   void tick(uint32_t now) {
     if (waiting_ && uint32_t(now-last_)>=200) {
-      waiting_=false; last_=now;
+      waiting_=false; timedOut_=true; timeoutEvent_=true; last_=now;
       if (pending_%32==0 && attempts_>=3) page_=6; // timeout is not unsupported
     }
   }
@@ -51,9 +52,15 @@ class ObdSession {
   bool accept(uint32_t id, const uint8_t* d, size_t bytes, uint32_t now) {
     accepted_=false;
     tick(now);
-    if (!d || !waiting_ || !responder(id) || (selected_ && id!=ecu_) || bytes<3) return false;
+    reason_=Reject::None;
+    if (!d || bytes<3) {reason_=Reject::Length;return false;}
+    if (!responder(id)) {reason_=Reject::Responder;return false;}
+    if (selected_ && id!=ecu_) {reason_=Reject::Ecu;return false;}
+    if (d[1]!=0x41) {reason_=Reject::Service;return false;}
+    if (!waiting_) {reason_=(timedOut_ && d[2]==pending_)?Reject::Deadline:Reject::NoPending;return false;}
+    if (d[2]!=pending_) {reason_=Reject::Pid;return false;}
     const unsigned payload=length(pending_);
-    if (!payload || bytes<3+payload || d[0]!=2+payload || d[1]!=0x41 || d[2]!=pending_) return false;
+    if (!payload || bytes<3+payload || d[0]!=2+payload) {reason_=Reject::Length;return false;}
     accepted_=true;
     if (!selected_) { ecu_=id; selected_=true; }
     waiting_=false; last_=now;
@@ -73,6 +80,10 @@ class ObdSession {
     for (unsigned i=0;i<10;++i) if (pids()[i]==pid) return 1;
     return 0;
   }
+  Reject rejection() const { return reason_; }
+  uint8_t pendingPid() const { return pending_; }
+  unsigned bitmapAttempt() const { return attempts_; }
+  bool takeTimeout() { const bool value=timeoutEvent_;timeoutEvent_=false;return value; }
   bool compatibilityEnabled() const { return allowUnknown_; }
   bool acceptedFrame() const { return accepted_; }
   bool waiting() const { return waiting_; }
@@ -80,9 +91,11 @@ class ObdSession {
   uint32_t ecu() const { return ecu_; }
  private:
   static const uint8_t* pids() {
-    static const uint8_t values[]={0x0C,0x0D,0x05,0x04,0x0F,0x11,0x31,0x42,0x46,0xA6};
+    static const uint8_t values[]={0x0C,0x0D,0x05,0x04,0x0F,0x11,0x31,0xA6,0x42,0x46};
     return values;
   }
+  Reject reason_=Reject::None;
+  bool timedOut_=false,timeoutEvent_=false;
   bool accepted_=false;
   bool allowUnknown_, observed_[10]={};
   bool extended_, waiting_=false, started_=false, selected_=false;

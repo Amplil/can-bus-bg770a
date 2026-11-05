@@ -32,6 +32,7 @@ bool WioCAN::enterConfigMode() {
 bool WioCAN::exitConfigMode() {
   clearBuffer();
   bool ret = sendCommand("AT+Q\r\n");
+  if(!ret)Serial.println("CAN config exit ACK missing; data mode unconfirmed");
   clearBuffer();
   return ret;
 }
@@ -52,6 +53,7 @@ bool WioCAN::setCanRate(unsigned char rate) {
 }
 
 bool WioCAN::send(unsigned long id, unsigned char ext, unsigned char rtr, unsigned char len, const unsigned char* buf) {
+  if(len>8 || (len && !buf) || ext>1 || rtr>1 || id>(ext?0x1FFFFFFFUL:0x7FFUL))return false;
   unsigned char data[14] = {0};
 
   data[0] = id >> 24;       // id3
@@ -67,7 +69,9 @@ bool WioCAN::send(unsigned long id, unsigned char ext, unsigned char rtr, unsign
   }
 
   for(int i = 0; i < 14; i++) {
-    canSerial->write(data[i]);
+    if(canSerial->write(data[i])!=1) {
+      Serial.println("CAN UART write incomplete; framing unconfirmed");return false;
+    }
   }
 
   return true;
@@ -84,9 +88,8 @@ void WioCAN::sendPid(unsigned char __pid) {
 }
 
 void WioCAN::sendDtc(unsigned char __dtc_mode) {
-    // OBD-II Mode 03 request should be sent as a Single Frame with length 0x02 and a padding byte 0x00
-    // Example: 0x02, 0x03, 0x00, 0x00, ...
-    unsigned char tmp[8] = {0x02, __dtc_mode, 0x00, 0, 0, 0, 0, 0};
+    // DTC services have one application byte (no PID); remaining bytes are padding.
+    unsigned char tmp[8] = {0x01, __dtc_mode, 0x00, 0, 0, 0, 0, 0};
 
 #if STANDARD_CAN_11BIT
     this->send(CAN_ID_PID, 0, 0, 8, tmp);   // SEND TO ID:0X55

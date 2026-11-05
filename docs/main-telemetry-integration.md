@@ -60,7 +60,7 @@ modem is restarted before sending. No hardware was reset or flashed in this task
 ## GNSS
 
 The first normal telemetry attempt precedes GNSS; subsequent acquisitions occur
-at most every five minutes. GNSS temporarily takes LTE offline, searches for up
+at most every seven minutes. GNSS temporarily takes LTE offline, searches for up
 to 30 seconds, stops GNSS and restores LTE/registration. A pending command may
 add its 20-second deadline. CAN receive/validation continues during this process.
 Command errors or uncertain boundaries use bounded reset/boot recovery. No-fix
@@ -107,8 +107,7 @@ no record is created until an accepted measurement has a valid timestamp.
 Root `obd.supported_pids` exposes support state; zero defaults in required fields
 are not unsupported measurements. `distance_traveled` (PID 31) is distance since
 DTC clear, not odometer. PID A6 remains `odometer`. Existing Mode 03 DTC read is
-retained with selected-ECU, pending-request and single-frame validation; zero DTC
-padding is ignored, hexadecimal digits are preserved. Multiframe DTC is still
+retained with selected-ECU, pending-request and single-frame validation; declared DTC count and SF length are checked, hexadecimal digits are preserved. Multiframe DTC is still
 marked MULTI and is not reassembled. No Mode 04 clear, other control service or
 ISO-TP flow-control frames are added or sent by the cellular example.
 
@@ -127,8 +126,8 @@ extracts and compiles current sketch functions and loop, not an old copied loop.
 Transport fixtures are WioCellular 0.3.16 at
 `9275de1d15f8bd2761f562b8895edc0ee9d1a1c5` with its MIT license.
 
-`pio run` compiles all five profiles: combined/default, NTP without GNSS, GNSS
-without NTP, CAN with HTTP time only, and combined 29-bit/250 kbps. Profiles verify
+`pio run` compiles all seven profiles: combined/default, NTP without GNSS, GNSS
+without NTP, CAN with HTTP time only, and combined 29-bit/250 kbps, 11-bit/250 kbps and 29-bit/500 kbps. Profiles verify
 compilation, not vehicle protocol selection. Build dependency pins and wrapper
 are shared. CI runs the three host suites and all target profiles.
 
@@ -142,8 +141,8 @@ No real vehicle, board, antenna, SIM or ingest server was available for these te
 
 ## Recorded local result
 
-All three UBSan host suites PASS. All five PlatformIO 6.2.0 profiles PASS.
-Combined default: RAM 12,404 / 237,568 bytes; flash 139,008 / 798,720 bytes.
+All three UBSan host suites PASS. All seven PlatformIO 6.2.0 profiles PASS.
+Combined default: RAM 12,508 / 237,568 bytes; flash 144,832 / 798,720 bytes.
 The framework emits its three existing ignored `used` attribute warnings in
 startup_nrf_common.c for each clean target build; there were no build errors.
 No independent agent review was performed. Physical/end-to-end ingest tests
@@ -251,9 +250,18 @@ finite retries and legacy telemetry availability, known exclusions, configuratio
 failure with no unconfigured transmission, actual UART command/legacy PID byte
 layout, empty 30-second send, deferred heartbeat, fragmented numeric 400/207/200,
 unknown/truncated ACKs and prior arbitration/sleep/DTC deadline cases. All three
-host suites and five target profiles passed locally. Latest main remains 93af604.
+host suites and seven target profiles passed locally. Latest main remains 93af604.
 **Physical retest of this patch: NOT DONE.** No board flashing or main merge was
 performed. Verify stage logs and PID00 retries/fallback requests on the same setup,
 then confirm actual measured data and ingest success without exposing the device
 identity. The root causes above are code-confirmed; hardware configuration and
 vehicle bitmap behavior still require physical observation.
+
+## Latest main-format comparison and verbose diagnostics
+
+See [actual-main wire/schema comparison](main-wire-compatibility.md) for unchanged
+Mode 01 bytes, intentional receiver/Mode 03 differences, the fixed synchronous
+work versus pending-response deadline collision, default verbose logs and the
+seven explicit build profiles. CAN Mode 03 SF decoding now consumes the declared
+DTC count before code pairs; earlier uncounted synthetic DTC fixtures were replaced
+with clearly labeled counted CAN fixtures, not inferred vehicle data.

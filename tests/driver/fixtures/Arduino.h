@@ -19,6 +19,7 @@ struct HardwareSerial {
  std::string noise;std::vector<unsigned char> tx;
  std::deque<unsigned char> rx;
  unsigned baud=0;
+ size_t failAfter=static_cast<size_t>(-1);
  void begin(unsigned value){baud=value;}
  void print(const char* s){for(;*s;++s)tx.push_back(static_cast<unsigned char>(*s));}
  template<class T>void print(T){}
@@ -32,7 +33,7 @@ struct HardwareSerial {
  template<class T>void println(const T&){}
  int available(){return static_cast<int>(rx.size());}
  int read(){if(rx.empty())return -1;const auto c=rx.front();rx.pop_front();return c;}
- size_t write(unsigned char c){tx.push_back(c);return 1;}
+ size_t write(unsigned char c){if(tx.size()>=failAfter)return 0;tx.push_back(c);return 1;}
  void flush(){}
 };
 extern HardwareSerial Serial,Serial1;

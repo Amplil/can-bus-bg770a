@@ -17,6 +17,8 @@
 #include <telemetry-time.h>
 #include <obd-session.h>
 #include <endpoint-ack.h>
+#include <can-diagnostics.h>
+#include <obd-dtc.h>
 #include <functional>
 #include <utility>
 #ifndef TELEMETRY_NTP
@@ -71,6 +73,8 @@ WioCAN can;
 static bg770a::TelemetryServices Services;
 static bg770a::ObdSession Obd(OBD_CAN_EXTENDED, OBD_ALLOW_UNKNOWN_PIDS);
 static bool CanReady=false, TelemetryAttempted=false, HaveCanActivity=false, ModemSleeping=false, SynchronousModem=false;
+static bg770a::CanDiagnostics CanStats;
+static bool DtcExpired=false;
 static bool DtcWaiting=false;
 static bool HeartbeatPending=false;
 static uint32_t DtcStarted=0;
@@ -95,43 +99,117 @@ void netPowerOnRestart();
 void netPowerOffWait();
 template<typename T> void printData(T&, const void*, size_t);
 
+static bool canIdle() { return !Obd.waiting() && !DtcWaiting; }
+static void trace(const char* event) {
+  Serial.printf("[%lu ms] [%s] ",static_cast<unsigned long>(millis()),event);
+  int64_t epoch;
+  if(Services.clock.utc(Services.now(millis()),epoch)) {
+    Serial.print(bg770a::isoUtc(epoch).c_str());Serial.print(" ");
+  } else Serial.print("UTC=unsynced ");
+}
+static const char* rejectionName(bg770a::ObdSession::Reject reason) {
+  using R=bg770a::ObdSession::Reject;
+  switch(reason) {
+    case R::Responder:return "DROP responder ID";
+    case R::Ecu:return "DROP selected ECU mismatch";
+    case R::Service:return "DROP service";
+    case R::Pid:return "DROP requested PID mismatch";
+    case R::Length:return "DROP PCI/application length";
+    case R::Deadline:return "DROP processing deadline";
+    case R::NoPending:return "DROP no pending request";
+    default:return "DROP invalid/unmatched";
+  }
+}
+static void traceFrame(const char* event,unsigned long id,const uint8_t* bytes,const char* result) {
+  if(strcmp(event,"CAN-RX")==0 && result[0]!='A' && !CanStats.detail(millis()))return;
+  trace(event);Serial.printf("id=0x%08lX bytes=",id);
+  for(unsigned i=0;i<8;++i)Serial.printf("%02X%s",unsigned(bytes[i]),i==7?"":" ");
+  Serial.print(" ");Serial.println(result);
+}
+static void tickCan(uint32_t now) {
+  Obd.tick(now);
+  if(Obd.takeTimeout()) {
+    trace("CAN-TIMEOUT");Serial.printf("PID=0x%02X bitmap_attempt=%u; no support inference\n",unsigned(Obd.pendingPid()),Obd.bitmapAttempt());
+  }
+  if(DtcWaiting && uint32_t(now-DtcStarted)>=200) {
+    DtcWaiting=false;DtcExpired=true;trace("CAN-TIMEOUT");Serial.println("Mode03 deadline elapsed");
+  }
+}
+static void canSummary() {
+  if(!CanStats.summary(millis()))return;
+  trace("CAN-SUMMARY");
+  Serial.printf("ready=%u tx_uart=%lu tx_failed=%lu rx=%lu telemetry=%lu bitmap=%lu dtc=%lu pending=%u PID=0x%02X queue=%u\n",
+    unsigned(CanReady),static_cast<unsigned long>(CanStats.queued),static_cast<unsigned long>(CanStats.queueFailures),
+    static_cast<unsigned long>(CanStats.received),static_cast<unsigned long>(CanStats.telemetry),
+    static_cast<unsigned long>(CanStats.bitmaps),static_cast<unsigned long>(CanStats.dtc),unsigned(!canIdle()),unsigned(Obd.pendingPid()),unsigned(dataArray.size()));
+  Serial.printf("  drops idle/id/ecu/service/pid/length/deadline=%lu/%lu/%lu/%lu/%lu/%lu/%lu sync_deferred=%lu raw_lines_suppressed=%lu\n",
+    static_cast<unsigned long>(CanStats.dropped[1]),static_cast<unsigned long>(CanStats.dropped[2]),
+    static_cast<unsigned long>(CanStats.dropped[3]),static_cast<unsigned long>(CanStats.dropped[4]),
+    static_cast<unsigned long>(CanStats.dropped[5]),static_cast<unsigned long>(CanStats.dropped[6]),
+    static_cast<unsigned long>(CanStats.dropped[7]),static_cast<unsigned long>(CanStats.syncDeferred),static_cast<unsigned long>(CanStats.suppressed));
+}
+
 static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
   Services.now(millis());
   if(ModemSleeping)return;
   for(int i=0;i<4;++i) WioCellular.doWork(0);
   if(SynchronousModem)return;
   Services.tick(millis());
+  static int lastNtp=-1,lastGnss=-1;
+  const int ntp=int(Services.ntp.phase()),gnss=int(Services.gnss.state());
+  if(ntp!=lastNtp || gnss!=lastGnss) {
+    trace("MODEM-STATE");const char* const ntpNames[]={"Idle","Echo","Ack","Result","Quarantined","Disabled"};
+    const char* const gnssNames[]={"Idle","Offline","Start","PollWait","Poll","Stop","Online","RestoreUrc","Registration","FlowControl","FlowSettle","ResetNeeded","BootWait","BootSettle"};
+    Serial.printf("ntp=%s gnss=%s clock=%s quality=%s\n",ntpNames[ntp],gnssNames[gnss],Services.clock.source(),Services.clock.quality(Services.now(millis())));
+    lastNtp=ntp;lastGnss=gnss;
+  }
+  static int lastOnline=-1;
+  const bool online=WioNetwork.getNetworkState()==WioCellularNetwork::NetworkState::Connected;
+  if(lastOnline!=int(online)) {trace("LTE-STATE");Serial.printf("online=%u\n",unsigned(online));lastOnline=int(online);}
+  // Never introduce command writes or a blocking reset into an OBD wait window.
+  if(!canIdle())return;
   if(Services.gnss.state()==bg770a::GnssSession::State::ResetNeeded) {
     WioCellular.getInterface().reset();
     Services.gnss.resetIssued(millis());
   }
-  const bool online=WioNetwork.getNetworkState()==WioCellularNetwork::NetworkState::Connected;
   const auto command=Services.command(millis(),WioNetwork.config.pdpContextId,online,
                                       allowNtp,allowGnss && TelemetryAttempted);
-  if(!command.empty())WioCellular.writeBinary(command.data(),command.size());
+  if(!command.empty()) {trace("MODEM-TX");Serial.println(command.c_str());WioCellular.writeBinary(command.data(),command.size());}
 }
 
 static void serviceCan() {
-  Obd.tick(millis());
-  if(DtcWaiting && uint32_t(millis()-DtcStarted)>=200)DtcWaiting=false;
+  tickCan(millis());
   unsigned long id=0; unsigned char bytes[8]={};
   for(unsigned n=0;n<8 && can.receive(&id,bytes);++n) {
     const uint32_t receivedAt=millis();
     // receive() may block: enforce the deadline after every returned frame.
-    if(DtcWaiting && uint32_t(receivedAt-DtcStarted)>=200)DtcWaiting=false;
+    tickCan(receivedAt);
+    ++CanStats.received;
     const bool telemetry=Obd.accept(id,bytes,sizeof(bytes),receivedAt);
     const bool dtc=DtcWaiting && Obd.selected() && id==Obd.ecu() &&
-      ((bytes[0]>=1 && bytes[0]<=7 && bytes[1]==0x43 && bytes[0]%2==1) ||
+      (bg770a::dtcSingleFrame(bytes) ||
        ((bytes[0]&0xF0)==0x10 && ((bytes[0]&15)*256U+bytes[1])>7 && bytes[2]==0x43));
+    auto reason=Obd.rejection();
+    const bool dtcService=((bytes[0]&0xF0)==0x10?bytes[2]:bytes[1])==0x43;
+    if(!telemetry && !dtc && dtcService && Obd.selected() && id==Obd.ecu()) {
+      if(!DtcWaiting)reason=DtcExpired?bg770a::ObdSession::Reject::Deadline:bg770a::ObdSession::Reject::NoPending;
+      else reason=bg770a::ObdSession::Reject::Length;
+    }
+    if(telemetry)++CanStats.telemetry;
+    else if(dtc)++CanStats.dtc;
+    else if(Obd.acceptedFrame())++CanStats.bitmaps;
+    else ++CanStats.dropped[unsigned(reason)];
+    const char* result=telemetry?"ACCEPT telemetry":dtc?"ACCEPT Mode03":Obd.acceptedFrame()?"ACCEPT bitmap":rejectionName(reason);
+    traceFrame("CAN-RX",id,bytes,result);
     // Valid activity wakes the modem even when UTC is unavailable. Capability
     // replies are activity too, but never create a measurement record.
     if(Obd.acceptedFrame() || dtc) {
       HaveCanActivity=true; LastCanActivity=receivedAt;
     }
-    if(dtc)DtcWaiting=false;
+    if(dtc) {DtcWaiting=false;DtcExpired=false;}
     if(!telemetry && !dtc)continue;
     int64_t epoch;
-    if(!Services.clock.utc(Services.now(millis()),epoch))continue;
+    if(!Services.clock.utc(Services.now(millis()),epoch)) {trace("CAN-RECORD");Serial.println("accepted activity, record deferred: UTC unavailable");continue;}
     if(vehicleData.isNull())initializeVehicleDataSchema();
     if(telemetry)updateVehicleData(bytes[2],bytes);
     if(dtc)processDtcData(bytes);
@@ -183,6 +261,7 @@ void setup() {
   }
   Serial.println();
   Serial.println();
+  trace("BOOT");Serial.println("profile=main-compatible-diag-v1; verbose CAN diagnostics; unrelated raw detail capped at 64 lines/s, totals every 5 s");
   Serial.println("Grove CAN Bus Module for Wio BG770A");
   Serial.println("=====================================");
 
@@ -199,7 +278,11 @@ void setup() {
   Services.ntpEnabled=TELEMETRY_NTP;
   Services.gnssEnabled=TELEMETRY_GNSS;
   ServicesHandler=WioCellular.registerUrcHandler2([](const std::string& line) {
-    return Services.line(line,millis());
+    const bool handled=Services.line(line,millis());
+    if(line.compare(0,7,"+QNTP: ")==0) {
+      trace("NTP-RESULT");Serial.printf("source=%s quality=%s result=%s\n",Services.clock.source(),Services.clock.quality(Services.now(millis())),Services.clock.lastError());
+    }
+    return handled;
   });
   WioNetwork.begin();
   // Wait for communication available
@@ -233,12 +316,13 @@ void setup() {
 }
 
 void loop() {
-  serviceModem();
   serviceCan();
-  if(HaveCanActivity && ModemSleeping && Services.atIdle())netPowerOnRestart();
-  if(Services.idle() && !ModemSleeping && !deviceIMSI[0] && getIMSI(deviceIMSI))JsonDoc["imsi"]=deviceIMSI;
+  serviceModem();
+  canSummary();
+  if(HaveCanActivity && ModemSleeping && Services.atIdle() && canIdle())netPowerOnRestart();
+  if(canIdle() && Services.idle() && !ModemSleeping && !deviceIMSI[0] && getIMSI(deviceIMSI))JsonDoc["imsi"]=deviceIMSI;
   static uint32_t lastClockRetry=millis();
-  if(Services.idle() && !ModemSleeping && uint32_t(millis()-lastClockRetry)>=60000 &&
+  if(canIdle() && Services.idle() && !ModemSleeping && uint32_t(millis()-lastClockRetry)>=60000 &&
       strcmp(Services.clock.source(),"unsynced")==0) {
     char time[64]; getTime(time);lastClockRetry=millis();
   }
@@ -255,8 +339,10 @@ void loop() {
     unsigned char pid;
     if(CanReady && !DtcWaiting && Obd.next(now,pid)) {
       const unsigned char request[8]={2,1,pid,0,0,0,0,0};
+      traceFrame("CAN-TX-UART",Obd.requestId(),request,"enqueue only; ECU reply pending (200 ms)");
       const bool sent=can.send(Obd.requestId(),OBD_CAN_EXTENDED,0,8,request);
-      Serial.print(sent ? "Queued Mode 01 PID 0x" : "Failed Mode 01 PID 0x");
+      if(sent)++CanStats.queued;else {++CanStats.queueFailures;CanReady=false;trace("CAN-UART-FAILED");Serial.println("polling stopped until reinitialization; UART framing unconfirmed");}
+      trace("CAN-WAIT");Serial.print(sent ? "Queued Mode 01 PID 0x" : "Failed Mode 01 PID 0x");
       Serial.print(pid,HEX);
       Serial.println(Obd.support(pid)==bg770a::Support::Unknown ? " (capability unknown)" : "");
     }
@@ -284,7 +370,12 @@ void loop() {
   JsonDoc["time_source"]=Services.clock.source();
   JsonDoc["time_sync_state"]=Services.clock.quality(Services.now(now));
 
-  if(millis() - lastCellularSend > CELLULAR_INTERVAL && Services.atIdle()) {
+  static bool deferLogged=false;
+  if(millis()-lastCellularSend>CELLULAR_INTERVAL && !canIdle()) {
+    ++CanStats.syncDeferred;
+    if(!deferLogged) {trace("LTE-DEFER");Serial.println("OBD response pending; synchronous modem work postponed");deferLogged=true;}
+  } else deferLogged=false;
+  if(millis() - lastCellularSend > CELLULAR_INTERVAL && Services.atIdle() && canIdle()) {
     if(arrayEmptyCheck(JsonDoc["data"])) {
       Serial.println("doc data is empty.");
       unsigned long emptyDuration = millis() - lastDataReceivedTime;
@@ -332,8 +423,9 @@ void loop() {
 // DTC送信機能
 void sendDtcRequest() {
   const unsigned char request[8]={1,3,0,0,0,0,0,0};
-  can.send(Obd.requestId(),OBD_CAN_EXTENDED,0,8,request);
-  DtcWaiting=true; DtcStarted=millis();
+  traceFrame("CAN-TX-UART",Obd.requestId(),request,"Mode03 enqueue only; reply pending (200 ms)");
+  if(can.send(Obd.requestId(),OBD_CAN_EXTENDED,0,8,request))++CanStats.queued;else {++CanStats.queueFailures;CanReady=false;trace("CAN-UART-FAILED");Serial.println("polling stopped until reinitialization; UART framing unconfirmed");}
+  DtcExpired=false;DtcWaiting=true; DtcStarted=millis();
   Serial.println("Sent DTC request");
 }
 
@@ -364,59 +456,18 @@ String dtcToString(unsigned char highByte, unsigned char lowByte) {
 
 // DTCデータを処理
 void processDtcData(unsigned char* data) {
-  // ISO-TP PCI 判定
-  const uint8_t pciType = data[0] & 0xF0;   // 0x0? = SingleFrame, 0x1? = FirstFrame, 0x2? = Consecutive, 0x3? = Flow
-  const uint8_t sfPayloadLen = data[0] & 0x0F; // SingleFrame のペイロード長
-
-  // Single Frame 以外（マルチフレーム）は未対応（今後再組立てが必要）
-  if (pciType == 0x10) {
-    // First Frame of multi-frame response for DTCs
-    Serial.println("DTC response is multi-frame (not reassembled). Skipping for now.");
-    vehicleData["dtc_codes"] = "MULTI";  // マルチフレームは未対応のため FALSE を格納
-    vehicleData["dtc_count"] = 0;
-    return;
+  if((data[0]&0xF0)==0x10) {
+    vehicleData["dtc_codes"]="MULTI";vehicleData["dtc_count"]=0;
+    trace("DTC");Serial.println("multiframe unsupported; no reassembly/flow control");return;
   }
-  if (pciType != 0x00) {
-    Serial.println("pciType != 0x00");
-    return; // 未対応フレーム
+  if(!bg770a::dtcSingleFrame(data))return;
+  String codes="";
+  for(unsigned n=0;n<data[2];++n) {
+    if(n)codes+=" ";
+    codes+=dtcToString(data[3+2*n],data[4+2*n]);
   }
-
-  // 期待: data[1] = 0x43 (Mode 03 Response)
-  if (sfPayloadLen >= 1 && sfPayloadLen<=7 && sfPayloadLen%2==1 && data[1] == 0x43) {
-    // 以降はDTCの2バイトペアの列
-    // このフレーム内で実際に載っているDTC数（Single Frameに収まる分のみ）
-    const uint8_t bytesAfterService = sfPayloadLen - 1; // service(0x43) を除いたバイト数
-    uint8_t dtcPairsInFrame = bytesAfterService / 2;
-    // フレーム上の位置の上限（データは data[2]～data[7]）
-    dtcPairsInFrame = min<uint8_t>(dtcPairsInFrame, 3);
-
-    if (dtcPairsInFrame == 0) {
-      vehicleData["dtc_codes"] = "";
-      vehicleData["dtc_count"] = 0;
-      Serial.println("No DTCs found in single-frame response");
-      return;
-    }
-
-    String dtcCodes = "";
-    unsigned count=0;
-    for (uint8_t i = 0; i < dtcPairsInFrame; i++) {
-      const uint8_t hi = data[2 + i * 2];
-      const uint8_t lo = data[3 + i * 2];
-      if(hi==0 && lo==0)continue;
-      ++count;
-      String dtcCode = dtcToString(hi, lo);
-      Serial.print("DTC ");
-      Serial.print(i + 1);
-      Serial.print(": ");
-      Serial.println(dtcCode);
-      if (dtcCodes.length() > 0) dtcCodes += " ";
-      dtcCodes += dtcCode;
-    }
-
-    vehicleData["dtc_codes"] = dtcCodes;
-    vehicleData["dtc_count"] = count; // Single Frame内で取得できた件数
-    //vehicleData["dtc_timestamp"] = timestamp;
-  }
+  vehicleData["dtc_codes"]=codes;vehicleData["dtc_count"]=data[2];
+  trace("DTC");Serial.printf("validated count=%u\n",unsigned(data[2]));
 }
 
 // 車両データを単一オブジェクトに更新
@@ -503,13 +554,15 @@ void updateVehicleData(unsigned char pid, unsigned char* data) {
 
 // 古いメッセージをクリーンアップ（メモリ管理）
 void clearData() {
+  trace("QUEUE-CLEAR");Serial.printf("records=%u\n",unsigned(dataArray.size()));
   dataArray.clear();
   vehicleData=JsonObject();
   Serial.println("dataArrayをクリアしました。");
 }
 
 static bool cellularSend(const JsonDocument &doc) {
-  if(!Services.idle() || !deviceIMSI[0] || ModemSleeping || doc["data"].size()==0)return false;
+  if(!canIdle() || !Services.idle() || !deviceIMSI[0] || ModemSleeping || doc["data"].size()==0)return false;
+  trace("LTE-SEND");Serial.printf("queue=%u; payload redacted\n",unsigned(doc["data"].size()));
   Serial.println("### Sending Combined Vehicle Data Object");
   Serial.print("Connecting ");
   Serial.print(HOST);
@@ -518,11 +571,13 @@ static bool cellularSend(const JsonDocument &doc) {
 
   {
     WioCellularTcpClient2<WioCellularModule> client{ WioCellular };
+    trace("LTE-OPEN");Serial.println("starting synchronous socket open (no pending OBD)");
     if (!client.open(WioNetwork.config.pdpContextId, HOST, PORT)) {
       Serial.printf("ERROR: Failed to open %s\n", WioCellularResultToString(client.getLastResult()));
       return false;
     }
 
+    trace("LTE-CONNECT");Serial.println("waiting for TCP connection (no pending OBD)");
     if (!client.waitForConnect()) {
       Serial.printf("ERROR: Failed to connect %s\n", WioCellularResultToString(client.getLastResult()));
       return false;
@@ -550,7 +605,7 @@ static bool cellularSend(const JsonDocument &doc) {
       if(recvSize==0) { ack.finish();break; }
       if(ack.feed(recvData,recvSize)!=bg770a::EndpointAck::Result::Pending)break;
     }
-    Serial.print("Endpoint status: ");Serial.println(ack.status());
+    trace("LTE-ACK");Serial.print("Endpoint status: ");Serial.println(ack.status());
     if(ack.result()!=bg770a::EndpointAck::Result::Accepted) {
       Serial.println("Endpoint rejected/unconfirmed; retaining records");return false;
     }
@@ -565,6 +620,7 @@ static bool cellularSend(const JsonDocument &doc) {
 static void initializeVehicleDataSchema() {
   if(dataArray.size()>=12)dataArray.remove(0);
   vehicleData = dataArray.add<JsonObject>(); // Preserve bounded latest samples
+  trace("QUEUE-ADD");Serial.printf("records=%u\n",unsigned(dataArray.size()));
   vehicleData["time_source"]=Services.clock.source();
   vehicleData["time_sync_state"]=Services.clock.quality(Services.now(millis()));
   int64_t epoch;
@@ -595,6 +651,8 @@ void printData(T &stream, const void *data, size_t size) {
 
 // Get IMSI from SIM card
 bool getIMSI(char* imsi) {
+  if(!canIdle() || !Services.idle())return false;
+  trace("MODEM-IDENTITY");Serial.println("query starting; value remains redacted");
   Serial.println("Getting IMSI...");
   
   // WioCellularライブラリのgetIMSI APIを使用してIMSIを取得
@@ -702,12 +760,15 @@ static bool getTimeFromWorldTimeApiHttp(char* time) {
 }
 
 bool getTime(char* time) {
+  if(!canIdle())return false;
+  trace("TIME");Serial.println("synchronization/fallback requested");
   if(WioNetwork.getNetworkState()!=WioCellularNetwork::NetworkState::Connected)return false;
   const uint32_t start=millis();
   while(TELEMETRY_NTP && uint32_t(millis()-start)<135000) {
     serviceModem();serviceCan();
     int64_t epoch;
     if(Services.clock.utc(Services.now(millis()),epoch)) {
+      trace("TIME-READY");Serial.println("validated NTP clock available");
       const auto iso=bg770a::isoUtc(epoch);strncpy(time,iso.c_str(),63);time[63]=0;return true;
     }
     if(Services.ntp.modemIdle() && !Services.clock.ready(Services.now(millis())))break;
@@ -718,10 +779,11 @@ bool getTime(char* time) {
   SynchronousModem=true;
   const bool fallback=getTimeFromWorldTimeApiHttp(time);
   SynchronousModem=false;
-  if(!fallback)return false;
+  if(!fallback) {trace("TIME-FAILED");Serial.println("HTTP fallback unavailable; clock unchanged");return false;}
   int64_t epoch;
   if(!bg770a::parseHttpTime(time,epoch))return false;
   Services.clock.seedFallback(epoch,Services.now(millis()));
+  trace("TIME-READY");Serial.println("validated HTTP fallback anchor (not NTP)");
   return true;
 }
 String formatTime(char* time) { return String(time); }
@@ -742,7 +804,8 @@ bool arrayEmptyCheck(JsonArrayConst arr) { // doc["data"]のすべての要素�
 }
 
 void netPowerOffWait() {
-  if(!Services.atIdle())return;
+  if(!canIdle() || !Services.atIdle())return;
+  trace("POWER-OFF");Serial.println("idle, no pending OBD");
   ModemSleeping=true;
   // Power off the cellular module
   // WioCellularがOFFになっているかどうか確かめる
@@ -769,6 +832,8 @@ void netPowerOffWait() {
 }
 
 void netPowerOnRestart() { // powerOnを開始する
+  if(!canIdle())return;
+  trace("POWER-ON");Serial.println("restarting modem; no pending OBD");
   // Power on the cellular module
   auto start = millis(); // 計測用
   Serial.print("powerOn開始");Serial.println(start);
@@ -800,58 +865,59 @@ void initCAN() {
   digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_ON);
   delay(1000);
   // Initialize CAN module
+  trace("CAN-CONFIG");Serial.printf("rate_kbps=%u id_bits=%u request_id=0x%08lX UART=%u\n",unsigned(OBD_CAN_RATE==CAN_RATE_500?500:250),unsigned(OBD_CAN_EXTENDED?29:11),static_cast<unsigned long>(Obd.requestId()),unsigned(CAN_BAUDRATE));
   can.begin();
   Obd=bg770a::ObdSession(OBD_CAN_EXTENDED, OBD_ALLOW_UNKNOWN_PIDS);
-  DtcWaiting=false;
+  DtcWaiting=false;DtcExpired=false;
   // Inherited default; verify the actual vehicle before selecting rate/ID width.
   if((CanReady=can.setCanRate(OBD_CAN_RATE))) {
-    Serial.println("Configured CAN bus rate: OK");
+    trace("CAN-CONFIG");Serial.println("Configured CAN bus rate: OK");
   } else {
-    Serial.println("Configured CAN bus rate: FAILED");
+    trace("CAN-CONFIG");Serial.println("Configured CAN bus rate: FAILED");
   }
 
   // --- set mask and filter (standard frame) ---
   // Mask設定: 0x00000000で全てのIDを通す（全通し）
   if (can.setMask(0, OBD_CAN_EXTENDED, 0x00000000)) {
-    Serial.println("Mask0 set: OK (All pass)");
+    trace("CAN-CONFIG");Serial.println("Mask0 set: OK (All pass)");
   } else {
-    CanReady=false;Serial.println("Mask0 set: FAILED");
+    CanReady=false;trace("CAN-CONFIG");Serial.println("Mask0 set: FAILED");
   }
   if (can.setMask(1, OBD_CAN_EXTENDED, 0x00000000)) {
-    Serial.println("Mask1 set: OK (All pass)");
+    trace("CAN-CONFIG");Serial.println("Mask1 set: OK (All pass)");
   } else {
-    CanReady=false;Serial.println("Mask1 set: FAILED");
+    CanReady=false;trace("CAN-CONFIG");Serial.println("Mask1 set: FAILED");
   }
 
   // Filter設定: 0x00000000で全てのIDを通す（全通し）
   if (can.setFilt(0, OBD_CAN_EXTENDED, 0x00000000)) {
-    Serial.println("Filt0 set: OK (All pass)");
+    trace("CAN-CONFIG");Serial.println("Filt0 set: OK (All pass)");
   } else {
-    CanReady=false;Serial.println("Filt0 set: FAILED");
+    CanReady=false;trace("CAN-CONFIG");Serial.println("Filt0 set: FAILED");
   }
   if (can.setFilt(1, OBD_CAN_EXTENDED, 0x00000000)) {
-    Serial.println("Filt1 set: OK (All pass)");
+    trace("CAN-CONFIG");Serial.println("Filt1 set: OK (All pass)");
   } else {
-    CanReady=false;Serial.println("Filt1 set: FAILED");
+    CanReady=false;trace("CAN-CONFIG");Serial.println("Filt1 set: FAILED");
   }
   if (can.setFilt(2, OBD_CAN_EXTENDED, 0x00000000)) {
-    Serial.println("Filt2 set: OK (All pass)");
+    trace("CAN-CONFIG");Serial.println("Filt2 set: OK (All pass)");
   } else {
-    CanReady=false;Serial.println("Filt2 set: FAILED");
+    CanReady=false;trace("CAN-CONFIG");Serial.println("Filt2 set: FAILED");
   }
   if (can.setFilt(3, OBD_CAN_EXTENDED, 0x00000000)) {
-    Serial.println("Filt3 set: OK (All pass)");
+    trace("CAN-CONFIG");Serial.println("Filt3 set: OK (All pass)");
   } else {
-    CanReady=false;Serial.println("Filt3 set: FAILED");
+    CanReady=false;trace("CAN-CONFIG");Serial.println("Filt3 set: FAILED");
   }
   if (can.setFilt(4, OBD_CAN_EXTENDED, 0x00000000)) {
-    Serial.println("Filt4 set: OK (All pass)");
+    trace("CAN-CONFIG");Serial.println("Filt4 set: OK (All pass)");
   } else {
-    CanReady=false;Serial.println("Filt4 set: FAILED");
+    CanReady=false;trace("CAN-CONFIG");Serial.println("Filt4 set: FAILED");
   }
   if (can.setFilt(5, OBD_CAN_EXTENDED, 0x00000000)) {
-    Serial.println("Filt5 set: OK (All pass)");
+    trace("CAN-CONFIG");Serial.println("Filt5 set: OK (All pass)");
   } else {
-    CanReady=false;Serial.println("Filt5 set: FAILED");
+    CanReady=false;trace("CAN-CONFIG");Serial.println("Filt5 set: FAILED");
   }
 }

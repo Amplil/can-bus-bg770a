@@ -33,8 +33,10 @@ int main() {
  rpm[0]=3;assert(!s.accept(0x7E8,rpm,8,310));rpm[0]=4;
  assert(!s.accept(0x7E9,rpm,8,311));assert(s.accept(0x7E8,rpm,8,312));
  ObdSession timeout;assert(timeout.next(0xFFFFFFF0U,p));timeout.tick(0xB8U);
- assert(timeout.support(0x0C)==Support::Unknown);assert(!timeout.next(0x11CU,p));
- assert(!timeout.accept(0x7E8,bitmap,8,0x11D));
+ assert(timeout.support(0x0C)==Support::Unknown);assert(timeout.next(0x11CU,p)&&p==0);
+ assert(!timeout.accept(0x7E8,bitmap,8,0x1E4));
+ assert(timeout.next(0x248,p)&&p==0);timeout.tick(0x310);
+ assert(!timeout.next(0x374,p));
  ObdSession ext(true);assert(ext.requestId()==0x18DB33F1UL);
  assert(ext.next(0,p));assert(!ext.accept(0x7E8,bitmap,8,1));
  assert(!ext.accept(0x18DA01F1,bitmap,8,2));
@@ -62,5 +64,23 @@ int main() {
  assert(odometer.next(t,p) && p==0xA6);
  uint8_t distance[]={6,0x41,0xA6,0,0,0x10,0,0};
  assert(odometer.accept(0x7E8,distance,8,t+1));
+ for(unsigned variant=0;variant<3;++variant) {
+  ObdSession compatibility(false,true);uint32_t now=0;
+  for(unsigned attempt=0;attempt<3;++attempt) {
+   assert(compatibility.next(now,p)&&p==0);
+   if(variant==1) {uint8_t bad[]={6,0x7F,0,0,0,0,0,0};assert(!compatibility.accept(0x7E8,bad,8,now+50));bad[0]=0x10;bad[1]=0x41;assert(!compatibility.accept(0x7E8,bad,8,now+60));}
+   compatibility.tick(now+200);now+=300;
+  }
+  assert(compatibility.support(0x0C)==Support::Unknown);
+  assert(compatibility.next(now,p)&&p==0x0C);
+  if(variant==2)assert(!compatibility.accept(0x7E8,bitmap,8,now+1)); // late bitmap cannot complete RPM
+  uint8_t reply[]={4,0x41,0x0C,0x1F,0x40,0,0,0};
+  assert(compatibility.accept(0x7E8,reply,8,now+2));
+  assert(compatibility.support(0x0C)==Support::Supported);
+ }
+ ObdSession excluded(false,true);assert(excluded.next(0,p));
+ assert(!excluded.accept(0x7E8,empty,8,1));assert(!excluded.next(101,p));
+ assert(excluded.next(201,p) && p==0x31); // known base-PID exclusions remain skipped
+ assert(excluded.support(0x0C)==Support::Unsupported);
  std::cout<<"OBD session regression tests passed\n";
 }

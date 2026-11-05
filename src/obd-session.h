@@ -7,7 +7,8 @@ enum class Support { Unknown, Unsupported, Supported };
 // Fixed standard Mode 01 telemetry only. No transport probing or control services.
 class ObdSession {
  public:
-  explicit ObdSession(bool extended=false) : extended_(extended) {}
+  explicit ObdSession(bool extended=false, bool allowUnknown=false)
+      : allowUnknown_(allowUnknown), extended_(extended) {}
   uint32_t requestId() const { return extended_ ? 0x18DB33F1UL : 0x7DF; }
   bool responder(uint32_t id) const {
     return extended_ ? id<=0x1FFFFFFFUL && (id & 0x1FFFFF00UL)==0x18DAF100UL
@@ -15,11 +16,14 @@ class ObdSession {
   }
   Support support(uint8_t pid) const {
     if (!pid || pid>0xC0) return Support::Unknown;
+    for(unsigned i=0;i<10;++i)if(pids()[i]==pid && observed_[i])return Support::Supported;
     const unsigned page=(pid-1)/32, bit=31-((pid-1)%32);
     if (!known_[page]) return Support::Unknown;
     return (maps_[page] & (uint32_t(1)<<bit)) ? Support::Supported : Support::Unsupported;
   }
-  // Discovery happens once per boot, at most six requests. Silence stays unknown.
+  // At most three attempts per bitmap page. Silence remains unknown.
+  // Explicit legacy compatibility mode polls only the existing read-only PIDs
+  // when unknown; a valid bitmap exclusion is never bypassed.
   bool next(uint32_t now, uint8_t& pid) {
     if (waiting_ || (started_ && uint32_t(now-last_)<100)) return false;
     if (page_<6) {
@@ -29,16 +33,18 @@ class ObdSession {
       bool found=false;
       for (unsigned n=0;n<10;++n) {
         pid=pids()[index_]; index_=(index_+1)%10;
-        if (support(pid)==Support::Supported) { found=true; break; }
+        const auto state=support(pid);
+        if (state==Support::Supported || (allowUnknown_ && state==Support::Unknown)) { found=true; break; }
       }
       if (!found) return false;
     }
+    if(page_<6)++attempts_;
     pending_=pid; waiting_=true; started_=true; last_=now; return true;
   }
   void tick(uint32_t now) {
     if (waiting_ && uint32_t(now-last_)>=200) {
       waiting_=false; last_=now;
-      if (pending_%32==0) page_=6; // timeout is not unsupported
+      if (pending_%32==0 && attempts_>=3) page_=6; // timeout is not unsupported
     }
   }
   // Legacy UART driver supplies 8 bytes but no actual DLC/IDE/RTR metadata.
@@ -54,9 +60,10 @@ class ObdSession {
     if (pending_%32==0) {
       unsigned page=pending_/32;
       maps_[page]=(uint32_t(d[3])<<24)|(uint32_t(d[4])<<16)|(uint32_t(d[5])<<8)|d[6];
-      known_[page]=true; page_=page+1;
+      known_[page]=true; page_=page+1; attempts_=0;
       return false; // capabilities are not telemetry
     }
+    for(unsigned i=0;i<10;++i)if(pids()[i]==pending_)observed_[i]=true;
     return true;
   }
   static unsigned length(uint8_t pid) {
@@ -66,6 +73,7 @@ class ObdSession {
     for (unsigned i=0;i<10;++i) if (pids()[i]==pid) return 1;
     return 0;
   }
+  bool compatibilityEnabled() const { return allowUnknown_; }
   bool acceptedFrame() const { return accepted_; }
   bool waiting() const { return waiting_; }
   bool selected() const { return selected_; }
@@ -76,10 +84,11 @@ class ObdSession {
     return values;
   }
   bool accepted_=false;
+  bool allowUnknown_, observed_[10]={};
   bool extended_, waiting_=false, started_=false, selected_=false;
   bool known_[6]={};
   uint32_t maps_[6]={}, last_=0, ecu_=0;
-  unsigned page_=0,index_=0;
+  unsigned page_=0,index_=0,attempts_=0;
   uint8_t pending_=0;
 };
 }

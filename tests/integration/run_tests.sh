@@ -9,3 +9,10 @@ for source in tests/obd/test_session.cpp tests/integration/test_services.cpp; do
  "$build/$name"
 done
 python3 tests/integration/test_sketch.py
+
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -pedantic -fsanitize=undefined -Itests/driver/fixtures -Isrc tests/driver/test_driver.cpp src/grove-can-bus.cpp -o "$build/driver"
+"$build/driver"
+
+json_include=${ARDUINOJSON_INCLUDE:-.pio/libdeps/seeed_wio_bg770a/ArduinoJson/src}
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -pedantic -fsanitize=undefined -Isrc -I"$json_include" tests/integration/test_endpoint.cpp -o "$build/endpoint"
+"$build/endpoint"

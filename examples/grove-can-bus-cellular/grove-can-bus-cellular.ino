@@ -16,6 +16,7 @@
 #include <telemetry-services.h>
 #include <telemetry-time.h>
 #include <obd-session.h>
+#include <endpoint-ack.h>
 #include <functional>
 #include <utility>
 #ifndef TELEMETRY_NTP
@@ -23,6 +24,11 @@
 #endif
 #ifndef TELEMETRY_GNSS
 #define TELEMETRY_GNSS 1
+#endif
+// Explicit compatibility policy: only the ten existing standard Mode 01 PIDs.
+// Unknown remains unknown until a validated positive reply; exclusions are skipped.
+#ifndef OBD_ALLOW_UNKNOWN_PIDS
+#define OBD_ALLOW_UNKNOWN_PIDS 1
 #endif
 #ifndef OBD_CAN_RATE
 #define OBD_CAN_RATE CAN_RATE_500
@@ -63,9 +69,10 @@ static constexpr unsigned long ABORT_TIME = 1000 * 60 * 5; // ABORTが発生し�
 
 WioCAN can;
 static bg770a::TelemetryServices Services;
-static bg770a::ObdSession Obd(OBD_CAN_EXTENDED);
+static bg770a::ObdSession Obd(OBD_CAN_EXTENDED, OBD_ALLOW_UNKNOWN_PIDS);
 static bool CanReady=false, TelemetryAttempted=false, HaveCanActivity=false, ModemSleeping=false, SynchronousModem=false;
 static bool DtcWaiting=false;
+static bool HeartbeatPending=false;
 static uint32_t DtcStarted=0;
 static uint32_t LastCanActivity=0;
 using ServiceHandler = decltype(std::declval<WioCellularModule&>().registerUrcHandler2(
@@ -208,8 +215,7 @@ void setup() {
 
   // Get IMSI for device identification
   if(Services.idle() && getIMSI(deviceIMSI)) {
-    Serial.print("端末識別用IMSI: ");
-    Serial.println(deviceIMSI);
+    Serial.println("Device identity ready (redacted)");
     // IMSIをJSONドキュメントのルートレベルに追加
     JsonDoc["imsi"] = deviceIMSI;
   } else {
@@ -242,11 +248,17 @@ void loop() {
   const uint32_t now=millis();
   if(HaveCanActivity) { lastDataReceivedTime=LastCanActivity; HaveCanActivity=false; }
   if(uint32_t(now-lastRotateSend)>=OBD_INTERVAL) {
-    if(!batch) { vehicleData=JsonObject(); batch=true; batchStarted=now; }
+    if(!batch) {
+      vehicleData=JsonObject(); batch=true; batchStarted=now;
+      if(!CanReady)Serial.println("CAN polling disabled: module configuration unconfirmed");
+    }
     unsigned char pid;
     if(CanReady && !DtcWaiting && Obd.next(now,pid)) {
       const unsigned char request[8]={2,1,pid,0,0,0,0,0};
-      can.send(Obd.requestId(),OBD_CAN_EXTENDED,0,8,request);
+      const bool sent=can.send(Obd.requestId(),OBD_CAN_EXTENDED,0,8,request);
+      Serial.print(sent ? "Queued Mode 01 PID 0x" : "Failed Mode 01 PID 0x");
+      Serial.print(pid,HEX);
+      Serial.println(Obd.support(pid)==bg770a::Support::Unknown ? " (capability unknown)" : "");
     }
     // Allow discovery through PID A0 and all current telemetry within the batch.
     if(uint32_t(now-batchStarted)>=4000 && !Obd.waiting()) {
@@ -259,6 +271,8 @@ void loop() {
   }
   JsonObject diagnostics=JsonDoc["obd"].to<JsonObject>();
   diagnostics["coverage"]="vehicle_unverified";
+  diagnostics["can_ready"]=CanReady;
+  diagnostics["unknown_pid_fallback"]=Obd.compatibilityEnabled();
   diagnostics["distance_traveled_meaning"]="distance_since_dtc_clear";
   if(Obd.selected())diagnostics["response_id"]=Obd.ecu();
   const unsigned char pids[]={0x0C,0x0D,0x05,0x04,0x0F,0x11,0x31,0xA6,0x42,0x46};
@@ -276,11 +290,9 @@ void loop() {
       unsigned long emptyDuration = millis() - lastDataReceivedTime;
       if(emptyDuration > DATA_EMPTY_TIMEOUT) { // DATA_EMPTY_TIMEOUT時間経過チェック
         unsigned long lastACKDuration = millis() - lastACKTime;
-        if(lastACKDuration > ACK_INTERVAL) {
-          Serial.print("最後の報告から");Serial.print(lastACKDuration / 1000);Serial.println("秒が経過したため生存報告で空データを送信します。");
-          lastACKTime = millis();
-          netPowerOnRestart();
-          cellularSend(JsonDoc);
+        if(lastACKDuration > ACK_INTERVAL && !HeartbeatPending) {
+          HeartbeatPending=true;
+          Serial.println("Heartbeat pending: ingest requires measured records; empty send deferred");
         }
         Serial.print("OBD2の受信データが");Serial.print(emptyDuration / 1000);Serial.println("秒間なかったためWioCellularとCAN BUSをOFFにします。");
         digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_OFF);
@@ -301,8 +313,10 @@ void loop() {
       lastDataReceivedTime = millis(); // 最後にデータを受信した時刻を更新
       //lastDataReceivedDuration=0;
     }
+    // The ingest contract rejects data:[]; retain heartbeat intent locally.
+    if(dataArray.size()==0) { lastCellularSend=millis();cooperativeDelay(10);return; }
     TelemetryAttempted=true;
-    if(cellularSend(JsonDoc))clearData(); // 送信後、データをクリア
+    if(cellularSend(JsonDoc)) { clearData();lastACKTime=millis();HeartbeatPending=false; } // 送信後、データをクリア
     lastCellularSend = millis();
   }
   
@@ -495,7 +509,7 @@ void clearData() {
 }
 
 static bool cellularSend(const JsonDocument &doc) {
-  if(!Services.idle() || !deviceIMSI[0] || ModemSleeping)return false;
+  if(!Services.idle() || !deviceIMSI[0] || ModemSleeping || doc["data"].size()==0)return false;
   Serial.println("### Sending Combined Vehicle Data Object");
   Serial.print("Connecting ");
   Serial.print(HOST);
@@ -518,7 +532,7 @@ static bool cellularSend(const JsonDocument &doc) {
     std::string str;
     attachFreshLocation(); // A slow TCP connection may outlive fix freshness.
     serializeJson(doc, str);
-    printData(Serial, str.data(), str.size());
+    Serial.print(str.size());Serial.print(" bytes (payload redacted)");
     Serial.println();
     if (!client.send(str.data(), str.size())) {
       Serial.printf("ERROR: Failed to send socket %s\n", WioCellularResultToString(client.getLastResult()));
@@ -527,14 +541,20 @@ static bool cellularSend(const JsonDocument &doc) {
 
     Serial.println("Receiving");
     static uint8_t recvData[WioCellular.RECEIVE_SOCKET_SIZE_MAX];
-    size_t recvSize;
-    if (!client.receive(recvData, sizeof(recvData), &recvSize, RECEIVE_TIMEOUT)) {
-      Serial.printf("ERROR: Failed to receive socket %s\n", WioCellularResultToString(client.getLastResult()));
-      return false;
+    bg770a::EndpointAck ack;
+    const uint32_t began=millis();
+    for(unsigned part=0;part<16 && uint32_t(millis()-began)<RECEIVE_TIMEOUT;++part) {
+      size_t recvSize=0;
+      const int remaining=RECEIVE_TIMEOUT-int(uint32_t(millis()-began));
+      if(!client.receive(recvData,sizeof(recvData),&recvSize,remaining))return false;
+      if(recvSize==0) { ack.finish();break; }
+      if(ack.feed(recvData,recvSize)!=bg770a::EndpointAck::Result::Pending)break;
+    }
+    Serial.print("Endpoint status: ");Serial.println(ack.status());
+    if(ack.result()!=bg770a::EndpointAck::Result::Accepted) {
+      Serial.println("Endpoint rejected/unconfirmed; retaining records");return false;
     }
 
-    printData(Serial, recvData, recvSize);
-    Serial.println();
   }
 
   Serial.println("### Completed");
@@ -584,8 +604,7 @@ bool getIMSI(char* imsi) {
   if (result == WioCellularResult::Ok && !imsiStr.empty()) {
     strncpy(imsi, imsiStr.c_str(), 19);
     imsi[19] = '\0';
-    Serial.print("IMSI: ");
-    Serial.println(imsi);
+    Serial.println("Device identity ready (redacted)");
     return true;
   } else {
     Serial.println("ERROR: Failed to get IMSI");
@@ -782,7 +801,7 @@ void initCAN() {
   delay(1000);
   // Initialize CAN module
   can.begin();
-  Obd=bg770a::ObdSession(OBD_CAN_EXTENDED);
+  Obd=bg770a::ObdSession(OBD_CAN_EXTENDED, OBD_ALLOW_UNKNOWN_PIDS);
   DtcWaiting=false;
   // Inherited default; verify the actual vehicle before selecting rate/ID width.
   if((CanReady=can.setCanRate(OBD_CAN_RATE))) {
@@ -796,43 +815,43 @@ void initCAN() {
   if (can.setMask(0, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Mask0 set: OK (All pass)");
   } else {
-    Serial.println("Mask0 set: FAILED");
+    CanReady=false;Serial.println("Mask0 set: FAILED");
   }
   if (can.setMask(1, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Mask1 set: OK (All pass)");
   } else {
-    Serial.println("Mask1 set: FAILED");
+    CanReady=false;Serial.println("Mask1 set: FAILED");
   }
 
   // Filter設定: 0x00000000で全てのIDを通す（全通し）
   if (can.setFilt(0, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt0 set: OK (All pass)");
   } else {
-    Serial.println("Filt0 set: FAILED");
+    CanReady=false;Serial.println("Filt0 set: FAILED");
   }
   if (can.setFilt(1, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt1 set: OK (All pass)");
   } else {
-    Serial.println("Filt1 set: FAILED");
+    CanReady=false;Serial.println("Filt1 set: FAILED");
   }
   if (can.setFilt(2, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt2 set: OK (All pass)");
   } else {
-    Serial.println("Filt2 set: FAILED");
+    CanReady=false;Serial.println("Filt2 set: FAILED");
   }
   if (can.setFilt(3, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt3 set: OK (All pass)");
   } else {
-    Serial.println("Filt3 set: FAILED");
+    CanReady=false;Serial.println("Filt3 set: FAILED");
   }
   if (can.setFilt(4, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt4 set: OK (All pass)");
   } else {
-    Serial.println("Filt4 set: FAILED");
+    CanReady=false;Serial.println("Filt4 set: FAILED");
   }
   if (can.setFilt(5, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt5 set: OK (All pass)");
   } else {
-    Serial.println("Filt5 set: FAILED");
+    CanReady=false;Serial.println("Filt5 set: FAILED");
   }
 }

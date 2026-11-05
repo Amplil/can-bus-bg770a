@@ -22,6 +22,7 @@ source=r'''
 #include <telemetry-services.h>
 #include <telemetry-time.h>
 #include <obd-session.h>
+#include <endpoint-ack.h>
 #include <cassert>
 #include <array>
 #include <deque>
@@ -43,7 +44,7 @@ struct Uart {
  void write(int c){tx+=char(c);}
  void reset(){++resets;}
 };
-struct Module:wiocellular::module::at_client::AtClient<Module>{Uart uart;Uart& getInterface(){return uart;}} WioCellular;
+struct Module:wiocellular::module::at_client::AtClient<Module>{static constexpr size_t RECEIVE_SOCKET_SIZE_MAX=256;Uart uart;Uart& getInterface(){return uart;}} WioCellular;
 struct Network {
  enum class NetworkState{Connected,Offline};
  struct Config{int pdpContextId=1;}config;
@@ -59,10 +60,14 @@ struct String:std::string {
 };
 constexpr int HEX=16;
 using std::min;
-struct SerialType {template<class... T>void print(T...){} template<class... T>void println(T...){} } Serial;
+struct SerialType {explicit operator bool()const{return true;} template<class... T>void print(T...){} template<class... T>void println(T...){} template<class... T>void printf(T...){} } Serial;
 struct Frame{unsigned long id;std::array<unsigned char,8> bytes;uint32_t delayMs=0;};
 struct Can {
  std::deque<Frame> rx;std::deque<std::array<unsigned char,8>> sent;
+ bool rateOK=true,maskOK=true,filterOK=true;
+ void begin(){} bool setCanRate(unsigned){return rateOK;}
+ bool setMask(unsigned,unsigned,unsigned long){return maskOK;}
+ bool setFilt(unsigned,unsigned,unsigned long){return filterOK;}
  bool receive(unsigned long* id,unsigned char* data){if(rx.empty())return false;auto f=rx.front();rx.pop_front();nowMs+=f.delayMs;*id=f.id;std::copy(f.bytes.begin(),f.bytes.end(),data);return true;}
  bool send(unsigned long,unsigned char,unsigned char,unsigned char size,const unsigned char* bytes){assert(size==8);assert(bytes[1]==1||bytes[1]==3);std::array<unsigned char,8> f;std::copy(bytes,bytes+8,f.begin());sent.push_back(f);return true;}
 }can;
@@ -71,12 +76,12 @@ static JsonArray dataArray=JsonDoc["data"].to<JsonArray>();
 static JsonObject vehicleData;
 static char deviceIMSI[20]={};
 static bg770a::TelemetryServices Services;
-static bg770a::ObdSession Obd;
-static bool CanReady=true,TelemetryAttempted=false,HaveCanActivity=false,ModemSleeping=false,DtcWaiting=false,SynchronousModem=false;
+static bg770a::ObdSession Obd(false,true);
+static bool CanReady=true,TelemetryAttempted=false,HaveCanActivity=false,ModemSleeping=false,DtcWaiting=false,SynchronousModem=false,HeartbeatPending=false;
 static uint32_t DtcStarted=0;
 static uint32_t LastCanActivity=0;
-constexpr unsigned OBD_CAN_EXTENDED=0;
-constexpr unsigned PIN_VGROVE_ENABLE=0,VGROVE_ENABLE_OFF=0;
+constexpr unsigned OBD_CAN_EXTENDED=0,OBD_ALLOW_UNKNOWN_PIDS=1,OBD_CAN_RATE=16;
+constexpr unsigned PIN_VGROVE_ENABLE=0,VGROVE_ENABLE_OFF=0,VGROVE_ENABLE_ON=1;
 static bool sendResult=false;static unsigned sendCalls=0,powerOffs=0,powerOns=0;
 void digitalWrite(unsigned,unsigned){}
 constexpr unsigned TELEMETRY_NTP=0;
@@ -88,12 +93,31 @@ static bool getTimeFromWorldTimeApiHttp(char* out){
  serviceModem(true,true);assert(WioCellular.uart.tx==before);
  std::strncpy(out,httpTime.c_str(),63);out[63]=0;return !httpTime.empty();
 }
-bool getIMSI(char* out){std::strcpy(out,"test-imsi");return true;}
-void initCAN(){Obd=bg770a::ObdSession();}
+bool getIMSI(char* out){std::strcpy(out,"fixture-device");return true;}
+void initCAN();
 void netPowerOffWait(){assert(Services.atIdle());++powerOffs;ModemSleeping=true;}
 void netPowerOnRestart(){assert(Services.atIdle());++powerOns;Services.powerCycle();ModemSleeping=false;WioNetwork.state=Network::NetworkState::Connected;}
 void clearData();
-static bool cellularSend(const JsonDocument&){assert(Services.idle());++sendCalls;return sendResult;}
+static bool cellularSend(const JsonDocument&);
+static unsigned socketOpens=0;
+static std::deque<std::string> ReplyChunks={"200 {}\r\n"};
+using WioCellularModule=Module;
+static constexpr const char* HOST="fixture.invalid";
+static constexpr int PORT=23080,RECEIVE_TIMEOUT=10000;
+static const char* WioCellularResultToString(int){return "fixture-status";}
+template<class T>struct WioCellularTcpClient2 {
+ std::deque<std::string> chunks=ReplyChunks;
+ explicit WioCellularTcpClient2(T&){}
+ bool open(int,const char*,int){++socketOpens;return true;}
+ bool waitForConnect(){return true;}
+ bool send(const char*,size_t){++sendCalls;return sendResult;}
+ int getLastResult(){return 0;}
+ bool receive(uint8_t* out,size_t cap,size_t* size,int remaining){assert(remaining>0);nowMs+=1;
+  if(chunks.empty()){*size=0;return true;}
+  auto part=chunks.front();chunks.pop_front();assert(part.size()<=cap);
+  std::copy(part.begin(),part.end(),out);*size=part.size();return true;
+ }
+};
 static void initializeVehicleDataSchema();
 void updateVehicleData(unsigned char,unsigned char*);
 void processDtcData(unsigned char*);
@@ -102,12 +126,61 @@ void sendDtcRequest();
 bool arrayEmptyCheck(JsonArrayConst);
 '''+defines+'\n'+constants+'\n'
 for signature in ['static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(',
- 'static void attachFreshLocation()', 'String dtcToString(', 'void processDtcData(unsigned char* data)',
+ 'static void attachFreshLocation()', 'static bool cellularSend(const JsonDocument &doc)', 'void initCAN() {', 'String dtcToString(', 'void processDtcData(unsigned char* data)',
  'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void initializeVehicleDataSchema() {',
  'String addMillisTime() {', 'bool getTime(char* time) {', 'bool arrayEmptyCheck(', 'void sendDtcRequest() {','void loop() {']:
     source+=function(signature)+'\n'
 source+=r'''
 int main(int argc,char** argv){
+ if(argc>1 && std::string(argv[1])=="missing-bitmap") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  nowMs=9900;loop();assert(can.sent.empty());
+  bool rpmRequested=false;
+  for(nowMs=10000;nowMs<14000 && dataArray.size()==0;nowMs+=10) {
+   loop();if(!can.sent.empty() && can.sent.back()[2]==0x0C && Obd.waiting()) {
+    rpmRequested=true;assert(Obd.support(0x0C)==bg770a::Support::Unknown);
+    can.rx.push_back({0x7E8,{4,0x41,0x0C,0x1F,0x40,0,0,0}});
+   }
+  }
+  assert(rpmRequested);
+  assert(dataArray.size()>0 && vehicleData["engine_rpm"]==2000);
+  assert(Obd.support(0x0C)==bg770a::Support::Supported);
+  std::cout<<"Missing bitmap recovers validated legacy telemetry after bounded retries\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="empty-and-400") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  sendResult=true;nowMs=30001;loop();assert(sendCalls==0 && socketOpens==0);
+  assert(!cellularSend(JsonDoc));assert(socketOpens==0);
+  initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;
+  ReplyChunks={"4","00 {\"error\":\"Invalid payload shape\",\"details\":{\"formErrors\":[],\"fieldErrors\":{\"data\":[\"data must contain at least one record\"]}}}"};
+  nowMs=61020;loop();assert(dataArray.size()==1 && sendCalls==1);
+  ReplyChunks={"20","7 {\"status\":\"partial\"}"};
+  nowMs=92040;loop();assert(dataArray.size()==1 && sendCalls==2);
+  ReplyChunks={"20","0 {\"result\":\"ok\"}\r\n"};
+  nowMs=123060;loop();assert(dataArray.size()==0 && sendCalls==3);
+  std::cout<<"Actual sender skips empty data; fragmented 400/207 retain queue and 200 clears it\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-deferred") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  sendResult=true;nowMs=30001;loop();assert(sendCalls==0);
+  nowMs=ACK_INTERVAL+61000;loop();
+  assert(HeartbeatPending && socketOpens==0 && powerOns==0 && powerOffs==1);
+  assert(dataArray.size()==0);ModemSleeping=false;
+  initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;
+  nowMs+=31000;loop();assert(!HeartbeatPending && sendCalls==1);
+  std::cout<<"Empty heartbeat remains pending locally until a measured payload succeeds\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="config-failure") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  can.rateOK=false;initCAN();assert(!CanReady);loop();nowMs=10000;loop();assert(can.sent.empty());
+  can.rateOK=true;can.maskOK=false;initCAN();assert(!CanReady);
+  can.maskOK=true;can.filterOK=false;initCAN();assert(!CanReady);
+  can.filterOK=true;initCAN();assert(CanReady);
+  std::cout<<"Actual initCAN propagates rate/mask/filter failures; no unconfigured transmission\n";return 0;
+ }
  if(argc>1 && std::string(argv[1])=="unsynced-wake") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;loop();
   ModemSleeping=true;WioNetwork.state=Network::NetworkState::Offline;
@@ -155,7 +228,7 @@ int main(int argc,char** argv){
  Services.ntpEnabled=false;Services.gnssEnabled=false;
  Services.clock.seedFallback(1735689599LL,Services.now(0));
  auto handler=WioCellular.registerUrcHandler2([](const std::string& s){return Services.line(s,millis());});
- loop();assert(JsonDoc["imsi"]=="test-imsi");assert(dataArray.size()==0);
+ loop();assert(JsonDoc["imsi"]=="fixture-device");assert(dataArray.size()==0);
  nowMs=10000;loop();assert(can.sent.back()[2]==0);
  can.rx.push_back({0x123,{6,0x41,0,0,0x18,0,0,0}});
  nowMs=10020;loop();assert(!Obd.selected());assert(dataArray.size()==0);
@@ -213,5 +286,5 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','unsynced-wake dtc-deadline').split():
+    for scenario in os.environ.get('SKETCH_SCENARIOS','unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure').split():
         subprocess.run([str(exe),scenario],check=True)

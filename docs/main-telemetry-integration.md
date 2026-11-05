@@ -3,8 +3,9 @@
 Base: `Amplil/can-bus-bg770a` main `93af60465fbfec11a852343c302180161a5ae251`.
 This ports the requested functionality, not the old main snapshot. The new main's
 `imsi` + `data[]` envelope, numeric record keys (including odometer), DTC strings,
-30-second send interval, CAN power gating, ten-minute idle sleep and hourly empty
-heartbeat remain. UTC ISO8601 `time` retains its string type and explicit offset;
+30-second send interval, CAN power gating and ten-minute idle sleep remain.
+Hourly heartbeat intent is retained locally; the ingest endpoint rejects empty records,
+so no empty heartbeat payload is sent. UTC ISO8601 `time` retains its string type and explicit offset;
 the previous code incorrectly relabeled local time with +09:00 and mishandled
 long uptime. Added metadata is optional for consumers. The ingest service itself
 is not available here; compatibility with strict rejection of extra fields needs
@@ -91,11 +92,13 @@ active protocol/bitrate probing. Grove GD32E103 CAN hardware cannot implement
 K-line or another non-CAN physical layer through software.
 
 Mode 01 bitmap discovery is bounded to PID 00 through A0 (six pages, following
-only advertised continuation bits). The A0 page is needed to preserve main's
+only advertised continuation bits), with at most three attempts per page. The A0 page is needed to preserve main's
 standard PID A6 odometer. The first valid PID 00 responder is selected for the
 boot; this does not identify its ECU role. Polling supports ten existing PIDs,
-only if advertised. Bit exclusions are unsupported; missing, negative and timed
-out responses remain unknown. Discovery resets when the CAN module is reinitialized.
+with explicit unknown-PID compatibility polling enabled by default (see field-regression
+follow-up below). Bit exclusions are unsupported; missing, negative and timed
+out responses remain unknown until a valid positive telemetry reply is observed.
+Discovery resets when the CAN module is reinitialized.
 A 200 ms response deadline and 100 ms minimum request gap reject unrelated,
 wrong-ECU, wrong-PID, wrong-service and malformed single-frame payloads. A
 four-second acquisition window follows the existing ten-second group interval;
@@ -140,7 +143,7 @@ No real vehicle, board, antenna, SIM or ingest server was available for these te
 ## Recorded local result
 
 All three UBSan host suites PASS. All five PlatformIO 6.2.0 profiles PASS.
-Combined default: RAM 12,388 / 237,568 bytes; flash 133,664 / 798,720 bytes.
+Combined default: RAM 12,404 / 237,568 bytes; flash 139,008 / 798,720 bytes.
 The framework emits its three existing ignored `used` attribute warnings in
 startup_nrf_common.c for each clean target build; there were no build errors.
 No independent agent review was performed. Physical/end-to-end ingest tests
@@ -168,3 +171,89 @@ The HTTP helper's actual reception from WorldTimeAPI remains **NOT TESTED**:
 fallback orchestration, date validation, clock anchoring and AT exclusion, not
 actual fragmented socket reads or the public server. That distinction also
 applies to the earlier host results above.
+
+## Field regression follow-up (reported against c6eb9f0)
+
+Confirmed with failing regressions against the previous extracted sketch:
+1. A missing PID00 response exhausted discovery after one try; all telemetry stayed
+   Unknown and was never requested again until CAN reinitialization. Unlike the old
+   main's unconditional ten read-only PID requests after ten seconds, that made
+   telemetry depend on receiving a capability bitmap.
+2. At 30 seconds the empty-data branch fell through into a send even without records.
+3. Receiving any TCP bytes was treated as delivery success, so the provided numeric
+   `400` rejection cleared the queued records and printed Completed.
+
+These are verified code paths, not proof that this vehicle lost PID00 specifically.
+The missing request prints were also a visibility regression: their absence alone
+could not establish whether UART transmission occurred. A failed CAN configuration
+is another possible cause of no requests; there is no physical evidence here that
+it occurred in the reported run. The user's older-version success demonstrates
+working legacy telemetry on that setup, not support for every Hustler generation.
+
+### Recovery policy and visibility
+
+`OBD_ALLOW_UNKNOWN_PIDS=1` is the explicit compatibility policy in the sketch. It
+restores requests for only the ten existing standard Mode 01 telemetry PIDs after
+bounded bitmap discovery (three attempts per page, 200 ms deadline, 100 ms minimum
+gap). It does not probe transport, bitrate, diagnostic services or new PIDs. Unknown
+is not converted to unsupported or assumed supported: only a matching positive
+response establishes observed support. Known bitmap exclusions are still skipped.
+Set `OBD_ALLOW_UNKNOWN_PIDS=0` for strict advertised/observed-only polling. Model
+coverage remains vehicle_unverified. The first validated responder (bitmap or
+telemetry) becomes the consistent ECU source; wrong ECU/PID/service/length and late
+responses are still rejected.
+
+Queued PID requests and CAN configuration failures are now logged without device
+identity/payload values. Queued means UART submission, not an ECU acknowledgment.
+`obd.can_ready` and `obd.unknown_pid_fallback` explain the gate/policy. All required
+rate/mask/filter operations must succeed. Driver configuration also checks the
+exit-to-data-mode acknowledgment; the old driver discarded that result. Command
+response storage and waits are bounded under echo/noise. The driver source's line
+endings were normalized while editing it. No setting is automatically swept or
+changed on a live bus after a configuration failure; check stage logs and retry
+explicit initialization with the verified settings.
+
+### Ingest acknowledgments and empty heartbeat
+
+The actual sender now refuses empty `data[]` before opening a socket. The hourly
+heartbeat becomes a local pending flag/log and is satisfied only by a later accepted
+measured payload. No invented zero measurement is added to satisfy the server.
+
+[SORACOM's documented TCP reply](https://users.soracom.io/ja-jp/docs/unified-endpoint/settings/)
+is numeric status plus body. Unified status 207 means partial failure; 200 means
+all configured destinations succeeded. The parser supports status 200/201/204 with
+a complete JSON object/array success body, and documented bare Harvest/Funnel
+201/204 only at clean response end. Explicit errors (including 400, 5xx, 207,
+JSON error/ng/false) are rejected. Unknown/custom plaintext ACKs, HTTP status-line
+responses, oversized or truncated ACKs remain unconfirmed and retain the queue.
+No HTTP/1.1 envelope is inferred from the reported `400 {error...}` TCP response.
+
+The exact provided sanitized 400 shape is a regression fixture. Current extracted
+`cellularSend` is tested through simulated socket reads with fragmentation, empty
+payload gating, rejection retention and confirmed-success clearing. Unlike the
+older test, the sender function itself is not stubbed. TCP/modem I/O is still
+simulated. The WorldTimeAPI HTTP receive helper remains stubbed as stated above.
+The acknowledgment read is bounded to 16 receives / ten seconds / 2048 bytes.
+Absent/truncated ACK can mean delivery succeeded but confirmation was lost, so a
+retry may duplicate records; no exactly-once delivery or server idempotency is
+claimed. The 12-record bound can still evict oldest records during prolonged failure.
+Only returned service status is checked; the device cannot independently verify
+external backend durability or custom SORACOM configuration correctness.
+
+Payload and response bodies, including the device identity, are no longer printed
+by the sender; only byte counts and numeric status are logged. Actual identifiers
+were not copied into tests, documentation or PR text. Fixtures use synthetic labels.
+
+### Verification and physical retest
+
+Host regressions cover startup scheduling, absent/negative/malformed/late bitmap,
+finite retries and legacy telemetry availability, known exclusions, configuration
+failure with no unconfigured transmission, actual UART command/legacy PID byte
+layout, empty 30-second send, deferred heartbeat, fragmented numeric 400/207/200,
+unknown/truncated ACKs and prior arbitration/sleep/DTC deadline cases. All three
+host suites and five target profiles passed locally. Latest main remains 93af604.
+**Physical retest of this patch: NOT DONE.** No board flashing or main merge was
+performed. Verify stage logs and PID00 retries/fallback requests on the same setup,
+then confirm actual measured data and ingest success without exposing the device
+identity. The root causes above are code-confirmed; hardware configuration and
+vehicle bitmap behavior still require physical observation.

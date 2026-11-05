@@ -187,7 +187,7 @@ static void serviceCan() {
     ++CanStats.received;
     const bool telemetry=Obd.accept(id,bytes,sizeof(bytes),receivedAt);
     const bool dtc=DtcWaiting && Obd.selected() && id==Obd.ecu() &&
-      (bg770a::dtcSingleFrame(bytes) ||
+      (bg770a::dtcSingleFrame(bytes,sizeof(bytes)) ||
        ((bytes[0]&0xF0)==0x10 && ((bytes[0]&15)*256U+bytes[1])>7 && bytes[2]==0x43));
     auto reason=Obd.rejection();
     const bool dtcService=((bytes[0]&0xF0)==0x10?bytes[2]:bytes[1])==0x43;
@@ -368,7 +368,7 @@ void loop() {
       state==bg770a::Support::Unsupported ? "unsupported" : "unknown";
   }
   JsonDoc["time_source"]=Services.clock.source();
-  JsonDoc["time_sync_state"]=Services.clock.quality(Services.now(now));
+  JsonDoc["time_sync_state"]=Services.clock.quality(Services.now(millis()));
 
   static bool deferLogged=false;
   if(millis()-lastCellularSend>CELLULAR_INTERVAL && !canIdle()) {

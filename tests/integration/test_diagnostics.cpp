@@ -21,5 +21,8 @@ int main(){
  const uint8_t two[]={6,0x43,2,0x01,0xAF,0xC0,0x10,0};assert(bg770a::dtcSingleFrame(two));
  const uint8_t uncouned[]={3,0x43,0x01,0xAF,0,0,0,0};assert(!bg770a::dtcSingleFrame(uncouned));
  const uint8_t mismatch[]={4,0x43,2,0x01,0xAF,0,0,0};assert(!bg770a::dtcSingleFrame(mismatch));
+ const uint8_t padded[]={7,0x43,1,0x01,0xAF,0xFF,0xFF,0xFF};
+ assert(bg770a::dtcSingleFrame(padded));assert(!bg770a::dtcSingleFrame(padded,7));
+ const uint8_t paddedZero[]={7,0x43,0,0xFF,0xFF,0xFF,0xFF,0xFF};assert(bg770a::dtcSingleFrame(paddedZero));
  std::cout<<"Diagnostic rejection reasons, bounded raw logs, timers and counted CAN Mode03 SF validation passed\n";
 }

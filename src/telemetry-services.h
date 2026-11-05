@@ -15,7 +15,7 @@ class TelemetryServices {
   bool line(const std::string& line, uint32_t low) {
     const auto mono=now(low);
     if (ntp.line(line,mono)) return true;
-    return gnss.line(line,low);
+    return gnss.line(line,uptime.latestTick());
   }
   void tick(uint32_t low) {
     ntp.tick(now(low));
@@ -23,18 +23,20 @@ class TelemetryServices {
       // Unknown final response: a physical reset is needed before another AT owner.
       ntp.resetBoundary(); gnss.recover();
     }
-    if (ntp.modemIdle()) gnss.tick(low);
+    if (ntp.modemIdle()) gnss.tick(uptime.latestTick());
   }
   bool atIdle() const { return ntp.modemIdle() && gnss.modemIdle(); }
   bool idle() const { return atIdle() && gnss.canSend(); }
   std::string command(uint32_t low, int context, bool online,
                       bool allowNtp, bool allowGnss) {
     tick(low);
+    const uint64_t mono=uptime.value();
+    const uint32_t current=uptime.latestTick();
     if (!ntp.modemIdle()) return {};
     if (gnss.modemIdle() && online && allowNtp && ntpEnabled &&
-        clock.ready(now(low)) && gnss.canSend() && ntp.begin(now(low),context,"ntp.nict.jp"))
+        clock.ready(mono) && gnss.canSend() && ntp.begin(mono,context,"ntp.nict.jp"))
       return ntp.command()+"\r";
-    if (online && allowGnss && gnssEnabled && ntp.modemIdle()) gnss.begin(low);
+    if (online && allowGnss && gnssEnabled && ntp.modemIdle()) gnss.begin(current);
     return gnss.takeCommand();
   }
   void powerCycle() { gnss=GnssSession{}; }

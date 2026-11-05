@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Compile current sketch functions and loop against real JSON/AT dispatcher."""
-import os, pathlib, re, subprocess, tempfile
+import os, pathlib, re, subprocess, tempfile, json
 root=pathlib.Path(__file__).resolve().parents[2]
 sketch=(root/'examples/grove-can-bus-cellular/grove-can-bus-cellular.ino').read_text()
+field=json.loads((root/'tests/fixtures/field-pid00-utc.json').read_text())
+observed_rx=next(e for e in field['events'] if e['kind']=='rx')
 def function(signature):
     start=sketch.index(signature)
     while ';' in sketch[start:sketch.index('{',start)]:
@@ -36,7 +38,8 @@ source=r'''
 #include <cstring>
 #include <new>
 static uint32_t nowMs=0;
-uint32_t millis(){return nowMs;}
+static bool advanceMillis=false;
+uint32_t millis(){const auto value=nowMs;if(advanceMillis)++nowMs;return value;}
 void delay(unsigned ms){nowMs+=ms;}
 #include "module/at_client/AtClient.hpp"
 struct Uart {
@@ -151,6 +154,47 @@ static void pollUntilSend(unsigned expected) {
  assert(sendCalls==expected);
 }
 int main(int argc,char** argv){
+ if(argc>1 && std::string(argv[1])=="synthetic-padded-values") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));
+  uint8_t pid;assert(Obd.next(0,pid));
+  const uint8_t map[]={6,0x41,0,0,0x10,0,0,0};Obd.accept(0x7E8,map,8,1);
+  assert(!Obd.next(101,pid));assert(Obd.next(102,pid) && pid==0x0C);
+  // Synthetic extension tests, not responses from the supplied vehicle log.
+  can.rx.push_back({0x7E8,{7,0x41,0x0C,0x1F,0x40,0xFF,0xAA,0x55}});
+  nowMs=109;serviceCan();assert(vehicleData["engine_rpm"]==2000);
+  assert(vehicleData["vehicle_speed"]==0 && CanStats.telemetry==1);
+  sendDtcRequest();can.rx.push_back({0x7E8,{7,0x43,1,0x01,0xAF,0xFF,0xFF,0xFF}});
+  serviceCan();assert(vehicleData["dtc_codes"]=="P01AF" && vehicleData["dtc_count"]==1);
+  std::cout<<"Synthetic padded RPM/DTC decode only required data; padding never adds values/codes\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="field-padded") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  nowMs=19750;loop();assert(Obd.waiting() && Obd.pendingPid()==0);
+  // Exact supplied field response; no other vehicle bytes are inferred.
+  can.rx.push_back({FIELD_ID,{FIELD_BYTES}});
+  nowMs=FIELD_MILLIS;loop();assert(CanStats.bitmaps==1 && Obd.selected());
+  assert(Obd.support(0x0C)==bg770a::Support::Supported);
+  assert(dataArray.size()==0); // bitmap/padding never becomes a measurement
+  assert(Serial.output.find("ACCEPT bitmap")!=std::string::npos);
+  std::cout<<"Exact fixed-length field bitmap accepted within deadline; padding not recorded\n";return 0;
+ }
+ if(argc>1 && (std::string(argv[1])=="utc-continuity" || std::string(argv[1])=="utc-true-wrap")) {
+  const bool wrap=std::string(argv[1])=="utc-true-wrap";
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  nowMs=wrap?0xFFFFFF00U:19740;advanceMillis=true;
+  int64_t anchor;assert(bg770a::parseHttpTime("2026-11-05T06:38:43+00:00",anchor));
+  const uint32_t start=millis();Services.clock.seedFallback(anchor,Services.now(start));
+  for(unsigned n=0;n<40;++n)loop();
+  const uint32_t current=millis();int64_t epoch;
+  assert(Services.clock.utc(Services.now(current),epoch));
+  const int64_t wall=uint32_t(current-start)/1000;
+  assert(epoch-anchor>=wall-1 && epoch-anchor<=wall+1);
+  if(wrap)assert(current<start);
+  assert(Serial.output.find("2026-12-")==std::string::npos);
+  std::cout<<"Actual verbose sketch UTC follows advancing millis, with true wrap="<<wrap<<"\n";return 0;
+ }
  if(argc>1 && std::string(argv[1])=="verbose-diagnostics") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
   for(unsigned i=0;i<80;++i)can.rx.push_back({0x123,{2,1,0x0C,0,0,0,0,0}});
@@ -352,10 +396,11 @@ int main(int argc,char** argv){
  std::cout<<"Actual sketch loop, AT recovery, CAN validation, legacy schema, DTC, queue, HTTP fallback tests passed\n";
 }
 '''
+source=source.replace('FIELD_ID',str(observed_rx['id'])).replace('FIELD_BYTES',','.join(str(n) for n in observed_rx['bytes'])).replace('FIELD_MILLIS',str(observed_rx['millis']))
 include=pathlib.Path(os.environ.get('ARDUINOJSON_INCLUDE',root/'.pio/libdeps/seeed_wio_bg770a/ArduinoJson/src'))
 with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics').split():
+    for scenario in os.environ.get('SKETCH_SCENARIOS','unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
         subprocess.run([str(exe),scenario],check=True)

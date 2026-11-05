@@ -19,11 +19,11 @@ identity from a real log is included.
 | Telemetry PIDs/order | 0C,0D,05,04,0F,11,31,A6,42,46 | Same now | Previously A6 was last; reordered to remove an unnecessary difference |
 | PID00 discovery | None | Bounded initial 00..A0 bitmap discovery | Adds read-only requests and startup delay; three attempts/page, then explicit unknown-PID compatibility policy. Not an all-model capability claim |
 | PID spacing / batch | >50 ms between requests, one group after each 10 s | >=100 ms after reply/timeout, up to 200 ms pending, four-second window followed by ten-second group gap | Slower bounded polling avoids overlap; it is not the same timing as main. Response deadline can reject a slow ECU; physical latency remains unknown |
-| Received data | DTC service check; otherwise uses byte 2 as PID without correlating an outstanding Mode 01 request | Selected response ECU, service 41, exact pending PID, expected SF application length, processing deadline | Intentional protection against unrelated/malformed/stale frames. No inference that main's broader acceptance was correct |
+| Received data | DTC service check; otherwise uses byte 2 as PID without correlating an outstanding Mode 01 request | Selected response ECU, service 41, exact pending PID, SF declaration 0..7 with required payload present (padding allowed), processing deadline | Intentional protection against unrelated/malformed/stale frames. No inference that main's broader acceptance was correct |
 | ECU selection | Can mix any received IDs into one record | First validated responder remains selected until CAN reinit | Consistent source; can omit PIDs available only on another ECU. Diagnose `DROP selected ECU mismatch`; no ECU-role assumption |
 | Configuration exit | Sends AT+Q but discards its return value | Requires command and exit acknowledgment | Same positive wire commands; no ACK now blocks polling. A real module missing ACK despite working data mode could explain a difference, but is unconfirmed. Do not disable all checks blindly |
 | Mode 03 request | `02 03 00 00 00 00 00 00` | `01 03 00 00 00 00 00 00` | Intentional one-byte service request: Mode 03 has no PID. Only UART byte 6 (PCI) differs; this cannot change Mode 01 RPM request bytes |
-| Mode 03 decode | Treats bytes after service as code pairs | Counted ISO 15765 single-frame response: service 43, count, code pairs | Main's uncounted interpretation is not restored. Count/length mismatch is rejected. Multiframe remains MULTI, not reassembled |
+| Mode 03 decode | Treats bytes after service as code pairs | Counted ISO 15765 single-frame response: service 43, count, code pairs | Main's uncounted interpretation is not restored. Count must fit the declared SF payload; trailing padding is ignored. Multiframe remains MULTI, not reassembled |
 | Server JSON | Identity field + data array; time string, ten numeric telemetry fields, DTC string/count | Same required keys/types/conversions; optional provenance/location/OBD metadata | Actual schema/update functions compare equal on synthetic Mode 01 values. UTC offset is truthful rather than forcibly relabeled; strict backend acceptance of extra keys is still untested |
 | Empty data / rejected send | May send empty data, clears on received bytes | Never sends empty data; clear only on supported positive service ACK | Needed for reported endpoint rejection; heartbeat intent is locally pending rather than fabricated data |
 
@@ -104,3 +104,54 @@ main ignored the return from write(). A partial write logs unconfirmed framing a
 stops further tracker requests until reinitialization instead of claiming success.
 Both the current driver DTC wrapper and cellular request use the one-byte Mode 03
 service. These changes do not alter a successful Mode 01 UART frame.
+
+## Supplied fixed-length response and UTC interleaving follow-up
+
+The failing-run excerpt now has a narrow observed-data fixture at
+`tests/fixtures/field-pid00-utc.json`. It contains the supplied PID00 request,
+`07 41 00 FF FF FF FF FF` response at 19780 ms, repeated observed response at
+20085 ms, and reported UTC/timer events. It includes no identity values and no
+unreceived RPM/other PID responses. The old timestamps/decisions are observations
+of the **failing** build, not a claimed capture after this patch. Other generated
+telemetry/padding/deadline responses in tests remain explicitly synthetic.
+
+The provided run establishes successful 500 kbps/11-bit configuration, a queued
+0x7DF request, an actual returned 0x7E8 PID00 response, and rejection by the old
+exact-length check. The request log is 19750 ms and RX log 19780 ms (30 ms in the
+software timestamps), comfortably inside 200 ms. No bitrate sweep or deadline
+increase is needed to explain that rejection. The fix accepts a classic ISO-TP
+single-frame declaration only when it is at least the PID's required application
+length and at most seven bytes, and the supplied buffer contains the entire
+declaration plus PCI. Wrong service/PID/ECU, non-SF, undersized/overlong declarations,
+short buffers and late responses remain rejected. Only the PID-specific measurement
+bytes (four bytes for a support bitmap) are decoded; extra declared padding never
+becomes extra capability bits or values. Counted DTC SF replies follow the same
+bounded-padding principle. Padded non-PID00 tests are synthetic, not inferred
+vehicle captures. True CAN DLC/IDE/RTR is still unavailable from this UART API.
+
+The UTC fault is also reproduced: old unsigned accumulation with low ticks
+19750 → 19765 → stale 19750 → 19780 adds an extra 2^32 ms. Anchored at the supplied
+NTP observation, it generates exactly the supplied December 24 timestamp; repeating
+the stale-capture pattern generates the supplied February 12 timestamp. Thus the
+code-derived interleaving explains the field values without assuming an NTP server
+sent those wrong dates. The stale repeated low tick is an inferred program variable
+use, distinctly labeled in the fixture, not an invented hardware observation.
+
+Fixes preserve verbose logging: the loop uses a fresh millis read for clock quality;
+Uptime64 rejects stale/ambiguous deltas without moving its live anchor; NTP and GNSS
+coordinator methods use the canonical accepted low tick so stale inputs cannot
+trigger false deadlines/resyncs. A read-only `project()` API maps historical samples
+without advancing live uptime and rejects future/ambiguous/pre-boot projections.
+The ordering contract requires each live observation gap to be **strictly less
+than 2^31 ms** (~24.85 days), including offline; the sketch normally observes every
+loop and its intentional sleep is ten minutes. A reset or longer unobserved gap
+cannot be disambiguated and needs a fresh clock instance. Initial samples near
+0xFFFFFFF0, real wrap, and a late pre-wrap sample after wrap are regression cases.
+
+Before-fix actual-sketch regressions failed on both exact field-response acceptance
+and UTC continuity with an advancing millis fake. After-fix tests execute the verbose
+sketch across normal progression and true wrap, reject short/malformed/late frames,
+check padding isolation and historical projection, and verify NTP/GNSS deadlines
+and no premature NTP resync from stale samples. These are host reproductions.
+**Physical retest of this patch: NOT DONE.** The supplied field log confirms the
+original failures; it does not prove corrected hardware behavior or later PID data.

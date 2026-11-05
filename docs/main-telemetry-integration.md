@@ -142,7 +142,7 @@ No real vehicle, board, antenna, SIM or ingest server was available for these te
 ## Recorded local result
 
 All three UBSan host suites PASS. All seven PlatformIO 6.2.0 profiles PASS.
-Combined default: RAM 12,508 / 237,568 bytes; flash 144,832 / 798,720 bytes.
+Combined default: RAM 12,516 / 237,568 bytes; flash 145,088 / 798,720 bytes.
 The framework emits its three existing ignored `used` attribute warnings in
 startup_nrf_common.c for each clean target build; there were no build errors.
 No independent agent review was performed. Physical/end-to-end ingest tests
@@ -265,3 +265,14 @@ work versus pending-response deadline collision, default verbose logs and the
 seven explicit build profiles. CAN Mode 03 SF decoding now consumes the declared
 DTC count before code pairs; earlier uncounted synthetic DTC fixtures were replaced
 with clearly labeled counted CAN fixtures, not inferred vehicle data.
+
+
+## Fixed-length field responses and stale-millis correction
+
+The supplied PID00 SF declaration 07 is now accepted with bounded length validation
+and padding isolation. The verbose sketch's stale local `now` call no longer feeds
+an older tick into live uptime. Uptime and coordinator layers additionally reject
+stale ordering and preserve real wraps/deadlines. The exact observed field subset,
+legacy-formula reproduction of both wrong UTC values, sampling contract and host
+regressions are documented in [the comparison guide](main-wire-compatibility.md).
+No new vehicle response is claimed; corrected physical retest remains NOT DONE.

@@ -60,7 +60,7 @@ class ObdSession {
     if (!waiting_) {reason_=(timedOut_ && d[2]==pending_)?Reject::Deadline:Reject::NoPending;return false;}
     if (d[2]!=pending_) {reason_=Reject::Pid;return false;}
     const unsigned payload=length(pending_);
-    if (!payload || bytes<3+payload || d[0]!=2+payload) {reason_=Reject::Length;return false;}
+    if (!payload || d[0]<2+payload || d[0]>7 || bytes<size_t(d[0])+1) {reason_=Reject::Length;return false;}
     accepted_=true;
     if (!selected_) { ecu_=id; selected_=true; }
     waiting_=false; last_=now;

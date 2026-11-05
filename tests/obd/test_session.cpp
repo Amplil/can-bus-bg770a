@@ -82,5 +82,25 @@ int main() {
  assert(!excluded.accept(0x7E8,empty,8,1));assert(!excluded.next(101,p));
  assert(excluded.next(201,p) && p==0x31); // known base-PID exclusions remain skipped
  assert(excluded.support(0x0C)==Support::Unsupported);
+ // Supplied PID00 form: declared SF length 7; only four bitmap bytes are used.
+ for(unsigned padding : {0U,255U}) {
+  ObdSession field;assert(field.next(19750,p));
+  uint8_t padded[]={7,0x41,0,0xFF,0xFF,0xFF,0xFF,static_cast<uint8_t>(padding)};
+  assert(!field.accept(0x7E8,padded,7,19760));assert(!field.acceptedFrame());
+  assert(!field.accept(0x7E8,padded,8,19780));assert(field.acceptedFrame());
+  for(unsigned pid=1;pid<=32;++pid)assert(field.support(pid)==Support::Supported);
+  assert(field.support(0x21)==Support::Unknown);
+ }
+ ObdSession paddedRpm;assert(paddedRpm.next(0,p));
+ uint8_t base[]={6,0x41,0,0,0x10,0,0,0};paddedRpm.accept(0x7E8,base,8,1);
+ assert(!paddedRpm.next(101,p));assert(paddedRpm.next(102,p) && p==0x0C);
+ uint8_t rpmPad[]={7,0x41,0x0C,0x1F,0x40,0xAA,0xFF,0x55};
+ rpmPad[0]=8;assert(!paddedRpm.accept(0x7E8,rpmPad,8,103));
+ rpmPad[0]=0x10;assert(!paddedRpm.accept(0x7E8,rpmPad,8,104));
+ rpmPad[0]=7;assert(!paddedRpm.accept(0x7E8,rpmPad,7,105));
+ assert(!paddedRpm.accept(0x7E9,rpmPad,8,106));
+ rpmPad[1]=0x7F;assert(!paddedRpm.accept(0x7E8,rpmPad,8,107));rpmPad[1]=0x41;
+ rpmPad[2]=0x0D;assert(!paddedRpm.accept(0x7E8,rpmPad,8,108));rpmPad[2]=0x0C;
+ assert(paddedRpm.accept(0x7E8,rpmPad,8,109));
  std::cout<<"OBD session regression tests passed\n";
 }

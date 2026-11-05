@@ -27,11 +27,29 @@ inline bool parse(const std::string& s, int64_t& epoch) {
   epoch=days*86400+h*3600+min*60+sec-tz*15*60;
   return true;
 }
-// Call regularly, at least once per 2^32 milliseconds, including while offline.
+// Observe with every forward gap strictly below 2^31 ms (~24.85 days), including offline.
+// Half-range ordering distinguishes a real forward wrap from a stale sample.
+// A reset or a longer gap is ambiguous and requires a fresh clock instance.
 class Uptime64 {
   uint32_t previous_ = 0;
   uint64_t elapsed_ = 0;
+  bool initialized_ = false;
 public:
-  uint64_t update(uint32_t now) { elapsed_ += uint32_t(now-previous_); previous_=now; return elapsed_; }
+  uint64_t update(uint32_t now) {
+    if(!initialized_) { initialized_=true;previous_=now;elapsed_=now;return elapsed_; }
+    const uint32_t delta=uint32_t(now-previous_);
+    if(delta>=0x80000000UL)return elapsed_; // stale/ambiguous: do not move either anchor
+    elapsed_+=delta;previous_=now;return elapsed_;
+  }
+  uint32_t latestTick() const { return previous_; }
+  uint64_t value() const { return elapsed_; }
+  // Historical event projection never mutates the live monotonic accumulator.
+  // Future, ambiguous or pre-start samples cannot be used as historical times.
+  bool project(uint32_t sample,uint64_t& event) const {
+    if(!initialized_)return false;
+    const uint32_t age=uint32_t(previous_-sample);
+    if(age>=0x80000000UL || uint64_t(age)>elapsed_)return false;
+    event=elapsed_-age;return true;
+  }
 };
 }

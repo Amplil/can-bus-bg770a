@@ -154,6 +154,37 @@ static void pollUntilSend(unsigned expected) {
  assert(sendCalls==expected);
 }
 int main(int argc,char** argv){
+ if(argc>1 && std::string(argv[1])=="registration-schedule") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;CanReady=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  initializeVehicleDataSchema();strcpy(deviceIMSI,"synthetic-device");sendResult=true;
+  Services.gnss.line("+CEREG: 0",0);
+  // Finish a synthetic unregistered query immediately before the due send.
+  Services.gnss.tick(25000);Services.gnss.takeCommand();
+  Services.gnss.line("AT+CEREG?",29998);Services.gnss.line("+CEREG: 1,0",29999);
+  Services.gnss.line("OK",29999);
+  nowMs=30001;loop();assert(sendCalls==0);
+  Services.gnss.line("+CEREG: 1",30002);loop();
+  assert(sendCalls==1 && dataArray.size()==0);
+  std::cout<<"Due send resumes immediately after synthetic registration recovery\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="registration-hold") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));
+  initializeVehicleDataSchema();
+  Services.gnss.line("+CEREG: 0",0);
+  assert(!cellularSend(JsonDoc));assert(sendCalls==0 && !TelemetryAttempted);
+  assert(Serial.output.find("registration unconfirmed")!=std::string::npos);
+  Services.gnss.tick(5000);Services.gnss.takeCommand();
+  Services.gnss.line("AT+CEREG?",5000);
+  Services.gnss.line("+CEREG: 1, 1",5001);Services.gnss.line("OK",5002);
+  strcpy(deviceIMSI,"synthetic-device");sendResult=true;nowMs=5002;
+  assert(cellularSend(JsonDoc));assert(sendCalls==1 && TelemetryAttempted);
+  for(unsigned i=0;i<13;++i)initializeVehicleDataSchema();
+  assert(dataArray.size()==12 && Serial.output.find("QUEUE-EVICT")!=std::string::npos);
+  std::cout<<"Synthetic registration hold/recovery keeps queue, exposes reason and eviction\n";return 0;
+ }
+
  if(argc>1 && std::string(argv[1])=="synthetic-padded-values") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
   Services.clock.seedFallback(1735689599LL,Services.now(0));
@@ -402,5 +433,5 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
+    for scenario in os.environ.get('SKETCH_SCENARIOS','registration-schedule registration-hold unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
         subprocess.run([str(exe),scenario],check=True)

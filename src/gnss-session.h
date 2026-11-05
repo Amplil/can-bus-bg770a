@@ -80,6 +80,7 @@ public:
   void recover() { resetNeeded(); }
   State state() const { return state_; }
   bool modemIdle() const { return state_ == State::Idle; }
+  bool registered() const { return registered_; }
   bool canSend() const { return modemIdle() && registered_; }
   const GnssFix& fix() const { return fix_; }
   bool ready(uint32_t now) const {
@@ -122,19 +123,28 @@ public:
   }
   bool line(const std::string& text, uint32_t now) {
     // Observe but do not swallow registration notifications needed by WioNetwork.
-    if (text.compare(0,8,"+CEREG: ") == 0) {
-      const std::string value = text.substr(8);
-      if (state_ == State::Registration && echo_ && value.find(',') != std::string::npos) {
-        // Query response is <n>,<stat>; network URC parser expects <stat>.
-        const auto comma = value.find(',');
-        queryRegistered_ = comma != std::string::npos && comma + 1 < value.size() &&
-          (value[comma + 1] == '1' || value[comma + 1] == '5') &&
-          (comma + 2 == value.size() || value[comma + 2] == ',');
-        return true;
-      }
-      registered_ = !value.empty() && (value[0] == '1' || value[0] == '5') &&
-        (value.size() == 1 || value[1] == ',');
-      if (state_ == State::Registration && echo_) queryRegistered_ = registered_;
+    if (text.compare(0,7,"+CEREG:") == 0) {
+      size_t pos=7;
+      auto number=[&](unsigned& out) {
+        while(pos<text.size() && text[pos]==' ')++pos;
+        const size_t start=pos;out=0;
+        while(pos<text.size() && text[pos]>='0' && text[pos]<='9') {
+          out=out*10+unsigned(text[pos++]-'0');if(out>255)return false;
+        }
+        const bool digits=pos>start;
+        while(pos<text.size() && text[pos]==' ')++pos;
+        return digits && (pos==text.size() || text[pos]==',');
+      };
+      unsigned first=0,second=0;
+      if(!number(first))return false;
+      // A detailed URC has a quoted location after <stat>, whereas a query
+      // has numeric <n>,<stat>. Do not consume the URC needed by WioNetwork.
+      const bool query=state_==State::Registration && echo_ &&
+        pos<text.size() && text[pos++]==',' && number(second);
+      if(query) {queryRegistered_=second==1 || second==5;return true;}
+      if(first>10)return false;
+      registered_=first==1 || first==5;
+      if(state_==State::Registration && echo_)queryRegistered_=registered_;
       return false;
     }
     if (state_ == State::BootWait && text == "APP RDY") {

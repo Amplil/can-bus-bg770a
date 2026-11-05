@@ -160,7 +160,7 @@ static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
   if(ntp!=lastNtp || gnss!=lastGnss) {
     trace("MODEM-STATE");const char* const ntpNames[]={"Idle","Echo","Ack","Result","Quarantined","Disabled"};
     const char* const gnssNames[]={"Idle","Offline","Start","PollWait","Poll","Stop","Online","RestoreUrc","Registration","FlowControl","FlowSettle","ResetNeeded","BootWait","BootSettle"};
-    Serial.printf("ntp=%s gnss=%s clock=%s quality=%s\n",ntpNames[ntp],gnssNames[gnss],Services.clock.source(),Services.clock.quality(Services.now(millis())));
+    Serial.printf("ntp=%s gnss=%s registered=%u clock=%s quality=%s\n",ntpNames[ntp],gnssNames[gnss],unsigned(Services.gnss.registered()),Services.clock.source(),Services.clock.quality(Services.now(millis())));
     lastNtp=ntp;lastGnss=gnss;
   }
   static int lastOnline=-1;
@@ -173,7 +173,7 @@ static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
     Services.gnss.resetIssued(millis());
   }
   const auto command=Services.command(millis(),WioNetwork.config.pdpContextId,online,
-                                      allowNtp,allowGnss && TelemetryAttempted);
+                                      allowNtp,allowGnss && TelemetryAttempted && dataArray.size()==0);
   if(!command.empty()) {trace("MODEM-TX");Serial.println(command.c_str());WioCellular.writeBinary(command.data(),command.size());}
 }
 
@@ -272,21 +272,38 @@ void setup() {
   WioNetwork.config.searchAccessTechnology = SEARCH_ACCESS_TECHNOLOGY;
   WioNetwork.config.ltemBand = LTEM_BAND;
   WioNetwork.config.apn = APN;
+  trace("STARTUP");Serial.println("cellular begin starting");
   WioCellular.begin();
+  trace("STARTUP");Serial.printf("powerOn starting timeout_ms=%lu\n",(unsigned long)POWER_ON_TIMEOUT);
   // Power on the cellular module
-  if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) abort();
+  const auto powerResult=WioCellular.powerOn(POWER_ON_TIMEOUT);
+  trace("STARTUP");Serial.printf("powerOn finished result=%s\n",WioCellularResultToString(powerResult));
+  if(powerResult!=WioCellularResult::Ok) {Serial.println("STARTUP FAILED: modem powerOn; stopping before network/CAN initialization");abort();}
   Services.ntpEnabled=TELEMETRY_NTP;
   Services.gnssEnabled=TELEMETRY_GNSS;
   ServicesHandler=WioCellular.registerUrcHandler2([](const std::string& line) {
+    // Print only a strictly validated timestamp, never an arbitrary modem line.
+    if(line.size()==33 && line.compare(0,10,"+QNTP: 0,\"")==0 && line.back()=='"') {
+      int64_t epoch;
+      const auto stamp=line.substr(10,22);
+      if(ntp_candidate::parse(stamp,epoch)) {
+        trace("NTP-ANCHOR");Serial.printf("modem_date=%s parsed_utc_epoch_s=%lld zone_units=15min; acceptance follows session validation\n",stamp.c_str(),(long long)epoch);
+      }
+    }
     const bool handled=Services.line(line,millis());
     if(line.compare(0,7,"+QNTP: ")==0) {
       trace("NTP-RESULT");Serial.printf("source=%s quality=%s result=%s\n",Services.clock.source(),Services.clock.quality(Services.now(millis())),Services.clock.lastError());
     }
     return handled;
   });
+  trace("STARTUP");Serial.println("network begin starting");
   WioNetwork.begin();
+  trace("STARTUP");Serial.printf("network wait starting timeout_ms=%lu\n",(unsigned long)NETWORK_TIMEOUT);
   // Wait for communication available
-  if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) abort();
+  if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) {
+    trace("STARTUP-FAILED");Serial.println("network wait timeout; stopping before CAN initialization");abort();
+  }
+  trace("STARTUP");Serial.println("network communication available");
 
   Serial.println("CAN bus initialized");
   initCAN();
@@ -334,6 +351,7 @@ void loop() {
   if(uint32_t(now-lastRotateSend)>=OBD_INTERVAL) {
     if(!batch) {
       vehicleData=JsonObject(); batch=true; batchStarted=now;
+      trace("CAN-BATCH");Serial.println("begin 4000 ms sampling window");
       if(!CanReady)Serial.println("CAN polling disabled: module configuration unconfirmed");
     }
     unsigned char pid;
@@ -349,6 +367,7 @@ void loop() {
     // Allow discovery through PID A0 and all current telemetry within the batch.
     if(uint32_t(now-batchStarted)>=4000 && !Obd.waiting()) {
       lastRotateSend=now;batch=false;
+      trace("CAN-BATCH");Serial.printf("pause; next window in %lu ms\n",(unsigned long)OBD_INTERVAL);
     }
   }
   if(uint32_t(now-lastDtcSend)>=DTC_INTERVAL && !Obd.waiting() && !DtcWaiting) {
@@ -406,9 +425,9 @@ void loop() {
     }
     // The ingest contract rejects data:[]; retain heartbeat intent locally.
     if(dataArray.size()==0) { lastCellularSend=millis();cooperativeDelay(10);return; }
-    TelemetryAttempted=true;
+    TelemetryAttempted=false;
     if(cellularSend(JsonDoc)) { clearData();lastACKTime=millis();HeartbeatPending=false; } // 送信後、データをクリア
-    lastCellularSend = millis();
+    if(TelemetryAttempted)lastCellularSend = millis();
   }
   
   // Optional: Enable debug mode by sending commands through Serial monitor
@@ -561,7 +580,17 @@ void clearData() {
 }
 
 static bool cellularSend(const JsonDocument &doc) {
-  if(!canIdle() || !Services.idle() || !deviceIMSI[0] || ModemSleeping || doc["data"].size()==0)return false;
+  const char* blocked=!canIdle()?"OBD pending":!Services.atIdle()?"AT busy":
+    !Services.gnss.canSend()?"registration unconfirmed":!deviceIMSI[0]?"identity pending":
+    ModemSleeping?"modem sleeping":doc["data"].size()==0?"empty queue":nullptr;
+  if(blocked) {
+    static uint32_t last=0;static const char* previous=nullptr;
+    if(previous!=blocked || uint32_t(millis()-last)>=5000) {
+      trace("LTE-HOLD");Serial.println(blocked);last=millis();previous=blocked;
+    }
+    return false;
+  }
+  TelemetryAttempted=true;
   trace("LTE-SEND");Serial.printf("queue=%u; payload redacted\n",unsigned(doc["data"].size()));
   Serial.println("### Sending Combined Vehicle Data Object");
   Serial.print("Connecting ");
@@ -618,7 +647,10 @@ static bool cellularSend(const JsonDocument &doc) {
 }
 
 static void initializeVehicleDataSchema() {
-  if(dataArray.size()>=12)dataArray.remove(0);
+  if(dataArray.size()>=12) {
+    static uint32_t evicted=0;
+    dataArray.remove(0);trace("QUEUE-EVICT");Serial.printf("oldest record removed; total=%lu capacity=12\n",(unsigned long)++evicted);
+  }
   vehicleData = dataArray.add<JsonObject>(); // Preserve bounded latest samples
   trace("QUEUE-ADD");Serial.printf("records=%u\n",unsigned(dataArray.size()));
   vehicleData["time_source"]=Services.clock.source();

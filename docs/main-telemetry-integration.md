@@ -276,3 +276,36 @@ stale ordering and preserve real wraps/deadlines. The exact observed field subse
 legacy-formula reproduction of both wrong UTC values, sampling contract and host
 regressions are documented in [the comparison guide](main-wire-compatibility.md).
 No new vehicle response is claimed; corrected physical retest remains NOT DONE.
+
+### Registration hold and startup diagnostics (follow-up)
+
+The supplied later vehicle excerpts show accepted telemetry and repeated CEREG
+queries, but contain neither the CEREG responses nor a complete 30-second send
+window. They do not establish a transport failure. Synthetic regression cases
+reproduce two parser defects: spaces after the query comma and a detailed,
+quoted-location URC arriving during a query. Both now retain correct registration
+semantics; actual response/location text is never logged. Registration uncertainty
+still blocks sending safely. A blocked call no longer consumes the next 30-second
+send opportunity, and optional new GNSS acquisition yields to queued telemetry.
+`LTE-HOLD`, `QUEUE-EVICT`, registration state and `CAN-BATCH` show the reason,
+cumulative oldest-record removal and normal four-second/ten-second cadence.
+The ten telemetry frames per sample are not ten queue records.
+
+The observed Mode03 `01 43 00 00 00 00 00 00` is retained as a regression that
+fails the required declared count-byte boundary. Padding outside PCI length does
+not prove zero DTCs. PID A6 receiving PID00 remains a PID mismatch, not odometer
+telemetry or proof of unsupported capability.
+
+The four subsequent BOOT events were manual resets, as clarified by the user.
+Previously `Cellular bus initialized` printed before `begin`, `powerOn` and network
+wait. STARTUP logs now bracket each stage, print bounded wait settings and failure
+results before the existing stop. The dependency's powerOn may wait twice for
+APP RDY (20 seconds each), then performs flow-control setup; network wait is
+180 seconds. No new reset/power retry is introduced. Hardware cause is unproven.
+
+The serial viewer and device UTC differ, but the viewer has no date/timezone and
+message submission time is not a capture-time anchor. NTP-ANCHOR logs only strictly
+validated modem date/zone and the parser's UTC epoch (quarter-hour zone conversion),
+separately from session acceptance. No timezone correction is guessed from the
+excerpt. Absolute clock accuracy, network registration on this device, startup
+failure stage and delivery after this patch require physical retesting.

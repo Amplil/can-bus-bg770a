@@ -97,6 +97,18 @@ int main() {
   assert(interleaved.line("+CEREG: 1,15",15004)); // Never accept a status prefix.
   interleaved.line("OK",15005); assert(!interleaved.canSend());
 
+  // Synthetic responses: optional spaces and a detailed URC during a query.
+  GnssSession spaced;
+  spaced.line("+CEREG: 0",0);spaced.tick(5000);
+  assert(spaced.takeCommand()=="AT+CEREG?\r");
+  spaced.line("AT+CEREG?",5000);
+  assert(spaced.line("+CEREG: 1, 5",5001));
+  spaced.line("OK",5002);assert(spaced.canSend());
+  spaced.line("+CEREG: 0",5003);spaced.tick(10003);
+  spaced.takeCommand();spaced.line("AT+CEREG?",10003);
+  assert(!spaced.line("+CEREG: 1,\"1234\",\"5678\",7",10004));
+  spaced.line("OK",10005);assert(spaced.canSend());
+
   GnssSession registrationError;
   registrationError.line("+CEREG: 0",0); registrationError.tick(5000);
   answer(registrationError,"AT+CEREG?",5000,"ERROR");

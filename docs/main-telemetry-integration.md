@@ -60,7 +60,7 @@ modem is restarted before sending. No hardware was reset or flashed in this task
 ## GNSS
 
 The first normal telemetry attempt precedes GNSS; subsequent acquisitions occur
-at most every seven minutes. GNSS temporarily takes LTE offline, searches for up
+at most every five minutes. GNSS temporarily takes LTE offline, searches for up
 to 30 seconds, stops GNSS and restores LTE/registration. A pending command may
 add its 20-second deadline. CAN receive/validation continues during this process.
 Command errors or uncertain boundaries use bounded reset/boot recovery. No-fix

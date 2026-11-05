@@ -10,6 +10,23 @@
 #include <WioCellular.h>
 #include <grove-can-bus.h>
 #include <ArduinoJson.h>
+#include <obd-session.h>
+
+// Set only from verified vehicle specifications; never probe live bus rates.
+#ifndef OBD_CAN_RATE
+#define OBD_CAN_RATE CAN_RATE_500
+#endif
+#ifndef OBD_CAN_EXTENDED
+#define OBD_CAN_EXTENDED 0
+#endif
+static_assert(OBD_CAN_RATE == CAN_RATE_250 || OBD_CAN_RATE == CAN_RATE_500, "OBD CAN rate must be 250 or 500 kbps");
+static_assert(OBD_CAN_EXTENDED == 0 || OBD_CAN_EXTENDED == 1, "OBD ID width must be 0 or 1");
+static bg770a::ObdSession Obd(OBD_CAN_EXTENDED);
+void addCANMessageToJSON(unsigned long, unsigned char*, unsigned long);
+void updateVehicleData(unsigned char, unsigned char*, unsigned long);
+void cleanupOldMessages();
+static bool cellularSend(const JsonDocument&);
+template<typename T> void printData(T&, const void*, size_t);
 
 #define SEARCH_ACCESS_TECHNOLOGY (WioCellularNetwork::SearchAccessTechnology::LTEM)  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
 #define LTEM_BAND (WioCellularNetwork::NTTDOCOMO_LTEM_BAND)        
@@ -23,6 +40,7 @@ static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // [ms]
 static JsonDocument JsonDoc;
 
 WioCAN can;
+static bool CanReady = false;
 
 static void abortHandler(int sig) {
   Serial.printf("ABORT: Signal %d received\n", sig);
@@ -78,52 +96,52 @@ void setup() {
   // Initialize CAN module
   can.begin();
   // Set CAN bus rate to 500kbps (commonly used)
-  if(can.setCanRate(CAN_RATE_500)) {
-    Serial.println("CAN bus rate set to 500kbps: OK");
+  if((CanReady = can.setCanRate(OBD_CAN_RATE))) {
+    Serial.println("Configured CAN bus rate: OK");
   } else {
-    Serial.println("CAN bus rate set to 500kbps: FAILED");
+    Serial.println("Configured CAN bus rate: FAILED");
   }
 
   // --- set mask and filter (standard frame) ---
   // Mask設定: 0x00000000で全てのIDを通す（全通し）
-  if (can.setMask(0, 0, 0x00000000)) {
+  if (can.setMask(0, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Mask0 set: OK (All pass)");
   } else {
     Serial.println("Mask0 set: FAILED");
   }
-  if (can.setMask(1, 0, 0x00000000)) {
+  if (can.setMask(1, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Mask1 set: OK (All pass)");
   } else {
     Serial.println("Mask1 set: FAILED");
   }
   
   // Filter設定: 0x00000000で全てのIDを通す（全通し）
-  if (can.setFilt(0, 0, 0x00000000)) {
+  if (can.setFilt(0, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt0 set: OK (All pass)");
   } else {
     Serial.println("Filt0 set: FAILED");
   }
-  if (can.setFilt(1, 0, 0x00000000)) {
+  if (can.setFilt(1, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt1 set: OK (All pass)");
   } else {
     Serial.println("Filt1 set: FAILED");
   }
-  if (can.setFilt(2, 0, 0x00000000)) {
+  if (can.setFilt(2, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt2 set: OK (All pass)");
   } else {
     Serial.println("Filt2 set: FAILED");
   }
-  if (can.setFilt(3, 0, 0x00000000)) {
+  if (can.setFilt(3, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt3 set: OK (All pass)");
   } else {
     Serial.println("Filt3 set: FAILED");
   }
-  if (can.setFilt(4, 0, 0x00000000)) {
+  if (can.setFilt(4, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt4 set: OK (All pass)");
   } else {
     Serial.println("Filt4 set: FAILED");
   }
-  if (can.setFilt(5, 0, 0x00000000)) {
+  if (can.setFilt(5, OBD_CAN_EXTENDED, 0x00000000)) {
     Serial.println("Filt5 set: OK (All pass)");
   } else {
     Serial.println("Filt5 set: FAILED");
@@ -133,7 +151,7 @@ void setup() {
   // Initialize JSON document structure
   JsonDoc["session_start"] = millis();
   JsonDoc["device_id"] = "WIO_BG770A_001";
-  JsonDoc["can_messages"] = JsonArray();
+  JsonDoc["can_messages"].to<JsonArray>();
   JsonDoc["vehicle_data"].to<JsonObject>();
   
   Serial.println();
@@ -144,184 +162,44 @@ void setup() {
 }
 
 void loop() {
-  // 統計情報用の変数
-  static unsigned long totalMessages = 0;
-  static unsigned long lastStatsTime = 0;
-  
-  // OBD-II PID要求を複数種類一括送信
-  static unsigned long lastSend = 0;
-  static int sendInterval = 1000;
   static unsigned long lastCellularSend = 0;
-  static int cellularSendInterval = 10000;
-  
-  // 送信するPIDの配列
-  static unsigned char obdPids[] = {
-    PID_ENGIN_PRM, PID_VEHICLE_SPEED, PID_COOLANT_TEMP, PID_ENGINE_LOAD, PID_INTAKE_AIR_TEMP,
-    PID_THROTTLE_POS, PID_DISTANCE_TRAVELED, PID_CONTROL_MODULE_VOLTAGE, PID_AMBIENT_AIR_TEMP
-  };
-  static const char* obdPidNames[] = {
-    "Engine RPM", "Vehicle Speed", "Coolant Temperature", "Engine Load",
-    "Intake Air Temperature", "Throttle Position", "Distance Traveled", "Control Module Voltage", "Ambient Air Temperature"
-  };
-  static int numPids = sizeof(obdPids) / sizeof(obdPids[0]);
-
-  if(millis() - lastSend > sendInterval) {
-    Serial.println("=== Sending all OBD-II PID requests ===");
-    
-    // すべてのPIDを順次送信し、各送信後に応答を受信
-    for(int i = 0; i < numPids; i++) {
-      unsigned char cmd = obdPids[i];
-      can.sendPid(cmd);
-      Serial.print("Sent OBD-II ");
-      Serial.print(obdPidNames[i]);
-      Serial.print(" request (PID: 0x");
-      if(cmd < 0x10) Serial.print("0");
-      Serial.print(cmd, HEX);
-      Serial.println(")");
-      
-      // 応答を待機して受信
-      unsigned long startTime = millis();
-      bool responseReceived = false;
-      
-      while(millis() - startTime < 200 && !responseReceived) {  // 最大200ms待機
-        unsigned long id = 0;
-        unsigned char data[8];
-        
-        if(can.receive(&id, data)) {
-          totalMessages++;
-          responseReceived = true;
-          
-          // タイムスタンプごとにJSONに蓄積
-          addCANMessageToJSON(id, data, millis());
-          // OBD2データを車両データとしても記録
-          updateVehicleData(data[2], data, millis());
-          
-          // 受信メッセージの詳細表示
-          Serial.print("  [");
-          Serial.print(millis());
-          Serial.print("ms] CAN ID: 0x");
-          if(id < 0x100) Serial.print("0");
-          if(id < 0x10) Serial.print("0");
-          Serial.print(id, HEX);
-          Serial.print(" | Data: ");
-          
-          for(int j = 0; j < 8; j++) {
-            if(data[j] < 0x10) Serial.print("0");
-            Serial.print(data[j], HEX);
-            if(j < 7) Serial.print(" ");
-          }
-          
-          // データの解釈を試行
-          Serial.print(" | ");
-          
-          // OBD-II応答の場合
-          if((id >= 0x7E8 && id <= 0x7EF)) {
-            Serial.print("OBD-II Response from ECU ");
-            Serial.print(id - 0x7E8);
-            if(data[0] >= 2 && data[1] == 0x41) {
-              Serial.print(" | PID: 0x");
-              Serial.print(data[2], HEX);
-              
-              // 特定のPIDの解釈
-              switch(data[2]) {
-                case PID_ENGIN_PRM: // Engine RPM
-                  if(data[0] >= 4) {
-                    unsigned int rpm = ((data[3] * 256) + data[4]) / 4;
-                    Serial.print(" | Engine RPM: ");
-                    Serial.print(rpm);
-                    Serial.print(" rpm");
-                  }
-                  break;
-                case PID_VEHICLE_SPEED: // Vehicle Speed
-                  Serial.print(" | Vehicle Speed: ");
-                  Serial.print(data[3]);
-                  Serial.print(" km/h");
-                  break;
-                case PID_COOLANT_TEMP: // Coolant Temperature
-                  Serial.print(" | Coolant Temp: ");
-                  Serial.print(data[3] - 40);
-                  Serial.print(" °C");
-                  break;
-                case PID_ENGINE_LOAD: // Engine Load
-                  Serial.print(" | Engine Load: ");
-                  Serial.print(data[3] * 100.0 / 255.0);
-                  Serial.print(" %");
-                  break;
-                case PID_INTAKE_AIR_TEMP: // Intake Air Temperature
-                  Serial.print(" | Intake Air Temp: ");
-                  Serial.print(data[3] - 40);
-                  Serial.print(" °C");
-                  break;
-                case PID_THROTTLE_POS: // Throttle Position
-                  Serial.print(" | Throttle Position: ");
-                  Serial.print(data[3] * 100.0 / 255.0);
-                  Serial.print(" %");
-                  break;
-                case PID_DISTANCE_TRAVELED: // Distance Traveled
-                  if(data[0] >= 4) {
-                    unsigned int distance = (data[3] * 256) + data[4];
-                    Serial.print(" | Distance Traveled: ");
-                    Serial.print(distance);
-                    Serial.print(" km");
-                  }
-                  break;
-                case PID_CONTROL_MODULE_VOLTAGE: // Control Module Voltage
-                  if(data[0] >= 4) {
-                    float voltage = ((data[3] * 256) + data[4]) / 1000.0;
-                    Serial.print(" | Control Module Voltage: ");
-                    Serial.print(voltage);
-                    Serial.print(" V");
-                  }
-                  break;
-                case PID_AMBIENT_AIR_TEMP: // Ambient Air Temperature
-                  Serial.print(" | Ambient Air Temp: ");
-                  Serial.print(data[3] - 40);
-                  Serial.print(" °C");
-                  break;
-              }
-            }
-          }
-          // その他の一般的なCAN IDの場合
-          else if(id >= 0x100 && id <= 0x7FF) {
-            Serial.print("Standard CAN Frame");
-          }
-          else if(id >= 0x18000000) {
-            Serial.print("Extended CAN Frame");
-          }
-          else {
-            Serial.print("Unknown Frame Type");
-          }    
-          Serial.println();
-        }
-        delay(10);  // 短い遅延
-      }
-      
-      // 応答が受信できなかった場合
-      if(!responseReceived) {
-        Serial.print("  No response received for PID: 0x");
-        if(cmd < 0x10) Serial.print("0");
-        Serial.println(cmd, HEX);
-      }
-      
-      // 次のPID送信前に短い遅延
-      delay(100);
-    }
-    
-    Serial.println("=== All PID requests completed ===");
-    lastSend = millis();
+  static const unsigned long cellularSendInterval = 10000;
+  const uint32_t now = millis();
+  Obd.tick(now);
+  unsigned long id = 0;
+  unsigned char data[8] = {};
+  // Bound receive work per loop; unrelated traffic never completes a request.
+  for (unsigned n=0; n<8 && can.receive(&id, data); ++n) {
+    addCANMessageToJSON(id, data, millis());
+    if (Obd.accept(id, data, sizeof(data), millis()))
+      updateVehicleData(data[2], data, millis());
+  }
+  unsigned char pid;
+  if (CanReady && Obd.next(millis(), pid)) {
+    unsigned char request[8] = {2, 1, pid, 0, 0, 0, 0, 0};
+    can.send(Obd.requestId(), OBD_CAN_EXTENDED, 0, 8, request);
+  }
+  JsonObject diagnostics = JsonDoc["obd"].to<JsonObject>();
+  diagnostics["coverage"] = "vehicle_unverified";
+  if (Obd.selected()) diagnostics["response_id"] = Obd.ecu();
+  const unsigned char pids[] = {0x0C,0x0D,0x05,0x04,0x0F,0x11,0x31,0x42,0x46};
+  for (auto p : pids) {
+    const auto state = Obd.support(p);
+    diagnostics["supported_pids"][String(p, HEX)] =
+      state == bg770a::Support::Supported ? "supported" :
+      state == bg770a::Support::Unsupported ? "unsupported" : "unknown";
   }
 
   if(millis() - lastCellularSend > cellularSendInterval) {
-    cellularSend(JsonDoc);
+    if (cellularSend(JsonDoc)) cleanupOldMessages();
     // 送信後、古いメッセージデータをクリア（最新のvehicle_dataは保持）
-    cleanupOldMessages();
     lastCellularSend = millis();
   }
   
   // Optional: Enable debug mode by sending commands through Serial monitor
   // Uncomment the following line to enable debug mode
   //can.debugMode();
-  can.debugPID();
+  // The normal receiver owns UART bytes; debugPID() would drain replies.
 
   delay(10);
 }
@@ -341,24 +219,9 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
     dataArray.add(data[i]);
   }
   
-  // メッセージタイプの判定
-  if(id >= 0x7E8 && id <= 0x7EF) {
-    message["type"] = "OBD2_Response";
-    message["ecu_id"] = id - 0x7E8;
-    
-    if(data[0] >= 2 && data[1] == 0x41) {
-      message["pid"] = "0x" + String(data[2], HEX);
-    }
-  } else if(id >= 0x100 && id <= 0x1FF) {
-    message["type"] = "Engine_Control";
-  } else if(id >= 0x200 && id <= 0x2FF) {
-    message["type"] = "Transmission_Control";
-  } else if(id >= 0x300 && id <= 0x3FF) {
-    message["type"] = "Body_Control";
-  } else {
-    message["type"] = "Unknown";
-  }
-  
+  // No Suzuki DBC or frame metadata is available: never infer ECU role.
+  message["type"] = "Unknown";
+
   // メッセージ数が多すぎる場合は古いものを削除（メモリ管理）
   if(messages.size() > 50) {
     messages.remove(0);  // 最古のメッセージを削除
@@ -367,7 +230,7 @@ void addCANMessageToJSON(unsigned long id, unsigned char* data, unsigned long ti
 
 // 車両データを時系列で更新
 void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long timestamp) {
-  JsonObject vehicleData = JsonDoc["vehicle_data"].to<JsonObject>();
+  JsonObject vehicleData = JsonDoc["vehicle_data"].as<JsonObject>();
   
   // raw_data オブジェクトが存在しない場合は作成
   if (!vehicleData["raw_data"].is<JsonObject>()) {
@@ -439,12 +302,13 @@ void updateVehicleData(unsigned char pid, unsigned char* data, unsigned long tim
       }
       break;
       
-    case PID_DISTANCE_TRAVELED: // Distance Traveled
+    case PID_DISTANCE_TRAVELED: // Distance Since DTC Clear
       if(data[0] >= 4) {
         unsigned int distance = (data[3] * 256) + data[4];
         JsonObject distanceObj = vehicleData["distance_traveled"].to<JsonObject>();
         distanceObj["value"] = distance;
         distanceObj["unit"] = "km";
+        distanceObj["meaning"] = "distance_since_dtc_clear";
         distanceObj["timestamp"] = timestamp;
       }
       break;

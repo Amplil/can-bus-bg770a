@@ -1,0 +1,15 @@
+name: OBD host regression
+on: [push, pull_request]
+jobs:
+  obd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bblanchon/ArduinoJson
+          ref: v7.4.3
+          path: .test-deps/ArduinoJson
+      - run: bash tests/obd/run_tests.sh
+        env:
+          ARDUINOJSON_INCLUDE: .test-deps/ArduinoJson/src

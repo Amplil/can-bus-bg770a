@@ -64,9 +64,10 @@ static constexpr unsigned long ABORT_TIME = 1000 * 60 * 5; // ABORTが発生し�
 WioCAN can;
 static bg770a::TelemetryServices Services;
 static bg770a::ObdSession Obd(OBD_CAN_EXTENDED);
-static bool CanReady=false, TelemetryAttempted=false, HaveTelemetry=false, ModemSleeping=false, SynchronousModem=false;
+static bool CanReady=false, TelemetryAttempted=false, HaveCanActivity=false, ModemSleeping=false, SynchronousModem=false;
 static bool DtcWaiting=false;
 static uint32_t DtcStarted=0;
+static uint32_t LastCanActivity=0;
 using ServiceHandler = decltype(std::declval<WioCellularModule&>().registerUrcHandler2(
     std::declval<std::function<bool(const std::string&)>>()));
 static ServiceHandler ServicesHandler;
@@ -108,17 +109,25 @@ static void serviceCan() {
   if(DtcWaiting && uint32_t(millis()-DtcStarted)>=200)DtcWaiting=false;
   unsigned long id=0; unsigned char bytes[8]={};
   for(unsigned n=0;n<8 && can.receive(&id,bytes);++n) {
-    const bool telemetry=Obd.accept(id,bytes,sizeof(bytes),millis());
+    const uint32_t receivedAt=millis();
+    // receive() may block: enforce the deadline after every returned frame.
+    if(DtcWaiting && uint32_t(receivedAt-DtcStarted)>=200)DtcWaiting=false;
+    const bool telemetry=Obd.accept(id,bytes,sizeof(bytes),receivedAt);
     const bool dtc=DtcWaiting && Obd.selected() && id==Obd.ecu() &&
       ((bytes[0]>=1 && bytes[0]<=7 && bytes[1]==0x43 && bytes[0]%2==1) ||
        ((bytes[0]&0xF0)==0x10 && ((bytes[0]&15)*256U+bytes[1])>7 && bytes[2]==0x43));
+    // Valid activity wakes the modem even when UTC is unavailable. Capability
+    // replies are activity too, but never create a measurement record.
+    if(Obd.acceptedFrame() || dtc) {
+      HaveCanActivity=true; LastCanActivity=receivedAt;
+    }
+    if(dtc)DtcWaiting=false;
     if(!telemetry && !dtc)continue;
     int64_t epoch;
     if(!Services.clock.utc(Services.now(millis()),epoch))continue;
     if(vehicleData.isNull())initializeVehicleDataSchema();
     if(telemetry)updateVehicleData(bytes[2],bytes);
-    if(dtc) { processDtcData(bytes); DtcWaiting=false; }
-    HaveTelemetry=true;
+    if(dtc)processDtcData(bytes);
   }
 }
 static void cooperativeDelay(uint32_t duration) {
@@ -220,6 +229,7 @@ void setup() {
 void loop() {
   serviceModem();
   serviceCan();
+  if(HaveCanActivity && ModemSleeping && Services.atIdle())netPowerOnRestart();
   if(Services.idle() && !ModemSleeping && !deviceIMSI[0] && getIMSI(deviceIMSI))JsonDoc["imsi"]=deviceIMSI;
   static uint32_t lastClockRetry=millis();
   if(Services.idle() && !ModemSleeping && uint32_t(millis()-lastClockRetry)>=60000 &&
@@ -230,7 +240,7 @@ void loop() {
   static uint32_t lastDtcSend=millis(), lastDataReceivedTime=millis(), lastACKTime=millis();
   static bool batch=false;
   const uint32_t now=millis();
-  if(HaveTelemetry) { lastDataReceivedTime=now; HaveTelemetry=false; }
+  if(HaveCanActivity) { lastDataReceivedTime=LastCanActivity; HaveCanActivity=false; }
   if(uint32_t(now-lastRotateSend)>=OBD_INTERVAL) {
     if(!batch) { vehicleData=JsonObject(); batch=true; batchStarted=now; }
     unsigned char pid;

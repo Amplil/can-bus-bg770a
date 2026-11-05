@@ -43,10 +43,12 @@ class ObdSession {
   }
   // Legacy UART driver supplies 8 bytes but no actual DLC/IDE/RTR metadata.
   bool accept(uint32_t id, const uint8_t* d, size_t bytes, uint32_t now) {
+    accepted_=false;
     tick(now);
     if (!d || !waiting_ || !responder(id) || (selected_ && id!=ecu_) || bytes<3) return false;
     const unsigned payload=length(pending_);
     if (!payload || bytes<3+payload || d[0]!=2+payload || d[1]!=0x41 || d[2]!=pending_) return false;
+    accepted_=true;
     if (!selected_) { ecu_=id; selected_=true; }
     waiting_=false; last_=now;
     if (pending_%32==0) {
@@ -64,6 +66,7 @@ class ObdSession {
     for (unsigned i=0;i<10;++i) if (pids()[i]==pid) return 1;
     return 0;
   }
+  bool acceptedFrame() const { return accepted_; }
   bool waiting() const { return waiting_; }
   bool selected() const { return selected_; }
   uint32_t ecu() const { return ecu_; }
@@ -72,6 +75,7 @@ class ObdSession {
     static const uint8_t values[]={0x0C,0x0D,0x05,0x04,0x0F,0x11,0x31,0x42,0x46,0xA6};
     return values;
   }
+  bool accepted_=false;
   bool extended_, waiting_=false, started_=false, selected_=false;
   bool known_[6]={};
   uint32_t maps_[6]={}, last_=0, ecu_=0;

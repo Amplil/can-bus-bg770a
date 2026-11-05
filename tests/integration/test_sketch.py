@@ -60,10 +60,10 @@ struct String:std::string {
 constexpr int HEX=16;
 using std::min;
 struct SerialType {template<class... T>void print(T...){} template<class... T>void println(T...){} } Serial;
-struct Frame{unsigned long id;std::array<unsigned char,8> bytes;};
+struct Frame{unsigned long id;std::array<unsigned char,8> bytes;uint32_t delayMs=0;};
 struct Can {
  std::deque<Frame> rx;std::deque<std::array<unsigned char,8>> sent;
- bool receive(unsigned long* id,unsigned char* data){if(rx.empty())return false;auto f=rx.front();rx.pop_front();*id=f.id;std::copy(f.bytes.begin(),f.bytes.end(),data);return true;}
+ bool receive(unsigned long* id,unsigned char* data){if(rx.empty())return false;auto f=rx.front();rx.pop_front();nowMs+=f.delayMs;*id=f.id;std::copy(f.bytes.begin(),f.bytes.end(),data);return true;}
  bool send(unsigned long,unsigned char,unsigned char,unsigned char size,const unsigned char* bytes){assert(size==8);assert(bytes[1]==1||bytes[1]==3);std::array<unsigned char,8> f;std::copy(bytes,bytes+8,f.begin());sent.push_back(f);return true;}
 }can;
 static JsonDocument JsonDoc;
@@ -72,8 +72,9 @@ static JsonObject vehicleData;
 static char deviceIMSI[20]={};
 static bg770a::TelemetryServices Services;
 static bg770a::ObdSession Obd;
-static bool CanReady=true,TelemetryAttempted=false,HaveTelemetry=false,ModemSleeping=false,DtcWaiting=false,SynchronousModem=false;
+static bool CanReady=true,TelemetryAttempted=false,HaveCanActivity=false,ModemSleeping=false,DtcWaiting=false,SynchronousModem=false;
 static uint32_t DtcStarted=0;
+static uint32_t LastCanActivity=0;
 constexpr unsigned OBD_CAN_EXTENDED=0;
 constexpr unsigned PIN_VGROVE_ENABLE=0,VGROVE_ENABLE_OFF=0;
 static bool sendResult=false;static unsigned sendCalls=0,powerOffs=0,powerOns=0;
@@ -90,7 +91,7 @@ static bool getTimeFromWorldTimeApiHttp(char* out){
 bool getIMSI(char* out){std::strcpy(out,"test-imsi");return true;}
 void initCAN(){Obd=bg770a::ObdSession();}
 void netPowerOffWait(){assert(Services.atIdle());++powerOffs;ModemSleeping=true;}
-void netPowerOnRestart(){assert(Services.idle());++powerOns;Services.powerCycle();ModemSleeping=false;}
+void netPowerOnRestart(){assert(Services.atIdle());++powerOns;Services.powerCycle();ModemSleeping=false;WioNetwork.state=Network::NetworkState::Connected;}
 void clearData();
 static bool cellularSend(const JsonDocument&){assert(Services.idle());++sendCalls;return sendResult;}
 static void initializeVehicleDataSchema();
@@ -106,7 +107,51 @@ for signature in ['static void serviceModem(', 'static void serviceCan()', 'stat
  'String addMillisTime() {', 'bool getTime(char* time) {', 'bool arrayEmptyCheck(', 'void sendDtcRequest() {','void loop() {']:
     source+=function(signature)+'\n'
 source+=r'''
-int main(){
+int main(int argc,char** argv){
+ if(argc>1 && std::string(argv[1])=="unsynced-wake") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;loop();
+  ModemSleeping=true;WioNetwork.state=Network::NetworkState::Offline;
+  nowMs=10000;loop();
+  can.rx.push_back({0x7E8,{6,0x41,0,0,0x18,0,0,0}});
+  nowMs=10020;loop();
+  assert(powerOns==1 && !ModemSleeping);assert(dataArray.size()==0);
+  ModemSleeping=true;nowMs=10200;loop();nowMs=10350;loop();
+  can.rx.push_back({0x123,{4,0x41,0x0C,0x1F,0x40,0,0,0}});
+  nowMs=10360;loop();assert(ModemSleeping && powerOns==1);
+  can.rx.push_back({0x7E8,{4,0x41,0x0C,0x1F,0x40,0,0,0}});
+  nowMs=10380;loop();assert(!ModemSleeping && powerOns==2);
+  assert(dataArray.size()==0);assert(std::string(Services.clock.source())=="unsynced");
+  nowMs=11000;sendDtcRequest();ModemSleeping=true;
+  can.rx.push_back({0x7E8,{3,0x43,0x01,0xAF,0,0,0,0}});
+  serviceCan();assert(!DtcWaiting);loop();assert(powerOns==3);
+  assert(dataArray.size()==0);
+  std::cout<<"Unsynced capability/telemetry/DTC activity wakes modem without fabricated records\n";
+  return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="dtc-deadline") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));
+  uint8_t pid;assert(Obd.next(0,pid));
+  const uint8_t bitmap[]={6,0x41,0,0,0x18,0,0,0};
+  assert(!Obd.accept(0x7E8,bitmap,8,1));
+  sendDtcRequest();
+  can.rx.push_back({0x123,{0,0,0,0,0,0,0,0},100});
+  can.rx.push_back({0x124,{0,0,0,0,0,0,0,0},100});
+  can.rx.push_back({0x7E8,{3,0x43,0x01,0xAF,0,0,0,0},1});
+  serviceCan();assert(dataArray.size()==0 && !DtcWaiting);
+  sendDtcRequest();can.rx.push_back({0x7E8,{3,0x43,0x01,0xAF,0,0,0,0},199});
+  serviceCan();assert(dataArray.size()==1 && !DtcWaiting);clearData();HaveCanActivity=false;
+  sendDtcRequest();can.rx.push_back({0x7E8,{3,0x43,0x01,0xAF,0,0,0,0},200});
+  serviceCan();assert(dataArray.size()==0 && !DtcWaiting && !HaveCanActivity);
+  sendDtcRequest();can.rx.push_back({0x7E8,{0x10,10,0x43,0,0,0,0,0},200});
+  serviceCan();assert(dataArray.size()==0 && !DtcWaiting);
+  nowMs=0xFFFFFFF0U;sendDtcRequest();
+  can.rx.push_back({0x7E8,{3,0x43,0x01,0xAF,0,0,0,0},200});
+  serviceCan();assert(dataArray.size()==0 && !DtcWaiting);
+  std::cout<<"DTC receive-time deadline, blocking batches, SF/FF boundary and millis wrap passed\n";
+  return 0;
+ }
+
  Services.ntpEnabled=false;Services.gnssEnabled=false;
  Services.clock.seedFallback(1735689599LL,Services.now(0));
  auto handler=WioCellular.registerUrcHandler2([](const std::string& s){return Services.line(s,millis());});
@@ -168,3 +213,5 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
+    for scenario in os.environ.get('SKETCH_SCENARIOS','unsynced-wake dtc-deadline').split():
+        subprocess.run([str(exe),scenario],check=True)

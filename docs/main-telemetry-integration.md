@@ -140,8 +140,31 @@ No real vehicle, board, antenna, SIM or ingest server was available for these te
 ## Recorded local result
 
 All three UBSan host suites PASS. All five PlatformIO 6.2.0 profiles PASS.
-Combined default: RAM 12,380 / 237,568 bytes; flash 133,520 / 798,720 bytes.
+Combined default: RAM 12,388 / 237,568 bytes; flash 133,664 / 798,720 bytes.
 The framework emits its three existing ignored `used` attribute warnings in
 startup_nrf_common.c for each clean target build; there were no build errors.
 No independent agent review was performed. Physical/end-to-end ingest tests
 remain NOT RUN for the unavailable hardware and server listed above.
+
+## Review follow-up: activity and receive deadlines
+
+Two reported issues were reproduced against head `150b8f0` with failing host
+regressions before the fixes. Validated capability, telemetry and DTC responses
+now update CAN activity before the UTC availability check. Activity wakes a
+sleeping modem independently of whether a timestamped record can be created;
+unsynced frames still never create fabricated timestamps or records. Unrelated
+frames do not wake the modem. Accepted DTC replies also end the pending request
+without requiring UTC.
+
+DTC's 200 ms deadline is now checked after each receive returns, including during
+a batch. The fake advances time by up to 100 ms for each unrelated frame before
+a delayed reply: late SF/FF responses are rejected, 199 ms is accepted, 200 ms is
+rejected, and wrap across millis is covered. The activity regression exercises
+unsynced sleep/wake in the actual extracted loop with a simulated power restart.
+These are host simulations, not physical UART, modem or vehicle tests.
+
+The HTTP helper's actual reception from WorldTimeAPI remains **NOT TESTED**:
+`test_sketch.py` supplies the HTTP datetime with a stub. It tests the current
+fallback orchestration, date validation, clock anchoring and AT exclusion, not
+actual fragmented socket reads or the public server. That distinction also
+applies to the earlier host results above.

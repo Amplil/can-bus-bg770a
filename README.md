@@ -32,3 +32,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Replacement-main telemetry integration
+
+NTP・GNSS・Hustler対応を現在の `imsi` / `data[]` 形式に移植した構成と検証・実機未確認事項は [integration guide](docs/main-telemetry-integration.md) を参照してください。`pio run` は機能別・組合せの7構成をビルドします。

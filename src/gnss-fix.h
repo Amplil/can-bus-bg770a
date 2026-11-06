@@ -134,11 +134,13 @@ inline bool parseQgpsloc(const char* line, uint32_t receivedMillis, GnssFix& out
   return true;
 }
 
-// Unsigned subtraction handles a millis() rollover. No fix survives >60 seconds,
-// even if a caller supplies a larger limit. Call regularly to expire cached data;
+// Unsigned subtraction handles a millis() rollover. Live use defaults to 60s;
+// timestamped location reporting may retain a fix up to the ten-minute cycle.
+// No fix survives >10 minutes, even if a caller supplies a larger limit.
+// Call regularly to expire cached data;
 // a 32-bit counter cannot distinguish intervals separated by an entire wrap.
 inline bool isFresh(const GnssFix& fix, uint32_t nowMillis, uint32_t maxAgeMillis = 60000) {
-  if (maxAgeMillis > 60000) maxAgeMillis = 60000;
+  if (maxAgeMillis > 600000) maxAgeMillis = 600000;
   return fix.valid && static_cast<uint32_t>(nowMillis - fix.receivedMillis) <= maxAgeMillis;
 }
 

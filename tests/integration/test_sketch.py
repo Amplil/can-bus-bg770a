@@ -26,6 +26,7 @@ source=r'''
 #include <obd-session.h>
 #include <endpoint-ack.h>
 #include <telemetry-batch.h>
+#include <telemetry-record.h>
 #include <can-diagnostics.h>
 #include <obd-dtc.h>
 #include <cassert>
@@ -127,6 +128,7 @@ void netPowerOffWait(){assert(Services.atIdle());++powerOffs;ModemSleeping=true;
 void netPowerOnRestart(){assert(Services.atIdle());++powerOns;Services.powerCycle();ModemSleeping=false;WioNetwork.state=Network::NetworkState::Connected;}
 void clearData();
 static void clearSentData(size_t);
+static void discardEmptyVehicleRecords();
 static bool cellularSend(const JsonDocument&);
 static unsigned socketOpens=0;
 static uint32_t socketDelay=0;
@@ -158,7 +160,7 @@ bool arrayEmptyCheck(JsonArrayConst);
 '''+defines+'\n'+constants+'\n'
 for signature in ['static bool canIdle()', 'static bool cellularOnline()', 'static void trace(', 'static const char* rejectionName(', 'static void traceFrame(', 'static void tickCan(', 'static void canSummary()', 'static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(', 'static bool waitForCellularNetwork(',
  'static void attachFreshLocation()', 'static bool cellularSend(const JsonDocument &doc)', 'void initCAN() {', 'String dtcToString(', 'void processDtcData(unsigned char* data)',
- 'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void clearSentData(', 'static void initializeVehicleDataSchema() {',
+ 'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void clearSentData(', 'static void discardEmptyVehicleRecords() {', 'static void initializeVehicleDataSchema() {',
  'String addMillisTime() {', 'bool getTime(char* time) {', 'bool arrayEmptyCheck(', 'void sendDtcRequest() {','void loop() {']:
     source+=function(signature)+'\n'
 source+=r'''
@@ -167,6 +169,37 @@ static void pollUntilSend(unsigned expected) {
  assert(sendCalls==expected);
 }
 int main(int argc,char** argv){
+ if(argc>1 && std::string(argv[1])=="zero-records") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  uint8_t pid;assert(Obd.next(0,pid));
+  const uint8_t bitmap[]={6,0x41,0,0,0x18,0,0,0};
+  assert(!Obd.accept(0x7E8,bitmap,8,1));
+  sendDtcRequest();can.rx.push_back({0x7E8,{2,0x43,0,0,0,0,0,0}});
+  serviceCan();assert(dataArray.size()==0 && !DtcWaiting);
+  initializeVehicleDataSchema();vehicleData["vehicle_speed"]=0;
+  assert(!cellularSend(JsonDoc) && socketOpens==0);
+  // Keep an in-progress zero sample while another CAN response is pending.
+  assert(!Obd.next(30001,pid));assert(Obd.next(30001,pid));nowMs=30001;loop();
+  assert(Obd.waiting() && dataArray.size()==1 && socketOpens==0);
+  Obd.tick(nowMs+201);discardEmptyVehicleRecords();assert(dataArray.size()==0);
+  initializeVehicleDataSchema();vehicleData["latitude"]=35;vehicleData["battery_level"]=99;
+  initializeVehicleDataSchema();vehicleData["control_module_voltage"]=12.4;
+  initializeVehicleDataSchema();vehicleData["dtc_count"]=1;vehicleData["dtc_codes"]="P01AF";
+  initializeVehicleDataSchema();vehicleData["dtc_codes"]=" \t";
+  discardEmptyVehicleRecords();assert(dataArray.size()==2 && vehicleData.isNull());
+  assert(dataArray[0]["engine_rpm"]==0 && dataArray[0]["vehicle_speed"]==0);
+  sendResult=true;
+  while(dataArray.size()) {
+   const auto queued=dataArray.size();assert(cellularSend(JsonDoc));
+   JsonDocument sent;assert(!deserializeJson(sent,SentPayloads.back()));
+   assert(sent["data"].size()==LastSentRecords && LastSentRecords>0);
+   for(JsonObjectConst row:sent["data"].as<JsonArrayConst>())assert(bg770a::hasVehicleMeasurement(row));
+   const auto acknowledged=LastSentRecords;clearSentData(acknowledged);
+   assert(dataArray.size()==queued-acknowledged);
+  }
+  std::cout<<"Empty DTC and all-zero rows never reach transport; stopped readings, DTC and acknowledgment counts preserved\n";return 0;
+ }
  if(argc>1 && std::string(argv[1])=="rejected-first-send") {
   Services.ntpEnabled=false;Services.gnssEnabled=true;
   Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
@@ -516,5 +549,5 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','rejected-first-send bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
+    for scenario in os.environ.get('SKETCH_SCENARIOS','zero-records rejected-first-send bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
         subprocess.run([str(exe),scenario],check=True)

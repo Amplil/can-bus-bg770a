@@ -18,6 +18,7 @@
 #include <obd-session.h>
 #include <endpoint-ack.h>
 #include <telemetry-batch.h>
+#include <telemetry-record.h>
 #include <can-diagnostics.h>
 #include <cellular-startup.h>
 #include <obd-dtc.h>
@@ -99,6 +100,7 @@ String dtcToString(unsigned char, unsigned char);
 void updateVehicleData(unsigned char, unsigned char*);
 void clearData();
 static void clearSentData(size_t);
+static void discardEmptyVehicleRecords();
 static bool cellularSend(const JsonDocument&);
 static void initializeVehicleDataSchema();
 bool getIMSI(char*);
@@ -228,6 +230,9 @@ static void serviceCan() {
     if(!telemetry && !dtc)continue;
     int64_t epoch;
     if(!Services.clock.utc(Services.now(millis()),epoch)) {trace("CAN-RECORD");Serial.println("accepted activity, record deferred: UTC unavailable");continue;}
+    // A no-fault reply can update an existing measured row, but must not create
+    // a new all-zero OBD row at a polling/acknowledgment boundary.
+    if(!telemetry && vehicleData.isNull() && bg770a::dtcSingleFrame(bytes,sizeof(bytes)) && bytes[2]==0)continue;
     if(vehicleData.isNull())initializeVehicleDataSchema();
     if(telemetry)updateVehicleData(bytes[2],bytes);
     if(dtc)processDtcData(bytes);
@@ -284,7 +289,9 @@ static bool waitForCellularNetwork(uint32_t timeout) {
 static void attachFreshLocation() {
   JsonDoc.remove("location");
   const auto& fix=Services.gnss.fix();
-  if(!bg770a::isFresh(fix,millis()))return;
+  // LTE restoration can exceed one minute. Keep the actual GNSS UTC/date and
+  // age so the dashboard can show when this last-known position was acquired.
+  if(!bg770a::isFresh(fix,millis(),bg770a::GnssSession::RetryMs))return;
   JsonObject location=JsonDoc["location"].to<JsonObject>();
   location["latitude"]=fix.latitude;location["longitude"]=fix.longitude;
   location["altitude_m"]=fix.altitude;location["hdop"]=fix.hdop;
@@ -451,6 +458,7 @@ void loop() {
   }
   if(millis() - lastCellularSend > CELLULAR_INTERVAL && CellularReady && Services.atIdle() && canIdle() &&
       (Services.idle() || ModemSleeping || dataArray.size()==0)) {
+    discardEmptyVehicleRecords();
     if(arrayEmptyCheck(JsonDoc["data"])) {
       Serial.println("doc data is empty.");
       unsigned long emptyDuration = millis() - lastDataReceivedTime;
@@ -650,6 +658,11 @@ static void clearSentData(size_t count) {
 static bool cellularSend(const JsonDocument &doc) {
   LastSentRecords=0;
   if(!CellularReady || !canIdle() || !Services.idle() || !deviceIMSI[0] || ModemSleeping || doc["data"].size()==0)return false;
+  // Enforce the invariant again at the transport boundary, including direct
+  // callers. The loop removes empty rows only after pending CAN replies finish.
+  for(JsonObjectConst record:doc["data"].as<JsonArrayConst>()) {
+    if(!bg770a::hasVehicleMeasurement(record))return false;
+  }
   trace("LTE-SEND");Serial.printf("queue=%u; payload redacted\n",unsigned(doc["data"].size()));
   Serial.println("### Sending Combined Vehicle Data Object");
   Serial.print("Connecting ");
@@ -717,6 +730,19 @@ static bool cellularSend(const JsonDocument &doc) {
   Serial.println("### Completed");
 
   return true;
+}
+
+static void discardEmptyVehicleRecords() {
+  size_t removed=0;
+  for(size_t n=dataArray.size();n>0;--n) {
+    if(!bg770a::hasVehicleMeasurement(dataArray[n-1].as<JsonObjectConst>())) {
+      dataArray.remove(n-1);++removed;
+    }
+  }
+  if(removed) {
+    vehicleData=JsonObject();
+    trace("QUEUE-DROP-EMPTY");Serial.printf("removed=%u remaining=%u\n",unsigned(removed),unsigned(dataArray.size()));
+  }
 }
 
 static void initializeVehicleDataSchema() {

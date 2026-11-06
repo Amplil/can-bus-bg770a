@@ -29,6 +29,16 @@ upload, even though no upload had been accepted.
   confirm recovery without a new unsolicited notification reaching WioNetwork.
 - LTE reattachment after GNSS has a 120-second deadline. Failure enters the
   existing physical-reset recovery path and disables optional GNSS for that boot.
+- GNSS acquisition starts are due every ten minutes from the previous start,
+  after accepted delivery and after the queue drains. Busy AT/CAN owners or an
+  unavailable LTE connection defer the acquisition. A valid location retains
+  its original GNSS UTC/date and may accompany uploads for up to ten minutes
+  after receipt, including after LTE restoration lasting over one minute.
+- Empty Mode 03 replies do not create new default-filled vehicle records.
+  Once outstanding CAN replies finish, rows with ten zero OBD numeric values
+  and no DTC information are discarded. The sender also rejects such rows
+  before opening a socket. Stopped vehicles with valid other readings and
+  records containing DTC information remain eligible for upload.
 - Each send contains a complete JSON envelope with a prefix of records fitting
   a conservative 1,024-byte application budget. Only that acknowledged prefix is
   removed; remaining records are sent after about one second when the AT/CAN
@@ -42,9 +52,15 @@ upload, even though no upload had been accepted.
 ## Endpoint contract and the original 400
 
 The local dashboard source at `OBD2-Tracker-Dashboard/schemas/telemetry.schema.ts`
-accepts the firmware's current UTC offset format and strips optional metadata.
-The actual installed schema passed a synthetic current-format record. This
-does not establish which code or forwarding configuration is deployed.
+accepts the firmware's UTC offset format and root `location`. It validates the
+fix's UTC/date, maps its coordinates onto one record in the batch, and preserves
+the fix time independently of that record's OBD time. HDOP is not treated as
+accuracy in meters. The nullable `gps_timestamp` database migration is required
+for the updated dashboard; API responses expose this as `gpsTimestamp`. The map
+retains the latest received location and shows when it was acquired, including
+when subsequent OBD records have no location. All-zero OBD rows with no DTC
+information are also rejected by dashboard ingestion. These source contracts do
+not establish which code or forwarding configuration is deployed.
 
 [SORACOM Beam's TCP-to-HTTP reference](https://users.soracom.io/ja-jp/docs/beam/tcp-http/)
 documents automatic Base64 `payload` wrapping. The device therefore continues to
@@ -69,15 +85,25 @@ settings, deployed dashboard code, or device identifiers were changed.
 Run `bash tests/cellular/run_tests.sh` with `ARDUINOJSON_INCLUDE` and
 `WIOCELLULAR_INCLUDE` pointing to the installed libraries' `src` directories.
 
-- Arduino CLI compilation for Wio BG770A board 1.0 with installed WioCellular
-  0.3.12 and SeeedJP nRF52 Boards 1.5.0 passed.
+- The cellular example with ten-minute GNSS and empty-record guards compiles
+  with Arduino CLI 1.2.0 for Wio BG770A board 1.0 using installed ArduinoJson
+  7.4.2, WioCellular 0.3.12 and SeeedJP nRF52 Boards 1.5.0. It uses 163,980 bytes
+  of program storage and 12,548 bytes of global RAM. The core emits its three
+  existing ignored `used` attribute warnings; compilation has no errors.
 - Actual extracted-sketch regressions cover rejected-first-send GNSS exclusion,
   fragmented safe errors, registration deferral/resumption, prefix-only queue
-  acknowledgment, and prompt backlog draining, alongside existing CAN/UTC checks.
+  acknowledgment, prompt backlog draining, empty DTC replies and all-zero row
+  exclusion while preserving stopped readings and actual DTC information,
+  alongside existing CAN/UTC checks.
 - GNSS session and real AT-dispatcher tests cover whitespace, extended/interleaved
   registration notifications, missing notifications, reattachment timeout and
   timer wrap. Endpoint and batch tests cover privacy, fragmentation, byte bounds,
   preserved record values, rejected queues, and allocation failures.
+
+The ten-minute cadence and location reporting through the updated dashboard
+require a new physical end-to-end check. The physical retest below establishes
+earlier delivery and LTE recovery behavior, not validation of these GPS and
+all-zero-record changes.
 
 Host response/registration samples are synthetic unless explicitly listed in
 the observed field fixtures.

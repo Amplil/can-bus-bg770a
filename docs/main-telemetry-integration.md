@@ -7,10 +7,11 @@ This ports the requested functionality, not the old main snapshot. The new main'
 Hourly heartbeat intent is retained locally; the ingest endpoint rejects empty records,
 so no empty heartbeat payload is sent. UTC ISO8601 `time` retains its string type and explicit offset;
 the previous code incorrectly relabeled local time with +09:00 and mishandled
-long uptime. Added metadata is optional for consumers. The ingest service itself
-is not available here; compatibility with strict rejection of extra fields needs
-server validation. Required numeric keys retain the main's zero defaults; these
-are placeholders for missing measurements, not evidence of PID support.
+long uptime. Added metadata is optional for consumers. The companion dashboard
+accepts the root GNSS location and preserves its acquisition time separately
+from OBD record time. Required numeric keys retain the main's zero defaults;
+these are placeholders for missing measurements, not evidence of PID support.
+An entire default-filled row with no DTC information is discarded before upload.
 
 ## Complete fork inventory (2026-11-05)
 
@@ -55,23 +56,41 @@ path's physical modem reset, restore flow control and LTE registration, disable
 further NTP/GNSS acquisition for that boot, and preserve any prior clock anchor.
 No AT is sent to a deliberately sleeping modem. Idle sleep needs an idle AT
 boundary, not successful network registration. On CAN activity after sleep the
-modem is restarted before sending. No hardware was reset or flashed in this task.
+modem is restarted before sending. Physical verification is required for each
+supported hardware and firmware configuration.
 
 ## GNSS
 
-The first normal telemetry attempt precedes GNSS; subsequent acquisitions occur
-at most every five minutes. GNSS temporarily takes LTE offline, searches for up
-to 30 seconds, stops GNSS and restores LTE/registration. A pending command may
-add its 20-second deadline. CAN receive/validation continues during this process.
-Command errors or uncertain boundaries use bounded reset/boot recovery. No-fix
-and stale-fix paths omit `location`; freshness is rechecked after TCP connection
-setup. No zero coordinates are substituted. Location is current acquisition
-metadata for the envelope, not the position of every queued historical record.
+The first accepted telemetry upload and an empty remaining queue precede GNSS.
+Subsequent acquisition starts are due every ten minutes, measured from the
+previous acquisition start. NTP, active CAN replies, queued telemetry, LTE
+availability and modem ownership can defer a due acquisition. GNSS temporarily
+takes LTE offline, searches for up to 30 seconds, stops GNSS and restores
+LTE/registration. A pending command may add its 20-second deadline. CAN
+receive/validation continues during this process. Command errors or uncertain
+boundaries use bounded reset/boot recovery.
+
+A valid fix may be reported for up to ten minutes after receipt so LTE
+reattachment lasting over one minute does not discard it. Freshness is rechecked
+after TCP connection setup. No-fix and expired-fix paths omit `location`; no zero
+coordinates are substituted. Each acquisition begins with a cleared fix.
+Location describes the timestamped GNSS fix for the envelope, independently of
+every queued historical OBD record.
 
 `location`: latitude/longitude (degrees), altitude_m, hdop, fix_type, satellites,
 utc_hhmmss, date_ddmmyy, age_ms, source=gnss. Use a compatible **passive** GNSS
-antenna. Hardware, firmware, antenna, RF, SIM and LTE reattachment need physical
-validation. GNSS and LTE are exclusive; the send cadence can lengthen.
+antenna. The dashboard validates the GNSS UTC/date, attaches the location to one
+record in the received batch and stores the actual fix time as `gps_timestamp`
+(`gpsTimestamp` in API responses). Its nullable database migration must be
+applied before running the updated dashboard. Existing record-level GPS payloads
+remain supported. HDOP remains dimensionless and is not converted to accuracy in
+meters. The map can show the latest received fix and its acquisition time even
+when later OBD records contain no GPS.
+
+The ten-minute GNSS cadence, position accuracy and location delivery through the
+updated dashboard require physical validation. Hardware, firmware, antenna, RF,
+SIM and LTE reattachment remain relevant. GNSS and LTE are exclusive; the send
+cadence can lengthen.
 
 ## Hustler / CAN
 
@@ -103,6 +122,12 @@ A 200 ms response deadline and 100 ms minimum request gap reject unrelated,
 wrong-ECU, wrong-PID, wrong-service and malformed single-frame payloads. A
 four-second acquisition window follows the existing ten-second group interval;
 no record is created until an accepted measurement has a valid timestamp.
+An empty Mode 03 reply updates an existing row but does not create a new one.
+Before sending, the sketch removes rows whose ten OBD numeric fields are all
+zero and whose DTC count/code is empty; a second transport guard refuses such
+rows. Removal waits for outstanding CAN replies to finish. A stopped vehicle
+with a real voltage, temperature, distance or other nonzero measurement remains
+eligible, as does a record containing DTC information.
 
 Root `obd.supported_pids` exposes support state; zero defaults in required fields
 are not unsupported measurements. `distance_traveled` (PID 31) is distance since
@@ -119,10 +144,13 @@ failed sends retain records until that bound. No unverified DBC/ECU-role claims.
 
 ## Validation and remaining physical work
 
-Run `bash tests/ntp/run_tests.sh`, `bash tests/gnss/run_tests.sh`, and
-`bash tests/integration/run_tests.sh`. ArduinoJson 7.4.3 headers are required;
-set ARDUINOJSON_INCLUDE or install PlatformIO dependencies. The integration suite
-extracts and compiles current sketch functions and loop, not an old copied loop.
+Run `bash tests/cellular/run_tests.sh` with `ARDUINOJSON_INCLUDE` and
+`WIOCELLULAR_INCLUDE` pointing to installed libraries' `src` directories.
+The configured dependencies are ArduinoJson 7.4.3 and WioCellular 0.3.16; record
+the installed versions when validating with other compatible headers. This suite
+does not invoke the separate historical compatibility test, which reads Git
+history. The integration checks extract and compile current sketch functions and
+loop, not an old copied loop.
 Transport fixtures are WioCellular 0.3.16 at
 `9275de1d15f8bd2761f562b8895edc0ee9d1a1c5` with its MIT license.
 
@@ -137,16 +165,23 @@ compare telemetry/DTC/odometer with an independent scan tool. Test no ECU, multi
 ECUs, negative/late replies, ignition transitions, sustained bus load, missing NTP
 notifications, timezone rollover, HTTP fragmentation, no GNSS antenna/fix, slow
 TCP, LTE reattachment, modem recovery, no-network idle sleep, CAN wake and heartbeat.
-No real vehicle, board, antenna, SIM or ingest server was available for these tests.
+The archived integration tests below ran without a real vehicle, board, antenna,
+SIM or ingest server.
 
-## Recorded local result
+## Archived integration validation
+
+These results precede the ten-minute GNSS and empty-record guards described
+above. They establish the earlier integration baseline. Compile validation of
+the cellular example with those guards is recorded in
+[cellular delivery validation](cellular-send.md#validation); physical validation
+of the GPS and empty-record behavior remains outstanding.
 
 All three UBSan host suites PASS. All seven PlatformIO 6.2.0 profiles PASS.
 Combined default: RAM 12,516 / 237,568 bytes; flash 145,088 / 798,720 bytes.
 The framework emits its three existing ignored `used` attribute warnings in
 startup_nrf_common.c for each clean target build; there were no build errors.
-No independent agent review was performed. Physical/end-to-end ingest tests
-remain NOT RUN for the unavailable hardware and server listed above.
+The archived baseline did not include physical/end-to-end ingest tests because
+the hardware and server listed above were unavailable.
 
 ## Review follow-up: activity and receive deadlines
 

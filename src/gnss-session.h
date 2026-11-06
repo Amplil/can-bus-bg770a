@@ -10,7 +10,7 @@ public:
   enum class State { Idle, Offline, Start, PollWait, Poll, Stop, Online,
                      RestoreUrc, Registration, FlowControl, FlowSettle, ResetNeeded, BootWait, BootSettle };
   static constexpr uint32_t AcquisitionMs = 30000;
-  static constexpr uint32_t RetryMs = 300000;
+  static constexpr uint32_t RetryMs = 600000; // Ten minutes between acquisition starts.
   static constexpr uint32_t ReattachmentMs = 120000;
 private:
   State state_ = State::Idle;
@@ -84,7 +84,7 @@ private:
       else resetNeeded();
       break;
     case State::RestoreUrc:
-      if (ok) { lastAttempt_ = now;prepareRegistrationQuery(now); }
+      if (ok) { prepareRegistrationQuery(now); }
       else resetNeeded();
       break;
     case State::Registration:

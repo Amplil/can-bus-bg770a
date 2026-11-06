@@ -42,7 +42,10 @@ int main() {
   assert(bg770a::isFresh(fix, 1234));
   assert(bg770a::isFresh(fix, 61234));
   assert(!bg770a::isFresh(fix, 61235));
-  assert(!bg770a::isFresh(fix, 61235, 100000));
+  assert(bg770a::isFresh(fix, 61235, 100000));
+  assert(bg770a::isFresh(fix, 601234, 600000));
+  assert(!bg770a::isFresh(fix, 601235, 600000));
+  assert(!bg770a::isFresh(fix, 601235, UINT32_MAX));
   assert(!bg770a::isFresh(fix, 1233));
   assert(bg770a::parseQgpsloc(sample, UINT32_MAX - 999, fix));
   assert(bg770a::isFresh(fix, 59000));

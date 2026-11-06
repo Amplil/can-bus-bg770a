@@ -23,10 +23,10 @@ int main() {
   GnssSession s; assert(s.canSend()); start(s,0);
   assert(!s.canSend()); assert(s.line(sample,1000)); assert(!s.fix().valid);
   assert(s.line("OK",1000)); assert(s.fix().valid); restore(s,1010);
-  assert(!s.ready(301009)); assert(s.ready(301010));
-  start(s,301010); assert(!s.fix().valid); s.line(sample,302010); s.line("OK",302010);
+  assert(!s.ready(599999)); assert(s.ready(600000));
+  start(s,600000); assert(!s.fix().valid); s.line(sample,601000); s.line("OK",601000);
   assert(!s.fix().valid); // Same UTC from previous acquisition is not a new fix.
-  s.tick(331010); restore(s,331020); assert(!s.fix().valid);
+  s.tick(630000); restore(s,630010); assert(!s.fix().valid);
   GnssSession noAntenna; start(noAntenna,0); noAntenna.line("+CME ERROR: 516",1000);
   noAntenna.tick(30000); restore(noAntenna,30010); assert(noAntenna.canSend());
   assert(!noAntenna.fix().valid);
@@ -49,6 +49,7 @@ int main() {
   assert(missingEcho.state()==GnssSession::State::ResetNeeded);
   GnssSession wrap; start(wrap,UINT32_MAX-2000); wrap.line("+CME ERROR: 516",UINT32_MAX-1000);
   wrap.tick(28000); restore(wrap,28001);
+  assert(!wrap.ready(597998));assert(wrap.ready(597999));
   // GNSS stop rejection must not issue CFUN=1 across an uncertain GNSS state.
   GnssSession stopRejected; start(stopRejected,0);
   stopRejected.line(sample,1000); stopRejected.line("OK",1000);

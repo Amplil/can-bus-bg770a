@@ -93,6 +93,9 @@ static bg770a::CanDiagnostics CanStats;
 static bool DtcExpired=false;
 static bool DtcWaiting=false;
 static bool HeartbeatPending=false;
+static JsonDocument HeartbeatDoc;
+static uint32_t LastHeartbeatAck=0, LastHeartbeatAttempt=0;
+static bool HeartbeatAcknowledged=false, HeartbeatAttempted=false;
 static uint32_t DtcStarted=0;
 static uint32_t LastCanActivity=0;
 using ServiceHandler = decltype(std::declval<WioCellularModule&>().registerUrcHandler2(
@@ -107,6 +110,8 @@ void clearData();
 static void clearSentData(size_t);
 static void discardEmptyVehicleRecords();
 static bool cellularSend(const JsonDocument&);
+static bool serviceHeartbeat();
+static uint32_t idleSleepDuration();
 static void initializeVehicleDataSchema();
 static bool queueStartupLocation();
 static bool dispatchServiceLine(const std::string& line);
@@ -280,7 +285,7 @@ static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
     Services.gnss.resetIssued(millis());
   }
   const bool initialGnss=allowGnss && StartupLocation==StartupLocationState::Pending && deviceIMSI[0];
-  const bool periodicGnss=allowGnss && StartupLocation==StartupLocationState::Complete && dataArray.size()==0;
+  const bool periodicGnss=allowGnss && !HeartbeatPending && StartupLocation==StartupLocationState::Complete && dataArray.size()==0;
   gpsSequence=Services.gnss.diagnostic().sequence;
   const auto command=Services.command(millis(),WioNetwork.config.pdpContextId,online,
                                       allowNtp,initialGnss || periodicGnss);
@@ -566,6 +571,63 @@ void setup() {
   Serial.println("========================================");
 }
 
+static bool serviceHeartbeat() {
+  if(!HeartbeatPending) {
+    if(HeartbeatAcknowledged && uint32_t(millis()-LastHeartbeatAck)<ACK_INTERVAL)return false;
+    HeartbeatPending=true;
+    trace("HEARTBEAT");Serial.printf("status=due reason=%s; awaiting idle modem, UTC and endpoint acknowledgment\n",
+      HeartbeatAcknowledged?"hourly":"startup");
+  }
+  // Finish radio acquisition before sending, but queued OBD/GPS records do not
+  // postpone an explicit startup/hourly heartbeat or consume its acknowledgment.
+  if(StartupLocation==StartupLocationState::Acquiring)return false;
+  if(!canIdle() || !Services.atIdle())return false;
+  if(ModemSleeping) {
+    netPowerOnRestart();
+    return true;
+  }
+  // Waiting for delivery must not stop acquiring later vehicle measurements.
+  // The main loop keeps polling CAN, but suppresses idle sleep while due.
+  if(!CellularReady || !Services.idle() || !deviceIMSI[0])return false;
+  if(HeartbeatAttempted && uint32_t(millis()-LastHeartbeatAttempt)<CELLULAR_INTERVAL)return false;
+  HeartbeatAttempted=true;LastHeartbeatAttempt=millis();
+  if(HeartbeatDoc["data"].size()==0) {
+    int64_t epoch;
+    if(!Services.clock.utc(Services.now(millis()),epoch)) {
+      char time[64];
+      if(!getTime(time) || !Services.clock.utc(Services.now(millis()),epoch)) {
+        LastHeartbeatAttempt=millis();
+        trace("HEARTBEAT");Serial.println("status=deferred reason=UTC_unavailable");
+        return true;
+      }
+    }
+    const auto timestamp=bg770a::isoUtc(epoch);
+    if(timestamp.empty())return true;
+    HeartbeatDoc.clear();
+    HeartbeatDoc["imsi"]=deviceIMSI;
+    JsonObject record=HeartbeatDoc["data"].to<JsonArray>().add<JsonObject>();
+    record["time"]=timestamp;record["type"]="heartbeat";
+  }
+  if(cellularSend(HeartbeatDoc)) {
+    HeartbeatDoc.clear();HeartbeatPending=false;HeartbeatAttempted=false;
+    trace("HEARTBEAT");Serial.println("status=accepted; next heartbeat due in one hour independently of measurement uploads");
+  } else {
+    LastHeartbeatAttempt=millis();
+    trace("HEARTBEAT");Serial.println("status=unconfirmed; timestamp retained for retry");
+  }
+  return true;
+}
+
+// Cap each idle sleep at the next heartbeat deadline, including repeated
+// ten-minute sleeps while the modem is already powered off.
+static uint32_t idleSleepDuration() {
+  if(!HeartbeatAcknowledged)return 0;
+  const uint32_t elapsed=uint32_t(millis()-LastHeartbeatAck);
+  if(elapsed>=ACK_INTERVAL)return 0;
+  const uint32_t remaining=ACK_INTERVAL-elapsed;
+  return remaining<uint32_t(POWER_OFF_INTERVAL)?remaining:uint32_t(POWER_OFF_INTERVAL);
+}
+
 void loop() {
   serviceCan();
   if(!CellularReady && canIdle() && Services.atIdle() && uint32_t(millis()-LastCellularAttempt)>=CELLULAR_RETRY_INTERVAL) {
@@ -575,14 +637,15 @@ void loop() {
   canSummary();
   if(HaveCanActivity && ModemSleeping && Services.atIdle() && canIdle())netPowerOnRestart();
   if(CellularReady && canIdle() && Services.idle() && !ModemSleeping && !deviceIMSI[0] && getIMSI(deviceIMSI))JsonDoc["imsi"]=deviceIMSI;
+  if(serviceHeartbeat()) {cooperativeDelay(10);return;}
   if(serviceStartupLocation()) {cooperativeDelay(10);return;}
   static uint32_t lastClockRetry=millis();
-  if(CellularReady && canIdle() && Services.idle() && !ModemSleeping && uint32_t(millis()-lastClockRetry)>=60000 &&
+  if(!HeartbeatPending && CellularReady && canIdle() && Services.idle() && !ModemSleeping && uint32_t(millis()-lastClockRetry)>=60000 &&
       strcmp(Services.clock.source(),"unsynced")==0) {
     char time[64]; getTime(time);lastClockRetry=millis();
   }
   static uint32_t lastCellularSend=millis(), lastRotateSend=0, batchStarted=0;
-  static uint32_t lastDtcSend=millis(), lastDataReceivedTime=millis(), lastACKTime=millis();
+  static uint32_t lastDtcSend=millis(), lastDataReceivedTime=millis();
   static bool batch=false;
   const uint32_t now=millis();
   if(HaveCanActivity) { lastDataReceivedTime=LastCanActivity; HaveCanActivity=false; }
@@ -645,12 +708,7 @@ void loop() {
     if(arrayEmptyCheck(JsonDoc["data"])) {
       Serial.println("doc data is empty.");
       unsigned long emptyDuration = millis() - lastDataReceivedTime;
-      if(CellularReady && emptyDuration > DATA_EMPTY_TIMEOUT) { // DATA_EMPTY_TIMEOUT時間経過チェック
-        unsigned long lastACKDuration = millis() - lastACKTime;
-        if(lastACKDuration > ACK_INTERVAL && !HeartbeatPending) {
-          HeartbeatPending=true;
-          Serial.println("Heartbeat pending: ingest requires measured records; empty send deferred");
-        }
+      if(CellularReady && !HeartbeatPending && emptyDuration > DATA_EMPTY_TIMEOUT) { // DATA_EMPTY_TIMEOUT時間経過チェック
         Serial.print("OBD2の受信データが");Serial.print(emptyDuration / 1000);Serial.println("秒間なかったためWioCellularとCAN BUSをOFFにします。");
         digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_OFF);
         netPowerOffWait();
@@ -670,11 +728,11 @@ void loop() {
       lastDataReceivedTime = millis(); // 最後にデータを受信した時刻を更新
       //lastDataReceivedDuration=0;
     }
-    // The ingest contract rejects data:[]; retain heartbeat intent locally.
+    // Heartbeats use their own explicit timestamp-only document.
     if(dataArray.size()==0) { lastCellularSend=millis();cooperativeDelay(10);return; }
     const bool delivered=cellularSend(JsonDoc);
     if(delivered) {
-      clearSentData(LastSentRecords);lastACKTime=millis();HeartbeatPending=false;
+      clearSentData(LastSentRecords);
     }
     lastCellularSend = millis();
     // Drain accepted prefixes promptly; failures keep the normal retry interval.
@@ -839,12 +897,13 @@ static void clearSentData(size_t count) {
 
 static bool cellularSend(const JsonDocument &doc) {
   LastSentRecords=0;
-  if(Services.gnssEnabled && StartupLocation!=StartupLocationState::Complete && &doc!=&StartupLocationDoc)return false;
+  if(Services.gnssEnabled && StartupLocation!=StartupLocationState::Complete &&
+     &doc!=&StartupLocationDoc && &doc!=&HeartbeatDoc)return false;
   if(!CellularReady || !canIdle() || !Services.idle() || !deviceIMSI[0] || ModemSleeping || doc["data"].size()==0)return false;
   // Enforce the invariant again at the transport boundary, including direct
   // callers. The loop removes empty rows only after pending CAN replies finish.
   for(JsonObjectConst record:doc["data"].as<JsonArrayConst>()) {
-    if(!bg770a::hasTelemetryMeasurement(record))return false;
+    if(!bg770a::hasTelemetryRecord(record))return false;
   }
   trace("LTE-SEND");Serial.printf("queue=%u; payload redacted\n",unsigned(doc["data"].size()));
   Serial.println("### Sending Combined Vehicle Data Object");
@@ -922,6 +981,9 @@ static bool cellularSend(const JsonDocument &doc) {
 
   Serial.println("### Completed");
 
+  if(&doc==&HeartbeatDoc) {
+    LastHeartbeatAck=millis();HeartbeatAcknowledged=true;
+  }
   return true;
 }
 
@@ -1121,7 +1183,7 @@ void netPowerOffWait() {
   // WioCellularがOFFになっているかどうか確かめる
   if (!WioCellular.getInterface().isActive()) {
     Serial.println("WioCellularはすでにOFFになっていたため、delay関数でPOWER_OFF_INTERVAL時間待ち、OFFを継続します。");
-    delay(POWER_OFF_INTERVAL);
+    delay(idleSleepDuration());
     return;
   }
   WioCellular.doWorkUntil(POWER_OFF_DELAY_TIME);
@@ -1137,7 +1199,7 @@ void netPowerOffWait() {
 
   start = millis();
   Serial.print("WioCellular.doWorkUntil(POWER_OFF_INTERVAL)が開始されます。");Serial.println(start);
-  WioCellular.doWorkUntil(POWER_OFF_INTERVAL);  
+  WioCellular.doWorkUntil(idleSleepDuration());
   Serial.print("WioCellular.doWorkUntil(POWER_OFF_INTERVAL)完了にかかった時間(ms)");Serial.println(millis() - start);
 }
 

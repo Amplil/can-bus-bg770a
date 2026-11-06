@@ -39,4 +39,24 @@ inline bool hasTelemetryMeasurement(JsonObjectConst record) {
     std::isfinite(longitude) && longitude>=-180 && longitude<=180 &&
     timestamp && parseHttpTime(timestamp,epoch);
 }
+
+// An explicit heartbeat records liveness without inventing a measurement.
+inline bool isHeartbeatRecord(JsonObjectConst record) {
+  const char* type=record["type"].as<const char*>();
+  const char* timestamp=record["time"].as<const char*>();
+  int64_t epoch;
+  if(!type || std::strcmp(type,"heartbeat")!=0 || !timestamp ||
+     !parseHttpTime(timestamp,epoch))return false;
+  for(JsonPairConst field:record) {
+    if(std::strcmp(field.key().c_str(),"type")!=0 &&
+       std::strcmp(field.key().c_str(),"time")!=0 && !field.value().isNull())return false;
+  }
+  return true;
+}
+inline bool hasTelemetryRecord(JsonObjectConst record) {
+  if(record["type"].isUnbound())return hasTelemetryMeasurement(record);
+  const char* type=record["type"].as<const char*>();
+  if(type && std::strcmp(type,"telemetry")==0)return hasTelemetryMeasurement(record);
+  return isHeartbeatRecord(record);
+}
 }

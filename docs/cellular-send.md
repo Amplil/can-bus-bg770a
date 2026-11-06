@@ -63,8 +63,21 @@ upload, even though no upload had been accepted.
   records count `0` and an empty code string. Unsupported multiframe DTC replies
   retain the `MULTI` marker with a `null` count. After pending CAN replies finish,
   rows with no OBD measurement, DTC result or valid GPS fix are discarded; the
-  sender also rejects them before opening a socket. A zero-speed-only reading
+  sender also rejects such unmarked rows before opening a socket. A zero-speed-only reading
   and a GPS-only reading are both eligible.
+- At startup, as soon as LTE, device identity and validated UTC are ready, the
+  device sends a separate heartbeat before beginning initial GNSS acquisition.
+  One hour after each acknowledged heartbeat, the modem wakes and sends another
+  separate `data` row containing only `time` and
+  `type: "heartbeat"`. It never inserts zero-valued vehicle readings. A missing
+  validated UTC clock, busy modem/CAN owner or unavailable network defers delivery;
+  an unconfirmed send retains its timestamp for a 30-second retry. Idle sleep
+  ends by the hourly deadline. Only successful heartbeat delivery resets that
+  deadline; normal OBD/GPS uploads cannot postpone or satisfy a heartbeat. A
+  heartbeat does not count as vehicle activity. The companion dashboard stores and labels these
+  rows on the data page while excluding them from measurement charts and summaries.
+  Deploy its heartbeat database migration and dashboard update before flashing
+  the updated device firmware.
 - Each send contains a complete JSON envelope with a prefix of records fitting
   a conservative 1,024-byte application budget. Only that acknowledged prefix is
   removed; remaining records are sent after about one second when the AT/CAN

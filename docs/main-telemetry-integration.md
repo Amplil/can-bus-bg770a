@@ -3,16 +3,21 @@
 Base: `Amplil/can-bus-bg770a` main `93af60465fbfec11a852343c302180161a5ae251`.
 This ports the requested functionality, not the old main snapshot. The new main's
 `imsi` + `data[]` envelope, numeric record keys (including odometer), DTC strings,
-30-second send interval, CAN power gating and ten-minute idle sleep remain.
-Hourly heartbeat intent is retained locally; the ingest endpoint rejects empty records,
-so no empty heartbeat payload is sent. UTC ISO8601 `time` retains its string type and explicit offset;
+30-second measurement send interval and CAN power gating remain. Idle sleep is
+at most ten minutes and ends by the next hourly heartbeat deadline.
+An explicit timestamp-only heartbeat is due at startup as soon as LTE, device
+identity and validated UTC are available, including when no OBD or GPS reading
+is available. Further heartbeats are due one hour after the last acknowledged
+heartbeat, independently of measurement uploads.
+UTC ISO8601 `time` retains its string type and explicit offset;
 the previous code incorrectly relabeled local time with +09:00 and mishandled
 long uptime. Added metadata is optional for consumers. The companion dashboard
 accepts the root GNSS location and preserves its acquisition time separately
 from OBD record time. Each OBD numeric field and DTC field starts as JSON `null`
 and is populated only by an accepted reply. A measured zero remains numeric `0`.
-A row with no acquired OBD measurement, DTC result or valid GPS fix is discarded
-before upload. A real GPS-only row is eligible while all OBD fields remain `null`.
+A measurement row with no acquired OBD measurement, DTC result or valid GPS fix
+is discarded before upload. An explicit heartbeat is stored separately from
+measurement rows. A real GPS-only row is eligible while all OBD fields remain `null`.
 
 ## Complete fork inventory (2026-11-05)
 
@@ -172,7 +177,7 @@ An accepted no-fault Mode 03 reply records DTC count `0` and code string `""`,
 including when it is the first acquisition in a row. An unanswered or rejected
 DTC request leaves those fields `null`. Before sending, the sketch removes rows
 whose ten OBD numeric fields and DTC result are all unavailable and which carry
-no valid GPS fix; a second transport guard refuses such rows. Removal waits for
+no valid GPS fix; a second transport guard refuses such unmarked rows. Removal waits for
 outstanding CAN replies to finish. A validated zero speed, temperature, RPM or
 other measurement is eligible for upload even when no other PID returned data.
 The startup GPS-only row is eligible independently of all PID responses.
@@ -295,11 +300,62 @@ endings were normalized while editing it. No setting is automatically swept or
 changed on a live bus after a configuration failure; check stage logs and retry
 explicit initialization with the verified settings.
 
-### Ingest acknowledgments and empty heartbeat
+### Ingest acknowledgments and hourly heartbeat
 
-The actual sender now refuses empty `data[]` before opening a socket. The hourly
-heartbeat becomes a local pending flag/log and is satisfied only by a later accepted
-measured payload. No invented zero measurement is added to satisfy the server.
+The sender refuses empty `data[]` before opening a socket. It sends a separate
+heartbeat document at startup as soon as LTE, device identity and validated UTC
+are ready, then one hour after each acknowledged heartbeat:
+
+```json
+{"imsi":"<device identity>","data":[{"time":"2026-11-06T12:00:00+00:00","type":"heartbeat"}]}
+```
+
+The modem wakes for a due heartbeat even without CAN activity. Each idle sleep
+is capped at the remaining time to that deadline. Pending CAN replies, GNSS
+radio work, LTE reattachment and unavailable UTC defer the send until the shared
+modem and a validated clock are available. A failed or unconfirmed send retains
+the original heartbeat timestamp and retries at the normal 30-second interval.
+Only a positive heartbeat acknowledgment starts the next hour. Accepted OBD
+and GPS uploads do not reset that interval, discard a pending heartbeat or
+replace its retained timestamp. Queued measurement/GPS rows do not block a due
+heartbeat. A ready startup heartbeat is attempted before initial GNSS acquisition;
+an already active acquisition finishes before the heartbeat uses the radio.
+Heartbeats do not update the vehicle-activity timer or populate any measurement.
+
+The companion dashboard accepts only explicitly marked heartbeat rows without
+readings, saves their type, and shows them as `生存確認` on its data
+page together with the latest communication and heartbeat timestamps. The page
+retries initial device discovery and periodically checks for saved records even
+while WebSocket is connected. Unmarked
+timestamp-only rows remain invalid. Heartbeats are excluded from measurement
+charts and summaries. Apply the dashboard's additive heartbeat database migration
+and update the dashboard before flashing firmware that emits this record type.
+
+Local heartbeat validation on 2026-11-06 passed the safe cellular host suite
+(NTP, GNSS, startup, OBD, telemetry services, timestamp handling, ACK parsing,
+batching, record validation and UART driver). The final extracted-sketch suite
+passed its default case and 47 named scenarios, including fifteen heartbeat cases:
+immediate ready startup before GNSS, delayed UTC/identity/LTE readiness without
+waiting an hour, startup with queued measurements, an hourly schedule independent
+of accepted OBD/GPS uploads, retained heartbeat timestamps across measurement
+acknowledgments, delivery despite a rejected GPS upload, hourly wake/send,
+timestamp retention and retry, registration recovery, pending CAN responses,
+continued CAN polling after rejection and without LTE, and sleep deadlines
+across timer wrap.
+
+At startup the USB serial log reports `[HEARTBEAT] status=due reason=startup`.
+A supported positive response then produces `[HEARTBEAT] status=accepted`.
+`status=unconfirmed` means the timestamp remains pending for retry; an unavailable
+validated clock is reported as `status=deferred reason=UTC_unavailable`.
+
+The complete sketch also compiled with the installed Arduino toolchain for
+`SeeedJP:nrf52:wio_bg770a`, board version 1.0, core 1.5.0, WioCellular 0.3.12
+and ArduinoJson 7.4.2: 176,460 bytes of program storage and 12,732 bytes of global
+RAM. These installed library versions differ from the PlatformIO pins; the
+PlatformIO profiles were not rebuilt for heartbeat validation. Host socket and
+modem responses are simulated. No board was flashed and hourly physical
+delivery, deployed dashboard behavior and the database migration still require
+verification on the target system.
 
 [SORACOM's documented TCP reply](https://users.soracom.io/ja-jp/docs/unified-endpoint/settings/)
 is numeric status plus body. Unified status 207 means partial failure; 200 means
@@ -331,7 +387,7 @@ were not copied into tests, documentation or PR text. Fixtures use synthetic lab
 Host regressions cover startup scheduling, absent/negative/malformed/late bitmap,
 finite retries and legacy telemetry availability, known exclusions, configuration
 failure with no unconfigured transmission, actual UART command/legacy PID byte
-layout, empty 30-second send, deferred heartbeat, fragmented numeric 400/207/200,
+layout, empty 30-second send, fragmented numeric 400/207/200,
 unknown/truncated ACKs and prior arbitration/sleep/DTC deadline cases. All three
 host suites and seven target profiles passed locally. Latest main remains 93af604.
 **Physical retest of this patch: NOT DONE.** No board flashing or main merge was

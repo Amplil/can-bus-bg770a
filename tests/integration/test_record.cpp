@@ -80,5 +80,37 @@ int main() {
   assert(!bg770a::hasTelemetryMeasurement(record));
   record["longitude"]=nullptr;
   assert(!bg770a::hasTelemetryMeasurement(record));
-  std::cout<<"All OBD fields preserve numeric zero versus null through JSON batching; invalid values and empty rows rejected\n";
+
+  // Heartbeats require an explicit marker and valid UTC time; they are never
+  // treated as acquired measurements or padded with invented numeric values.
+  source.clear();source["imsi"]="synthetic-device";
+  record=source["data"].to<JsonArray>().add<JsonObject>();
+  record["time"]="2026-11-06T10:44:59+00:00";
+  assert(!bg770a::hasTelemetryRecord(record));
+  record["type"]="heartbeat";
+  assert(bg770a::isHeartbeatRecord(record));
+  assert(bg770a::hasTelemetryRecord(record));
+  assert(!bg770a::hasTelemetryMeasurement(record));
+  assert(bg770a::makeTelemetryBatch(source,batch,1024)==1);
+  std::string heartbeatEncoded;serializeJson(batch,heartbeatEncoded);
+  JsonDocument heartbeatDecoded;assert(!deserializeJson(heartbeatDecoded,heartbeatEncoded));
+  JsonObjectConst heartbeatSent=heartbeatDecoded["data"][0].as<JsonObjectConst>();
+  assert(heartbeatSent.size()==2 && heartbeatSent["type"]=="heartbeat");
+  assert(heartbeatSent["time"]=="2026-11-06T10:44:59+00:00");
+  record["time"]="invalid";assert(!bg770a::isHeartbeatRecord(record));
+  assert(!bg770a::hasTelemetryRecord(record));
+  record.remove("time");assert(!bg770a::isHeartbeatRecord(record));
+  record["time"]="2026-11-06T10:44:59+00:00";
+  record["type"]="unknown";assert(!bg770a::hasTelemetryRecord(record));
+  record["type"]="telemetry";assert(!bg770a::hasTelemetryRecord(record));
+  record["engine_rpm"]=0;assert(bg770a::hasTelemetryRecord(record));
+  record.remove("engine_rpm");
+  record["type"]="heartbeat";record["engine_rpm"]=0;
+  assert(!bg770a::isHeartbeatRecord(record));
+  assert(!bg770a::hasTelemetryRecord(record));
+  record.remove("engine_rpm");record["latitude"]=0;
+  assert(!bg770a::isHeartbeatRecord(record));
+  record.remove("latitude");record["dtc_count"]=0;
+  assert(!bg770a::isHeartbeatRecord(record));
+  std::cout<<"Measured zero stays distinct from null; explicit timestamp-only heartbeats batch without fake measurements\n";
 }

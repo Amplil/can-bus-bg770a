@@ -99,6 +99,10 @@ static bool CanReady=true,HaveCanActivity=false,ModemSleeping=false,DtcWaiting=f
 enum class StartupLocationState {Pending,Acquiring,Upload,Complete};
 static StartupLocationState StartupLocation=StartupLocationState::Pending;
 static JsonDocument StartupLocationDoc;
+static JsonDocument HeartbeatDoc;
+static uint32_t LastHeartbeatAck=0,LastHeartbeatAttempt=0;
+static bool HeartbeatAcknowledged=false;
+static bool HeartbeatAttempted=false;
 static bool StartupLocationAttempted=false;
 static uint32_t StartupLocationLastAttempt=0;
 static bool CellularReady=true;
@@ -122,12 +126,13 @@ static void serviceModem(bool,bool);
 bool getTime(char*);
 static std::string httpTime;
 static unsigned identityCalls=0,httpCalls=0;
+static bool identityAvailable=true;
 static bool getTimeFromWorldTimeApiHttp(char* out){
  ++httpCalls;assert(SynchronousModem);const auto before=WioCellular.uart.tx;
  serviceModem(true,true);assert(WioCellular.uart.tx==before);
  std::strncpy(out,httpTime.c_str(),63);out[63]=0;return !httpTime.empty();
 }
-bool getIMSI(char* out){++identityCalls;std::strcpy(out,"fixture-device");return true;}
+bool getIMSI(char* out){++identityCalls;if(!identityAvailable)return false;std::strcpy(out,"fixture-device");return true;}
 void initCAN();
 void netPowerOffWait(){assert(Services.atIdle());++powerOffs;ModemSleeping=true;}
 void netPowerOnRestart(){assert(Services.atIdle());++powerOns;Services.powerCycle();ModemSleeping=false;WioNetwork.state=Network::NetworkState::Connected;}
@@ -137,6 +142,8 @@ static void discardEmptyVehicleRecords();
 static bool cellularSend(const JsonDocument&);
 static bool queueStartupLocation();
 static bool serviceStartupLocation();
+static bool serviceHeartbeat();
+static uint32_t idleSleepDuration();
 static unsigned socketOpens=0;
 static uint32_t socketDelay=0;
 static bool socketOpenResult=true,socketConnectResult=true;
@@ -169,7 +176,7 @@ bool arrayEmptyCheck(JsonArrayConst);
 for signature in ['static bool canIdle()', 'static bool cellularOnline()', 'static void trace(', 'static bool hasGpsPosition(', 'static size_t gpsRowCount(', 'static std::string gpsPayloadTime(', 'static void logGpsPosition(', 'static void logGpsPayload(', 'static void logGpsDiagnostic()', 'static const char* rejectionName(', 'static void traceFrame(', 'static void tickCan(', 'static void canSummary()', 'static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(', 'static bool waitForCellularNetwork(',
  'static void attachFreshLocation()', 'static bool queueStartupLocation()', 'static bool dispatchServiceLine(', 'static bool serviceStartupLocation()', 'static bool cellularSend(const JsonDocument &doc)', 'void initCAN() {', 'String dtcToString(', 'void processDtcData(unsigned char* data)',
  'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void clearSentData(', 'static void discardEmptyVehicleRecords() {', 'static void initializeVehicleDataSchema() {',
- 'String addMillisTime() {', 'bool getTime(char* time) {', 'bool arrayEmptyCheck(', 'void sendDtcRequest() {','void loop() {']:
+ 'String addMillisTime() {', 'bool getTime(char* time) {', 'bool arrayEmptyCheck(', 'void sendDtcRequest() {', 'static bool serviceHeartbeat()', 'static uint32_t idleSleepDuration()', 'void loop() {']:
     source+=function(signature)+'\n'
 source+=r'''
 static void pollUntilSend(unsigned expected) {
@@ -182,9 +189,9 @@ static void startupReply(const char* command) {
  assert(WioCellular.uart.tx.compare(WioCellular.uart.tx.size()-sent.size(),sent.size(),sent)==0);
  assert(dispatchServiceLine(command));assert(dispatchServiceLine("OK"));loop();
 }
-static void completeStartupGnss(bool hasFix=true,bool registered=true) {
+static void completeStartupGnss(bool hasFix=true,bool registered=true,unsigned priorSends=0) {
  loop();assert(StartupLocation==StartupLocationState::Acquiring);
- assert(sendCalls==0 && can.sent.empty());
+ assert(sendCalls==priorSends && can.sent.empty());
  startupReply("AT+CFUN=4");startupReply("AT+QGPS=1");
  if(hasFix) {
   nowMs+=1000;loop();
@@ -206,6 +213,10 @@ static size_t logCount(const std::string& token) {
  return result;
 }
 int main(int argc,char** argv){
+ // Legacy scenarios start from an acknowledged heartbeat so their existing
+ // telemetry/GNSS assertions retain their original setup. Boot scenarios use
+ // the actual firmware default: no heartbeat has been acknowledged yet.
+ if(argc<=1 || std::string(argv[1]).find("heartbeat-startup-")!=0)HeartbeatAcknowledged=true;
  if(argc>1 && std::string(argv[1])=="gps-observability") {
   // Synthetic modem replies: coordinates are published only after final OK.
   Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;CanReady=false;
@@ -752,17 +763,239 @@ int main(int argc,char** argv){
   nowMs=123060;loop();pollUntilSend(3);assert(dataArray.size()==0 && sendCalls==3);
   std::cout<<"Actual sender skips empty data; fragmented 400/207 retain queue and 200 clears it\n";return 0;
  }
- if(argc>1 && std::string(argv[1])=="heartbeat-deferred") {
+ if(argc>1 && std::string(argv[1])=="heartbeat-hourly") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
+  CanReady=false;
   Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
-  sendResult=true;nowMs=30001;loop();assert(sendCalls==0);
-  nowMs=ACK_INTERVAL+61000;loop();
-  for(unsigned n=0;n<400 && !powerOffs;++n){nowMs+=10;loop();}
-  assert(HeartbeatPending && socketOpens==0 && powerOns==0 && powerOffs==1);
-  assert(dataArray.size()==0);ModemSleeping=false;
+  sendResult=true;nowMs=60001;loop();assert(sendCalls==0 && ModemSleeping);
+  CanReady=false;nowMs=ACK_INTERVAL-1;loop();assert(sendCalls==0);
+  CanReady=false;nowMs=ACK_INTERVAL;loop();pollUntilSend(1);
+  assert(powerOns==1 && socketOpens==1 && dataArray.size()==0);
+  assert(!HeartbeatPending && HeartbeatDoc["data"].size()==0);
+  JsonDocument sent;assert(!deserializeJson(sent,SentPayloads.back()));
+  JsonObjectConst row=sent["data"][0].as<JsonObjectConst>();
+  assert(sent["imsi"]=="fixture-device" && sent["data"].size()==1);
+  assert(row.size()==2 && row["type"]=="heartbeat");
+  assert(bg770a::isHeartbeatRecord(row) && !bg770a::hasTelemetryMeasurement(row));
+  int64_t epoch;assert(bg770a::parseHttpTime(row["time"].as<const char*>(),epoch));
+  assert(epoch>=1735689599LL+static_cast<int64_t>(ACK_INTERVAL/1000));
+  const auto accepted=LastHeartbeatAck;assert(uint32_t(nowMs-accepted)<1000);
+  CanReady=false;nowMs=accepted+ACK_INTERVAL-1;loop();assert(sendCalls==1);
+  CanReady=false;nowMs=accepted+ACK_INTERVAL;loop();pollUntilSend(2);
+  assert(!HeartbeatPending && dataArray.size()==0);
+  std::cout<<"No-data hourly heartbeat wakes sleeping modem and sends only a timestamp plus heartbeat marker\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-retry") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;CanReady=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();sendResult=true;
+  ReplyChunks={"400 {\"error\":\"Invalid payload shape\"}"};
+  nowMs=ACK_INTERVAL;loop();pollUntilSend(1);
+  assert(HeartbeatPending && HeartbeatDoc["data"].size()==1 && LastHeartbeatAck==0);
+  JsonDocument first;assert(!deserializeJson(first,SentPayloads.back()));
+  const std::string originalTime=first["data"][0]["time"].as<std::string>();
+  assert(!originalTime.empty() && dataArray.size()==0);
+  ReplyChunks={"200 {\"ok\":true}"};
+  nowMs+=1000;loop();assert(sendCalls==1 && HeartbeatPending);
+  CanReady=false;nowMs+=31000;loop();pollUntilSend(2);
+  JsonDocument retry;assert(!deserializeJson(retry,SentPayloads.back()));
+  assert(retry["data"][0]["time"].as<std::string>()==originalTime);
+  assert(retry["data"][0].size()==2 && !HeartbeatPending);
+  assert(HeartbeatDoc["data"].size()==0 && LastHeartbeatAck>0 && dataArray.size()==0);
+  std::cout<<"Rejected heartbeat keeps original timestamp and retries after30s until accepted\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-unsynced") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;CanReady=false;loop();
+  sendResult=true;ModemSleeping=true;nowMs=ACK_INTERVAL;loop();
+  assert(powerOns==1 && !ModemSleeping && HeartbeatPending);
+  assert(socketOpens==0 && sendCalls==0 && HeartbeatDoc["data"].size()==0);
+  Services.clock.seedFallback(1735689599LL,Services.now(nowMs));
+  nowMs+=61000;loop();pollUntilSend(1);
+  assert(!HeartbeatPending && dataArray.size()==0);
+  std::cout<<"Heartbeat waits for validated UTC instead of inventing a date, then sends once synchronized\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-independent-cadence") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;CanReady=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();sendResult=true;
+  const auto heartbeatAck=LastHeartbeatAck;
+  // Successful OBD uploads and ten-minute GPS uploads must never postpone the
+  // next heartbeat. Normal telemetry also remains queued when heartbeat sends.
+  for(unsigned n=1;n<=5;++n) {
+   nowMs=n*600000;initializeVehicleDataSchema();vehicleData["vehicle_speed"]=0;
+   assert(cellularSend(JsonDoc));clearSentData(LastSentRecords);
+   assert(LastHeartbeatAck==heartbeatAck && HeartbeatAcknowledged);
+   StartupLocationDoc.clear();StartupLocationDoc["imsi"]="fixture-device";
+   JsonObject gps=StartupLocationDoc["data"].to<JsonArray>().add<JsonObject>();
+   gps["time"]="2026-11-06T10:44:59+00:00";
+   gps["gps_time"]="2026-11-06T10:44:59.000+00:00";
+   gps["latitude"]=0;gps["longitude"]=0;
+   assert(cellularSend(StartupLocationDoc));StartupLocationDoc.clear();
+   assert(LastHeartbeatAck==heartbeatAck && HeartbeatAcknowledged);
+  }
+  assert(sendCalls==10);
+  nowMs=ACK_INTERVAL-1;assert(!serviceHeartbeat());assert(sendCalls==10);
   initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;
-  nowMs+=31000;loop();pollUntilSend(1);assert(!HeartbeatPending && sendCalls==1);
-  std::cout<<"Empty heartbeat remains pending locally until a measured payload succeeds\n";return 0;
+  nowMs=ACK_INTERVAL;assert(serviceHeartbeat());assert(sendCalls==11);
+  JsonDocument heartbeat;assert(!deserializeJson(heartbeat,SentPayloads.back()));
+  assert(heartbeat["data"][0]["type"]=="heartbeat");
+  assert(dataArray.size()==1 && vehicleData["engine_rpm"]==2000);
+  assert(!HeartbeatPending && LastHeartbeatAck>=ACK_INTERVAL);
+  std::cout<<"Hourly heartbeat schedule is independent of successful OBD/GPS uploads and preserves queued readings\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-registration") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;CanReady=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();sendResult=true;
+  Services.line("+CEREG: 0",1000);nowMs=ACK_INTERVAL;Services.tick(nowMs);
+  assert(Services.gnss.takeCommand()=="AT+CEREG?\r");
+  Services.line("AT+CEREG?",nowMs);Services.line("+CEREG: 1,2",nowMs);Services.line("OK",nowMs);
+  assert(Services.atIdle() && !Services.idle());
+  serviceHeartbeat();assert(sendCalls==0 && socketOpens==0);
+  nowMs+=5000;Services.tick(nowMs);assert(Services.gnss.takeCommand()=="AT+CEREG?\r");
+  Services.line("AT+CEREG?",nowMs);Services.line("+CEREG: 1,5",nowMs);Services.line("OK",nowMs);
+  loop();pollUntilSend(1);assert(!HeartbeatPending && dataArray.size()==0);
+  std::cout<<"Due heartbeat waits through missing registration and sends after confirmed LTE recovery\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-pending-can") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;CanReady=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();sendResult=true;
+  nowMs=ACK_INTERVAL;uint8_t pid;assert(Obd.next(nowMs,pid));assert(Obd.waiting());
+  serviceHeartbeat();assert(socketOpens==0 && sendCalls==0);
+  nowMs+=201;loop();pollUntilSend(1);
+  assert(!HeartbeatPending && !Obd.waiting() && dataArray.size()==0);
+  std::cout<<"Due heartbeat defers socket work until an outstanding ECU response deadline ends\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-keeps-polling") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();sendResult=true;
+  ReplyChunks={"400 {\"error\":\"Invalid payload shape\"}"};
+  nowMs=ACK_INTERVAL;assert(serviceHeartbeat());assert(sendCalls==1 && HeartbeatPending);
+  const auto pendingTime=HeartbeatDoc["data"][0]["time"].as<std::string>();
+  const auto before=can.sent.size();nowMs+=10;loop();
+  assert(can.sent.size()>before && Obd.waiting() && powerOffs==0);
+  ReplyChunks={"200 {\"ok\":true}"};bool rpmQueued=false;
+  for(unsigned n=0;n<400 && dataArray.size()==0;++n) {
+   if(Obd.waiting() && !can.sent.empty() && can.sent.back()[1]==1) {
+    if(can.sent.back()[2]==0)can.rx.push_back({0x7E8,{6,0x41,0,0,0x18,0,0,0}});
+    if(can.sent.back()[2]==0x0C && !rpmQueued) {
+     can.rx.push_back({0x7E8,{4,0x41,0x0C,0x1F,0x40,0,0,0}});rpmQueued=true;
+    }
+   }
+   nowMs+=10;loop();
+  }
+  assert(rpmQueued && dataArray.size()==1 && HeartbeatPending && powerOffs==0);
+  // A normal successful upload cannot cancel a failed heartbeat or alter its
+  // retained timestamp. It remains due until its own acknowledgment arrives.
+  nowMs+=201;serviceCan();assert(canIdle());
+  assert(cellularSend(JsonDoc));clearSentData(LastSentRecords);
+  assert(sendCalls==2 && HeartbeatPending && LastHeartbeatAck==0);
+  assert(HeartbeatDoc["data"][0]["time"].as<std::string>()==pendingTime);
+  CanReady=false;nowMs=ACK_INTERVAL+31000;loop();pollUntilSend(3);
+  JsonDocument retried;assert(!deserializeJson(retried,SentPayloads.back()));
+  assert(retried["data"][0]["type"]=="heartbeat");
+  assert(retried["data"][0]["time"].as<std::string>()==pendingTime);
+  assert(!HeartbeatPending && HeartbeatDoc["data"].size()==0 && dataArray.size()==0);
+  std::cout<<"Failed heartbeat permits CAN acquisition; successful telemetry preserves the heartbeat timestamp until its own retry succeeds\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-offline-polling") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();sendResult=true;
+  Services.line("+CEREG: 0",1000);nowMs=ACK_INTERVAL;
+  for(unsigned n=0;n<100;++n){nowMs+=10;loop();}
+  assert(HeartbeatPending && sendCalls==0 && socketOpens==0);
+  assert(can.sent.size()>0 && CanStats.queued>0 && powerOffs==0);
+  std::cout<<"Missing LTE registration leaves heartbeat due while CAN polling continues without idle sleep\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-startup-ready") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;CanReady=false;sendResult=true;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));
+  assert(!HeartbeatAcknowledged && !deviceIMSI[0]);loop();
+  assert(sendCalls==1 && HeartbeatAcknowledged && !HeartbeatPending);
+  assert(nowMs<CELLULAR_INTERVAL && dataArray.size()==0);
+  assert(StartupLocation==StartupLocationState::Pending);
+  assert(WioCellular.uart.tx.find("AT+CFUN=4")==std::string::npos);
+  JsonDocument heartbeat;assert(!deserializeJson(heartbeat,SentPayloads.back()));
+  assert(heartbeat["data"].size()==1 && heartbeat["data"][0].size()==2);
+  assert(heartbeat["data"][0]["type"]=="heartbeat");
+  loop();assert(StartupLocation==StartupLocationState::Acquiring);
+  std::cout<<"First ready boot loop sends a timestamp-only heartbeat before startup GNSS acquisition\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-startup-unsynced") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;CanReady=false;sendResult=true;
+  loop();assert(!HeartbeatAcknowledged && HeartbeatPending && socketOpens==0);
+  assert(HeartbeatDoc["data"].size()==0);
+  nowMs=31000;Services.clock.seedFallback(1735689599LL,Services.now(nowMs));loop();
+  assert(sendCalls==1 && HeartbeatAcknowledged && !HeartbeatPending && nowMs<ACK_INTERVAL);
+  std::cout<<"Boot heartbeat waits for real UTC and sends on early synchronization without an hourly delay\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-startup-identity") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;CanReady=false;sendResult=true;
+  identityAvailable=false;Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  assert(!HeartbeatAcknowledged && HeartbeatPending && socketOpens==0 && !deviceIMSI[0]);
+  nowMs=1000;identityAvailable=true;loop();
+  assert(sendCalls==1 && HeartbeatAcknowledged && !HeartbeatPending && nowMs<ACK_INTERVAL);
+  std::cout<<"Boot heartbeat waits for device identity and sends immediately when IMSI becomes available\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-startup-lte-backlog") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;CanReady=false;CellularReady=false;
+  WioNetwork.state=Network::NetworkState::Offline;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;
+  nowMs=60000;loop();assert(HeartbeatPending && !HeartbeatAcknowledged && sendCalls==0);
+  assert(StartupLocation==StartupLocationState::Pending && dataArray.size()==1);
+  CellularReady=true;WioNetwork.state=Network::NetworkState::Connected;sendResult=true;
+  nowMs+=10;loop();assert(sendCalls==1 && HeartbeatAcknowledged && !HeartbeatPending);
+  assert(StartupLocation==StartupLocationState::Pending && dataArray.size()==1);
+  JsonDocument heartbeat;assert(!deserializeJson(heartbeat,SentPayloads.back()));
+  assert(heartbeat["data"][0]["type"]=="heartbeat");
+  completeStartupGnss(false,true,1);pollUntilSend(2);
+  assert(StartupLocation==StartupLocationState::Complete && dataArray.size()==0);
+  JsonDocument measured;assert(!deserializeJson(measured,SentPayloads.back()));
+  assert(measured["data"][0]["engine_rpm"]==2000 && nowMs<ACK_INTERVAL);
+  std::cout<<"Boot heartbeat sends on early LTE recovery before GNSS and preserves queued measurements for later upload\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-startup-retry") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;CanReady=false;sendResult=true;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));
+  ReplyChunks={"400 {\"error\":\"Invalid payload shape\"}"};loop();
+  assert(sendCalls==1 && HeartbeatPending && !HeartbeatAcknowledged);
+  const auto retainedTime=HeartbeatDoc["data"][0]["time"].as<std::string>();
+  nowMs=1000;initializeVehicleDataSchema();vehicleData["vehicle_speed"]=0;
+  ReplyChunks={"200 {\"ok\":true}"};assert(cellularSend(JsonDoc));clearSentData(LastSentRecords);
+  assert(sendCalls==2 && HeartbeatPending && !HeartbeatAcknowledged && LastHeartbeatAck==0);
+  assert(HeartbeatDoc["data"][0]["time"].as<std::string>()==retainedTime);
+  nowMs=31000;loop();pollUntilSend(3);
+  JsonDocument retry;assert(!deserializeJson(retry,SentPayloads.back()));
+  assert(retry["data"][0]["type"]=="heartbeat");
+  assert(retry["data"][0]["time"].as<std::string>()==retainedTime);
+  assert(HeartbeatAcknowledged && !HeartbeatPending && LastHeartbeatAck>=31000);
+  std::cout<<"Rejected boot heartbeat survives normal telemetry acknowledgment and retries its original timestamp before an hour\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-gps-rejection") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;CanReady=false;sendResult=true;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));
+  ReplyChunks={"400 {\"error\":\"Invalid payload shape\"}"};completeStartupGnss();
+  assert(sendCalls==1 && StartupLocation==StartupLocationState::Upload);
+  const auto gpsTime=StartupLocationDoc["data"][0]["gps_time"].as<std::string>();
+  nowMs=ACK_INTERVAL;ReplyChunks={"200 {\"ok\":true}"};loop();
+  assert(sendCalls==2 && HeartbeatAcknowledged && !HeartbeatPending);
+  JsonDocument heartbeat;assert(!deserializeJson(heartbeat,SentPayloads.back()));
+  assert(heartbeat["data"][0]["type"]=="heartbeat");
+  assert(StartupLocation==StartupLocationState::Upload);
+  assert(StartupLocationDoc["data"][0]["gps_time"].as<std::string>()==gpsTime);
+  const auto heartbeatAck=LastHeartbeatAck;loop();
+  assert(sendCalls==3 && StartupLocation==StartupLocationState::Complete);
+  assert(LastHeartbeatAck==heartbeatAck);
+  std::cout<<"Rejected GPS upload does not block a due heartbeat; subsequent GPS acknowledgment preserves heartbeat cadence\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="heartbeat-sleep-deadline") {
+  LastHeartbeatAck=0;nowMs=0;HeartbeatAcknowledged=false;
+  assert(idleSleepDuration()==0);HeartbeatAcknowledged=true;
+  assert(idleSleepDuration()==POWER_OFF_INTERVAL);
+  nowMs=ACK_INTERVAL-1234;assert(idleSleepDuration()==1234);
+  nowMs=ACK_INTERVAL;assert(idleSleepDuration()==0);
+  LastHeartbeatAck=0xFFFFF000U;nowMs=LastHeartbeatAck+ACK_INTERVAL-1234;
+  assert(idleSleepDuration()==1234);
+  nowMs=LastHeartbeatAck+ACK_INTERVAL;assert(idleSleepDuration()==0);
+  std::cout<<"Idle sleep stops at hourly heartbeat deadline, including millis wrap\n";return 0;
  }
  if(argc>1 && std::string(argv[1])=="config-failure") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
@@ -878,5 +1111,5 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','gps-observability gps-upload-failures gps-payload-prefix gps-command-timeout-log qntp-utc-metadata zero-records startup-gps-delayed-fix startup-gps-first startup-gps-only startup-gps-no-fix startup-no-fix-periodic-gps startup-no-fix-no-network startup-gps-recovery startup-ntp-first bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
+    for scenario in os.environ.get('SKETCH_SCENARIOS','gps-observability gps-upload-failures gps-payload-prefix gps-command-timeout-log qntp-utc-metadata zero-records startup-gps-delayed-fix startup-gps-first startup-gps-only startup-gps-no-fix startup-no-fix-periodic-gps startup-no-fix-no-network startup-gps-recovery startup-ntp-first bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-hourly heartbeat-retry heartbeat-unsynced heartbeat-independent-cadence heartbeat-registration heartbeat-pending-can heartbeat-keeps-polling heartbeat-offline-polling heartbeat-startup-ready heartbeat-startup-unsynced heartbeat-startup-identity heartbeat-startup-lte-backlog heartbeat-startup-retry heartbeat-gps-rejection heartbeat-sleep-deadline config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
         subprocess.run([str(exe),scenario],check=True)

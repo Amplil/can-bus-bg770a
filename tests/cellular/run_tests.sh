@@ -10,7 +10,8 @@ bash tests/gnss/run_tests.sh
 bash tests/startup/run_tests.sh
 for source in tests/obd/test_session.cpp tests/integration/test_services.cpp \
     tests/integration/test_diagnostics.cpp tests/integration/test_time_samples.cpp \
-    tests/integration/test_endpoint.cpp tests/integration/test_batch.cpp; do
+    tests/integration/test_endpoint.cpp tests/integration/test_batch.cpp \
+    tests/integration/test_record.cpp; do
   name=$(basename "$source" .cpp)
   "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -pedantic -fsanitize=undefined \
     -Isrc -I"$json_include" -Itests/gnss/fixtures/test-support \

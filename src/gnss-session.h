@@ -104,6 +104,7 @@ private:
 public:
   void recover() { resetNeeded(); }
   State state() const { return state_; }
+  bool disabled() const { return disabled_; }
   bool modemIdle() const { return state_ == State::Idle; }
   bool canSend() const { return modemIdle() && registered_; }
   int registrationStatus() const { return registrationStatus_; }

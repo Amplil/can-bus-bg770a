@@ -1,22 +1,42 @@
 #pragma once
 #include <ArduinoJson.h>
+#include "telemetry-time.h"
 #include <cmath>
 #include <cstring>
 
 namespace bg770a {
-// Required wire fields have zero defaults. A default-filled row (including an
-// empty Mode 03 reply) carries no vehicle measurement and must never be sent.
-// A stopped vehicle still qualifies through voltage, temperature, distance, etc.
+inline void initializeObdFields(JsonObject record) {
+  static const char* const fields[]={"engine_rpm","vehicle_speed","coolant_temp",
+    "engine_load","intake_air_temp","throttle_position","distance_traveled",
+    "odometer","control_module_voltage","ambient_air_temp","dtc_codes","dtc_count"};
+  for(const char* field:fields)record[field]=nullptr;
+}
+// Unreceived OBD fields are null. Any finite acquired value, including zero,
+// qualifies; a validated no-fault Mode 03 reply is also an acquired result.
+// Rows containing only null OBD fields or non-OBD metadata must never be sent.
 inline bool hasVehicleMeasurement(JsonObjectConst record) {
   static const char* const fields[]={"engine_rpm","vehicle_speed","coolant_temp",
     "engine_load","intake_air_temp","throttle_position","distance_traveled",
     "odometer","control_module_voltage","ambient_air_temp"};
   if(record.isNull())return false;
   for(const char* field:fields) {
+    if(!record[field].is<double>())continue;
     const double value=record[field].as<double>();
-    if(std::isfinite(value) && value!=0)return true;
+    if(std::isfinite(value))return true;
   }
-  const char* codes=record["dtc_codes"] | "";
-  return record["dtc_count"].as<unsigned>()>0 || std::strspn(codes," \t\r\n")!=std::strlen(codes);
+  if(record["dtc_count"].is<unsigned>())return true;
+  const char* codes=record["dtc_codes"].as<const char*>();
+  return codes && (!*codes || std::strspn(codes," \t\r\n")!=std::strlen(codes));
+}
+// A timestamped GPS fix can be uploaded before any OBD response is available.
+inline bool hasTelemetryMeasurement(JsonObjectConst record) {
+  if(hasVehicleMeasurement(record))return true;
+  if(!record["latitude"].is<double>() || !record["longitude"].is<double>())return false;
+  const double latitude=record["latitude"].as<double>(),longitude=record["longitude"].as<double>();
+  const char* timestamp=record["gps_time"].as<const char*>();
+  int64_t epoch;
+  return std::isfinite(latitude) && latitude>=-90 && latitude<=90 &&
+    std::isfinite(longitude) && longitude>=-180 && longitude<=180 &&
+    timestamp && parseHttpTime(timestamp,epoch);
 }
 }

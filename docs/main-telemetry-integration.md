@@ -9,9 +9,10 @@ so no empty heartbeat payload is sent. UTC ISO8601 `time` retains its string typ
 the previous code incorrectly relabeled local time with +09:00 and mishandled
 long uptime. Added metadata is optional for consumers. The companion dashboard
 accepts the root GNSS location and preserves its acquisition time separately
-from OBD record time. Required numeric keys retain the main's zero defaults;
-these are placeholders for missing measurements, not evidence of PID support.
-An entire default-filled row with no DTC information is discarded before upload.
+from OBD record time. Each OBD numeric field and DTC field starts as JSON `null`
+and is populated only by an accepted reply. A measured zero remains numeric `0`.
+A row with no acquired OBD measurement, DTC result or valid GPS fix is discarded
+before upload. A real GPS-only row is eligible while all OBD fields remain `null`.
 
 ## Complete fork inventory (2026-11-05)
 
@@ -45,7 +46,7 @@ with a 64-bit monotonic counter; resync is due every six hours, stale after 24.
 Startup services CAN while waiting for NTP (135-second overall wait). Existing
 WorldTimeAPI HTTP fallback is retained with two bounded attempts, complete JSON
 validation and offset parsing. It is labeled `http_fallback`, never `ntp`. HTTP
-is unauthenticated as in main. Failure of both sources defers timestamped records
+is unauthenticated as in main. Failure of both sources defers timestamped OBD records
 and retries fallback while online, rather than inventing a date or rebooting.
 
 `time_source`, `time_sync_state`, `utc_epoch_s` accompany each acquired record;
@@ -61,35 +62,56 @@ supported hardware and firmware configuration.
 
 ## GNSS
 
-The first accepted telemetry upload and an empty remaining queue precede GNSS.
-Subsequent acquisition starts are due every ten minutes, measured from the
-previous acquisition start. NTP, active CAN replies, queued telemetry, LTE
-availability and modem ownership can defer a due acquisition. GNSS temporarily
-takes LTE offline, searches for up to 30 seconds, stops GNSS and restores
-LTE/registration. A pending command may add its 20-second deadline. CAN
-receive/validation continues during this process. Command errors or uncertain
-boundaries use bounded reset/boot recovery.
+After network/time setup and device identification, the first bounded GNSS
+attempt precedes normal OBD polling and telemetry uploads. A valid fix becomes
+a GPS-only row and is sent as soon as LTE/registration is restored, independently
+of ECU availability or OBD responses. The row uses GNSS UTC seconds for `time`,
+the exact acquisition time including milliseconds for `gps_time`, and direct
+per-record `latitude`, `longitude` and `altitude`. All OBD and DTC fields remain
+`null`. OBD collection resumes once the fix is queued, while ordinary OBD
+uploads and idle sleep wait for its acknowledgment. The separate GPS document
+survives bounded OBD-queue eviction during prolonged delivery failure. A
+rejected or unconfirmed upload retains the row for the normal 30-second retry.
+A no-fix startup attempt resumes normal OBD acquisition without
+inventing coordinates or numeric zero readings.
 
-A valid fix may be reported for up to ten minutes after receipt so LTE
-reattachment lasting over one minute does not discard it. Freshness is rechecked
-after TCP connection setup. No-fix and expired-fix paths omit `location`; no zero
-coordinates are substituted. Each acquisition begins with a cleared fix.
-Location describes the timestamped GNSS fix for the envelope, independently of
-every queued historical OBD record.
+Subsequent acquisition starts are due every ten minutes, measured from the
+previous acquisition start, after the initial attempt completes and the OBD
+queue drains. If the initial attempt found a fix, its upload must first be
+confirmed. A no-fix startup result permits periodic acquisition even before any
+upload succeeds. Each valid periodic fix also creates a GPS-only row and is sent
+independently of OBD replies; any such queued fix must be acknowledged before a
+further acquisition starts. NTP, active CAN replies, queued telemetry, LTE availability and
+modem ownership can defer a periodic acquisition. GNSS temporarily takes LTE offline, searches for
+up to 30 seconds, stops GNSS and restores LTE/registration. A pending command may
+add its 20-second deadline. CAN receive/validation continues during this process.
+Command errors or uncertain boundaries use bounded reset/boot recovery.
+
+A cached fix may accompany ordinary OBD batches as root `location` for up to ten
+minutes after receipt so LTE reattachment lasting over one minute does not
+discard it. Freshness is rechecked after TCP connection setup. No-fix and
+expired-fix paths omit `location`; no zero coordinates are substituted. Each
+acquisition begins with a cleared fix. Root `location` describes the timestamped
+GNSS fix for the envelope, independently of every queued historical OBD record.
+Each queued GPS-only row retains its original acquisition time across
+LTE recovery and rejected uploads, including delivery delayed beyond the cached
+fix's ten-minute lifetime.
 
 `location`: latitude/longitude (degrees), altitude_m, hdop, fix_type, satellites,
 utc_hhmmss, date_ddmmyy, age_ms, source=gnss. Use a compatible **passive** GNSS
-antenna. The dashboard validates the GNSS UTC/date, attaches the location to one
+antenna. The dashboard validates the GNSS UTC/date, attaches root `location` to one
 record in the received batch and stores the actual fix time as `gps_timestamp`
 (`gpsTimestamp` in API responses). Its nullable database migration must be
 applied before running the updated dashboard. Existing record-level GPS payloads
 remain supported. HDOP remains dimensionless and is not converted to accuracy in
-meters. The map can show the latest received fix and its acquisition time even
-when later OBD records contain no GPS.
+meters. Direct per-record GPS, including the startup GPS-only row, is also
+accepted without an OBD measurement. The map can show the latest received fix
+and its acquisition time before any OBD response and retain it when later OBD
+records contain no GPS. Unavailable OBD values display as `-`.
 
-The ten-minute GNSS cadence, position accuracy and location delivery through the
-updated dashboard require physical validation. Hardware, firmware, antenna, RF,
-SIM and LTE reattachment remain relevant. GNSS and LTE are exclusive; the send
+GPS-first startup, the ten-minute GNSS cadence, position accuracy and location
+delivery through the updated dashboard require physical validation. Hardware,
+firmware, antenna, RF, SIM and LTE reattachment remain relevant. GNSS and LTE are exclusive; the send
 cadence can lengthen.
 
 ## Hustler / CAN
@@ -121,19 +143,21 @@ Discovery resets when the CAN module is reinitialized.
 A 200 ms response deadline and 100 ms minimum request gap reject unrelated,
 wrong-ECU, wrong-PID, wrong-service and malformed single-frame payloads. A
 four-second acquisition window follows the existing ten-second group interval;
-no record is created until an accepted measurement has a valid timestamp.
-An empty Mode 03 reply updates an existing row but does not create a new one.
-Before sending, the sketch removes rows whose ten OBD numeric fields are all
-zero and whose DTC count/code is empty; a second transport guard refuses such
-rows. Removal waits for outstanding CAN replies to finish. A stopped vehicle
-with a real voltage, temperature, distance or other nonzero measurement remains
-eligible, as does a record containing DTC information.
+no OBD record is created until an accepted measurement has a valid timestamp.
+An accepted no-fault Mode 03 reply records DTC count `0` and code string `""`,
+including when it is the first acquisition in a row. An unanswered or rejected
+DTC request leaves those fields `null`. Before sending, the sketch removes rows
+whose ten OBD numeric fields and DTC result are all unavailable and which carry
+no valid GPS fix; a second transport guard refuses such rows. Removal waits for
+outstanding CAN replies to finish. A validated zero speed, temperature, RPM or
+other measurement is eligible for upload even when no other PID returned data.
+The startup GPS-only row is eligible independently of all PID responses.
 
-Root `obd.supported_pids` exposes support state; zero defaults in required fields
-are not unsupported measurements. `distance_traveled` (PID 31) is distance since
+Root `obd.supported_pids` exposes support state independently of each record's
+nullable readings. `distance_traveled` (PID 31) is distance since
 DTC clear, not odometer. PID A6 remains `odometer`. Existing Mode 03 DTC read is
 retained with selected-ECU, pending-request and single-frame validation; declared DTC count and SF length are checked, hexadecimal digits are preserved. Multiframe DTC is still
-marked MULTI and is not reassembled. No Mode 04 clear, other control service or
+marked MULTI with a `null` count and is not reassembled. No Mode 04 clear, other control service or
 ISO-TP flow-control frames are added or sent by the cellular example.
 
 UART receive supplies ID + eight bytes but no true DLC/IDE/RTR. Application length

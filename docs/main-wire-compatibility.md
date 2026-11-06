@@ -4,7 +4,11 @@ Compared actual source at main `93af60465fbfec11a852343c302180161a5ae251`
 with the integration branch. `tests/compat/test_main_compatibility.py` compiles
 both real driver versions and executes their requests/configuration commands.
 It also compiles both actual record initialization/update functions and compares
-required JSON values/types. All response bytes in that test are explicitly
+required JSON values/types against that historical schema. The current nullable
+OBD/DTC defaults intentionally differ from that historical comparison; use the
+current extracted-sketch and record tests to verify the current contract. That
+historical compatibility script reads Git history and must not be run when Git
+operations are prohibited. All response bytes in that test are explicitly
 **synthetic host fixtures**, not reconstructed vehicle captures. No device
 identity from a real log is included.
 
@@ -24,7 +28,7 @@ identity from a real log is included.
 | Configuration exit | Sends AT+Q but discards its return value | Requires command and exit acknowledgment | Same positive wire commands; no ACK now blocks polling. A real module missing ACK despite working data mode could explain a difference, but is unconfirmed. Do not disable all checks blindly |
 | Mode 03 request | `02 03 00 00 00 00 00 00` | `01 03 00 00 00 00 00 00` | Intentional one-byte service request: Mode 03 has no PID. Only UART byte 6 (PCI) differs; this cannot change Mode 01 RPM request bytes |
 | Mode 03 decode | Treats bytes after service as code pairs | Counted ISO 15765 single-frame response: service 43, count, code pairs | Main's uncounted interpretation is not restored. Count must fit the declared SF payload; trailing padding is ignored. Multiframe remains MULTI, not reassembled |
-| Server JSON | Identity field + data array; time string, ten numeric telemetry fields, DTC string/count | Same required keys/types/conversions; optional provenance/location/OBD metadata | Actual schema/update functions compare equal on synthetic Mode 01 values. UTC offset is truthful rather than forcibly relabeled; strict backend acceptance of extra keys is still untested |
+| Server JSON | Identity field + data array; time string, ten numeric telemetry fields, DTC string/count | Same keys and acquired-value conversions; unavailable OBD/DTC fields are `null`; optional provenance/location/OBD metadata | Only accepted measurements populate fields. Genuine zero values and confirmed zero-DTC remain distinct from missing data. Companion dashboard schema and database columns preserve nulls. UTC offset is truthful rather than forcibly relabeled |
 | Empty data / rejected send | May send empty data, clears on received bytes | Never sends empty data; clear only on supported positive service ACK | Needed for reported endpoint rejection; heartbeat intent is locally pending rather than fabricated data |
 
 ELM Electronics' [manufacturer data sheet, p.34](https://www.elmelectronics.com/wp-content/uploads/2016/07/ELM327DS.pdf)

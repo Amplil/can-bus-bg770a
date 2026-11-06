@@ -9,7 +9,16 @@ include = pathlib.Path(os.environ.get('ARDUINOJSON_INCLUDE', root / '.pio/libdep
 if not (include / 'ArduinoJson.h').exists():
     raise SystemExit('ArduinoJson missing: run PlatformIO build or set ARDUINOJSON_INCLUDE')
 sketch = (root / 'examples/grove-can-bus-cellular/grove-can-bus-cellular.ino').read_text()
-function = sketch[sketch.index('static void attachFreshLocation() {'):sketch.index('\nstatic void abortHandler')]
+start = sketch.index('static void attachFreshLocation() {')
+end = sketch.index('{', start) + 1
+depth = 1
+while depth:
+    if sketch[end] == '{':
+        depth += 1
+    elif sketch[end] == '}':
+        depth -= 1
+    end += 1
+function = sketch[start:end]
 source = r'''
 #include <ArduinoJson.h>
 #include <telemetry-services.h>

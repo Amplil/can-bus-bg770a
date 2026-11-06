@@ -95,7 +95,12 @@ static JsonObject vehicleData;
 static char deviceIMSI[20]={};
 static bg770a::TelemetryServices Services;
 static bg770a::ObdSession Obd(false,true);
-static bool CanReady=true,TelemetryDelivered=false,HaveCanActivity=false,ModemSleeping=false,DtcWaiting=false,SynchronousModem=false,HeartbeatPending=false;
+static bool CanReady=true,HaveCanActivity=false,ModemSleeping=false,DtcWaiting=false,SynchronousModem=false,HeartbeatPending=false;
+enum class StartupLocationState {Pending,Acquiring,Upload,Complete};
+static StartupLocationState StartupLocation=StartupLocationState::Pending;
+static JsonDocument StartupLocationDoc;
+static bool StartupLocationAttempted=false;
+static uint32_t StartupLocationLastAttempt=0;
 static bool CellularReady=true;
 static uint32_t LastCellularAttempt=0;
 static constexpr uint32_t CELLULAR_RETRY_INTERVAL=60000;
@@ -130,6 +135,8 @@ void clearData();
 static void clearSentData(size_t);
 static void discardEmptyVehicleRecords();
 static bool cellularSend(const JsonDocument&);
+static bool queueStartupLocation();
+static bool serviceStartupLocation();
 static unsigned socketOpens=0;
 static uint32_t socketDelay=0;
 static std::deque<std::string> SentPayloads;
@@ -159,7 +166,7 @@ void sendDtcRequest();
 bool arrayEmptyCheck(JsonArrayConst);
 '''+defines+'\n'+constants+'\n'
 for signature in ['static bool canIdle()', 'static bool cellularOnline()', 'static void trace(', 'static const char* rejectionName(', 'static void traceFrame(', 'static void tickCan(', 'static void canSummary()', 'static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(', 'static bool waitForCellularNetwork(',
- 'static void attachFreshLocation()', 'static bool cellularSend(const JsonDocument &doc)', 'void initCAN() {', 'String dtcToString(', 'void processDtcData(unsigned char* data)',
+ 'static void attachFreshLocation()', 'static bool queueStartupLocation()', 'static bool dispatchServiceLine(', 'static bool serviceStartupLocation()', 'static bool cellularSend(const JsonDocument &doc)', 'void initCAN() {', 'String dtcToString(', 'void processDtcData(unsigned char* data)',
  'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void clearSentData(', 'static void discardEmptyVehicleRecords() {', 'static void initializeVehicleDataSchema() {',
  'String addMillisTime() {', 'bool getTime(char* time) {', 'bool arrayEmptyCheck(', 'void sendDtcRequest() {','void loop() {']:
     source+=function(signature)+'\n'
@@ -168,6 +175,30 @@ static void pollUntilSend(unsigned expected) {
  for(unsigned n=0;n<400 && sendCalls<expected;++n){nowMs+=10;loop();}
  assert(sendCalls==expected);
 }
+static void startupReply(const char* command) {
+ const std::string sent=std::string(command)+"\r";
+ assert(WioCellular.uart.tx.size()>=sent.size());
+ assert(WioCellular.uart.tx.compare(WioCellular.uart.tx.size()-sent.size(),sent.size(),sent)==0);
+ assert(dispatchServiceLine(command));assert(dispatchServiceLine("OK"));loop();
+}
+static void completeStartupGnss(bool hasFix=true,bool registered=true) {
+ loop();assert(StartupLocation==StartupLocationState::Acquiring);
+ assert(sendCalls==0 && can.sent.empty());
+ startupReply("AT+CFUN=4");startupReply("AT+QGPS=1");
+ if(hasFix) {
+  nowMs+=1000;loop();
+  assert(dispatchServiceLine("AT+QGPSLOC=2"));
+  assert(dispatchServiceLine("+QGPSLOC: 123456.789,35.12345,139.12345,1.2,12.0,3,0.00,0.0,0.0,061126,08"));
+  assert(dispatchServiceLine("OK"));loop();
+  assert(StartupLocationDoc["data"].size()==1);
+ } else {
+  nowMs+=bg770a::GnssSession::AcquisitionMs;loop();
+  assert(!Services.gnss.fix().valid);
+ }
+ startupReply("AT+QGPSEND");startupReply("AT+CFUN=1");startupReply("AT+CEREG=1");
+ assert(dispatchServiceLine("AT+CEREG?"));
+ assert(dispatchServiceLine(registered?"+CEREG: 1,1":"+CEREG: 1,0"));assert(dispatchServiceLine("OK"));loop();
+}
 int main(int argc,char** argv){
  if(argc>1 && std::string(argv[1])=="zero-records") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
@@ -175,21 +206,52 @@ int main(int argc,char** argv){
   uint8_t pid;assert(Obd.next(0,pid));
   const uint8_t bitmap[]={6,0x41,0,0,0x18,0,0,0};
   assert(!Obd.accept(0x7E8,bitmap,8,1));
-  sendDtcRequest();can.rx.push_back({0x7E8,{2,0x43,0,0,0,0,0,0}});
-  serviceCan();assert(dataArray.size()==0 && !DtcWaiting);
-  initializeVehicleDataSchema();vehicleData["vehicle_speed"]=0;
+  const char* fields[]={"engine_rpm","vehicle_speed","coolant_temp","engine_load",
+   "intake_air_temp","throttle_position","distance_traveled","odometer",
+   "control_module_voltage","ambient_air_temp","dtc_count","dtc_codes"};
+  initializeVehicleDataSchema();
+  for(const char* field:fields)assert(vehicleData.containsKey(field) && vehicleData[field].isNull());
+  vehicleData["latitude"]=35;vehicleData["battery_level"]=99;
+  assert(!bg770a::hasVehicleMeasurement(vehicleData));
   assert(!cellularSend(JsonDoc) && socketOpens==0);
-  // Keep an in-progress zero sample while another CAN response is pending.
-  assert(!Obd.next(30001,pid));assert(Obd.next(30001,pid));nowMs=30001;loop();
-  assert(Obd.waiting() && dataArray.size()==1 && socketOpens==0);
-  Obd.tick(nowMs+201);discardEmptyVehicleRecords();assert(dataArray.size()==0);
-  initializeVehicleDataSchema();vehicleData["latitude"]=35;vehicleData["battery_level"]=99;
+  discardEmptyVehicleRecords();assert(dataArray.size()==0);
+  // A complete no-fault reply is an acquired zero, unlike an unanswered query.
+  sendDtcRequest();can.rx.push_back({0x7E8,{2,0x43,0,0,0,0,0,0}});
+  serviceCan();assert(dataArray.size()==1 && !DtcWaiting);
+  assert(vehicleData["dtc_count"]==0 && vehicleData["dtc_codes"]=="");
+  assert(vehicleData["engine_rpm"].isNull() && bg770a::hasVehicleMeasurement(vehicleData));
+  sendResult=true;assert(cellularSend(JsonDoc));
+  JsonDocument noFault;assert(!deserializeJson(noFault,SentPayloads.back()));
+  assert(noFault["data"][0]["dtc_count"]==0 && noFault["data"][0]["dtc_codes"]=="");
+  assert(noFault["data"][0]["vehicle_speed"].isNull());
+  clearSentData(LastSentRecords);
+  // Malformed and timed-out RPM replies leave the field unmeasured.
+  assert(!Obd.next(101,pid));assert(Obd.next(102,pid) && pid==0x0C);
+  nowMs=103;can.rx.push_back({0x7E8,{3,0x41,0x0C,0,0,0,0,0}});serviceCan();
+  assert(Obd.waiting() && dataArray.size()==0);
+  nowMs=302;serviceCan();assert(!Obd.waiting() && dataArray.size()==0);
+  // A validated stopped-speed response is a real zero and may be sent alone.
+  assert(Obd.next(402,pid) && pid==0x0D);
+  nowMs=403;can.rx.push_back({0x7E8,{3,0x41,0x0D,0,0,0,0,0}});serviceCan();
+  assert(dataArray.size()==1 && vehicleData["vehicle_speed"]==0);
+  assert(vehicleData["engine_rpm"].isNull() && vehicleData["dtc_count"].isNull());
+  discardEmptyVehicleRecords();assert(dataArray.size()==1);
+  assert(cellularSend(JsonDoc));
+  JsonDocument stopped;assert(!deserializeJson(stopped,SentPayloads.back()));
+  const JsonObjectConst stoppedRow=stopped["data"][0].as<JsonObjectConst>();
+  assert(stoppedRow["vehicle_speed"]==0);
+  for(const char* field:fields)if(std::strcmp(field,"vehicle_speed"))assert(stoppedRow[field].isNull());
+  clearSentData(LastSentRecords);
+  initializeVehicleDataSchema();vehicleData["engine_rpm"]=0;vehicleData["vehicle_speed"]=0;
+  initializeVehicleDataSchema();vehicleData["coolant_temp"]=0;
+  initializeVehicleDataSchema();vehicleData["intake_air_temp"]=-40;
   initializeVehicleDataSchema();vehicleData["control_module_voltage"]=12.4;
   initializeVehicleDataSchema();vehicleData["dtc_count"]=1;vehicleData["dtc_codes"]="P01AF";
   initializeVehicleDataSchema();vehicleData["dtc_codes"]=" \t";
-  discardEmptyVehicleRecords();assert(dataArray.size()==2 && vehicleData.isNull());
+  initializeVehicleDataSchema();
+  discardEmptyVehicleRecords();assert(dataArray.size()==5 && vehicleData.isNull());
   assert(dataArray[0]["engine_rpm"]==0 && dataArray[0]["vehicle_speed"]==0);
-  sendResult=true;
+  assert(dataArray[1]["coolant_temp"]==0 && dataArray[2]["intake_air_temp"]==-40);
   while(dataArray.size()) {
    const auto queued=dataArray.size();assert(cellularSend(JsonDoc));
    JsonDocument sent;assert(!deserializeJson(sent,SentPayloads.back()));
@@ -198,24 +260,123 @@ int main(int argc,char** argv){
    const auto acknowledged=LastSentRecords;clearSentData(acknowledged);
    assert(dataArray.size()==queued-acknowledged);
   }
-  std::cout<<"Empty DTC and all-zero rows never reach transport; stopped readings, DTC and acknowledgment counts preserved\n";return 0;
+  std::cout<<"Unavailable OBD values serialize as null; validated zero speed, zero temperature and no-fault DTC remain measured; empty rows excluded\n";return 0;
  }
- if(argc>1 && std::string(argv[1])=="rejected-first-send") {
+ if(argc>1 && std::string(argv[1])=="startup-gps-first") {
   Services.ntpEnabled=false;Services.gnssEnabled=true;
-  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  // A queued OBD row must not precede the first acquired GPS upload.
   initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;sendResult=true;
   ReplyChunks={"400 ","{\"error\":\"Invalid payload: decode or JSON failed\",\"private\":\"fixture-private-response\"}"};
-  nowMs=30001;loop();pollUntilSend(1);
-  assert(dataArray.size()==1 && !TelemetryDelivered);
-  assert(Services.gnss.state()==bg770a::GnssSession::State::Idle);
-  assert(WioCellular.uart.tx.find("AT+CFUN=4")==std::string::npos);
+  completeStartupGnss();assert(sendCalls==1);
+  assert(dataArray.size()==1 && StartupLocation==StartupLocationState::Upload);
+  assert(StartupLocationDoc["data"].size()==1 && Services.gnss.modemIdle());
   assert(Serial.output.find("reason=payload_decode")!=std::string::npos);
   assert(Serial.output.find("fixture-private-response")==std::string::npos);
+  JsonDocument sent;assert(!deserializeJson(sent,SentPayloads.back()));
+  JsonObjectConst row=sent["data"][0].as<JsonObjectConst>();
+  assert(row["time"]=="2026-11-06T12:34:56+00:00");
+  assert(row["gps_time"]=="2026-11-06T12:34:56.789+00:00");
+  assert(std::abs(row["latitude"].as<double>()-35.12345)<0.00001);
+  assert(std::abs(row["longitude"].as<double>()-139.12345)<0.00001);
+  const char* fields[]={"engine_rpm","vehicle_speed","coolant_temp","engine_load",
+   "intake_air_temp","throttle_position","distance_traveled","odometer",
+   "control_module_voltage","ambient_air_temp","dtc_count","dtc_codes"};
+  for(const char* field:fields)assert(row.containsKey(field) && row[field].isNull());
+  nowMs+=1000;loop();assert(sendCalls==1 && dataArray.size()==1);
+  // Keep the initial fix and its acquisition time even after the fresh-fix window.
+  nowMs+=bg770a::GnssSession::RetryMs+1;loop();assert(sendCalls==2);
+  assert(StartupLocation==StartupLocationState::Upload && dataArray.size()==1);
+  JsonDocument retry;assert(!deserializeJson(retry,SentPayloads.back()));
+  assert(retry["data"][0]["gps_time"]==row["gps_time"]);
+  assert(retry["data"][0]["latitude"]==row["latitude"]);
   ReplyChunks={"200 {\"ok\":true}"};
-  nowMs+=31000;loop();pollUntilSend(2);
-  assert(dataArray.size()==0 && TelemetryDelivered);
-  assert(WioCellular.uart.tx.find("AT+CFUN=4")!=std::string::npos);
-  std::cout<<"Rejected first send retains data and LTE; fragmented error classified privately; GNSS waits until accepted delivery\n";return 0;
+  nowMs+=31000;serviceCan();assert(!serviceStartupLocation());
+  assert(sendCalls==3 && StartupLocation==StartupLocationState::Complete);
+  assert(dataArray.size()==1 && StartupLocationDoc["data"].size()==0);
+  std::cout<<"Startup GPS precedes queued OBD without a prior clock; failed ACK retains the acquired fix for bounded retries and success releases OBD\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="startup-gps-only") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;
+  completeStartupGnss();assert(sendCalls==1 && dataArray.size()==0);
+  assert(StartupLocation==StartupLocationState::Complete && socketOpens==1);
+  assert(can.sent.empty() && powerOffs==0);
+  // The regular cadence is measured from the acquisition start, after completion.
+  nowMs=bg770a::GnssSession::RetryMs-1;serviceModem(true,true);
+  assert(Services.gnss.modemIdle());
+  nowMs=bg770a::GnssSession::RetryMs;serviceModem(true,true);
+  assert(Services.gnss.state()==bg770a::GnssSession::State::Offline);
+  std::cout<<"Startup GPS-only upload needs no OBD response; periodic GNSS waits ten minutes from initial acquisition\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="startup-gps-no-fix") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;
+  completeStartupGnss(false);
+  assert(StartupLocation==StartupLocationState::Complete && sendCalls==0);
+  assert(StartupLocationDoc["data"].size()==0 && dataArray.size()==0);
+  assert(nowMs<bg770a::GnssSession::AcquisitionMs+1000);
+  assert(can.sent.size()>0 && Obd.waiting());
+  std::cout<<"Startup no-fix acquisition ends at its bound, restores LTE and resumes OBD without fabricated GPS\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="startup-no-fix-periodic-gps") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;
+  completeStartupGnss(false);
+  assert(sendCalls==0 && StartupLocation==StartupLocationState::Complete);
+  // No ECU ever replies and no upload has succeeded. The ten-minute attempt
+  // must nevertheless acquire and send GPS through the independent document.
+  CanReady=false;can.sent.clear();nowMs=bg770a::GnssSession::RetryMs;serviceCan();
+  serviceModem(true,true);assert(StartupLocation==StartupLocationState::Acquiring);
+  sendResult=true;completeStartupGnss();
+  assert(sendCalls==1 && StartupLocation==StartupLocationState::Complete);
+  assert(dataArray.size()==0 && StartupLocationDoc["data"].size()==0);
+  JsonDocument periodic;assert(!deserializeJson(periodic,SentPayloads.back()));
+  assert(periodic["data"][0]["gps_time"]=="2026-11-06T12:34:56.789+00:00");
+  assert(periodic["data"][0]["engine_rpm"].isNull());
+  std::cout<<"A bounded no-fix startup still permits ten-minute GPS-only acquisition/upload with no ECU reply or prior successful upload\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="startup-no-fix-no-network") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;
+  completeStartupGnss(false,false);
+  assert(StartupLocation==StartupLocationState::Complete && sendCalls==0);
+  assert(Services.atIdle() && !Services.idle());
+  assert(Obd.waiting() && can.sent.size()>0);
+  assert(dataArray.size()==0 && StartupLocationDoc["data"].size()==0);
+  std::cout<<"No-fix startup releases CAN collection even while LTE registration is unavailable\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="startup-gps-recovery") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;
+  loop();startupReply("AT+CFUN=4");startupReply("AT+QGPS=1");
+  nowMs+=1000;loop();
+  assert(dispatchServiceLine("AT+QGPSLOC=2"));
+  assert(dispatchServiceLine("+QGPSLOC: 123456.789,35.12345,139.12345,1.2,12.0,3,0.00,0.0,0.0,061126,08"));
+  assert(dispatchServiceLine("OK"));
+  assert(StartupLocation==StartupLocationState::Upload && StartupLocationDoc["data"].size()==1);
+  // Dispatch and fail the stop before the outer loop can snapshot a live fix.
+  serviceModem(true,false);
+  // A failed GNSS stop clears the session fix and requires physical recovery.
+  assert(dispatchServiceLine("AT+QGPSEND"));assert(dispatchServiceLine("ERROR"));loop();
+  assert(WioCellular.uart.resets==1 && !Services.gnss.fix().valid && sendCalls==0);
+  assert(StartupLocation==StartupLocationState::Upload && StartupLocationDoc["data"].size()==1);
+  nowMs+=2000;assert(dispatchServiceLine("APP RDY"));nowMs+=2200;loop();
+  startupReply("AT+IFC=2,2");nowMs+=2200;loop();
+  startupReply("AT+CFUN=1");startupReply("AT+CEREG=1");
+  assert(dispatchServiceLine("AT+CEREG?"));
+  assert(dispatchServiceLine("+CEREG: 1,1"));assert(dispatchServiceLine("OK"));loop();
+  assert(sendCalls==1 && StartupLocation==StartupLocationState::Complete);
+  JsonDocument recovered;assert(!deserializeJson(recovered,SentPayloads.back()));
+  assert(recovered["data"][0]["gps_time"]=="2026-11-06T12:34:56.789+00:00");
+  assert(recovered["data"][0]["engine_rpm"].isNull());
+  std::cout<<"Startup GPS snapshot survives GNSS stop failure and modem reset, then sends its original acquisition time after LTE recovery\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="startup-ntp-first") {
+  Services.ntpEnabled=true;Services.gnssEnabled=true;
+  loop();assert(StartupLocation==StartupLocationState::Pending);
+  assert(WioCellular.uart.tx.find("AT+QNTP=")!=std::string::npos);
+  assert(WioCellular.uart.tx.find("AT+CFUN=4")==std::string::npos);
+  assert(dispatchServiceLine(Services.ntp.command()));assert(dispatchServiceLine("OK"));loop();
+  assert(WioCellular.uart.tx.find("AT+CFUN=4")==std::string::npos);
+  assert(dispatchServiceLine("+QNTP: 0,\"2026/11/06,12:34:50+00\""));loop();
+  assert(StartupLocation==StartupLocationState::Acquiring);
+  assert(WioCellular.uart.tx.find("AT+CFUN=4")!=std::string::npos && sendCalls==0);
+  std::cout<<"Startup GNSS waits for validated NTP ownership to finish before taking the modem\n";return 0;
  }
  if(argc>1 && std::string(argv[1])=="bounded-send-prefix") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
@@ -310,7 +471,7 @@ int main(int argc,char** argv){
   // Synthetic extension tests, not responses from the supplied vehicle log.
   can.rx.push_back({0x7E8,{7,0x41,0x0C,0x1F,0x40,0xFF,0xAA,0x55}});
   nowMs=109;serviceCan();assert(vehicleData["engine_rpm"]==2000);
-  assert(vehicleData["vehicle_speed"]==0 && CanStats.telemetry==1);
+  assert(vehicleData["vehicle_speed"].isNull() && CanStats.telemetry==1);
   sendDtcRequest();can.rx.push_back({0x7E8,{7,0x43,1,0x01,0xAF,0xFF,0xFF,0xFF}});
   serviceCan();assert(vehicleData["dtc_codes"]=="P01AF" && vehicleData["dtc_count"]==1);
   std::cout<<"Synthetic padded RPM/DTC decode only required data; padding never adds values/codes\n";return 0;
@@ -489,7 +650,7 @@ int main(int argc,char** argv){
 
  Services.ntpEnabled=false;Services.gnssEnabled=false;
  Services.clock.seedFallback(1735689599LL,Services.now(0));
- auto handler=WioCellular.registerUrcHandler2([](const std::string& s){return Services.line(s,millis());});
+ auto handler=WioCellular.registerUrcHandler2(dispatchServiceLine);
  loop();assert(JsonDoc["imsi"]=="fixture-device");assert(dataArray.size()==0);
  nowMs=10000;loop();assert(can.sent.back()[2]==0);
  can.rx.push_back({0x123,{6,0x41,0,0,0x18,0,0,0}});
@@ -515,7 +676,7 @@ int main(int argc,char** argv){
  sendDtcRequest();can.rx.push_back({0x7E8,{8,0x43,0x01,0xAF,0,0,0,0}});serviceCan();assert(DtcWaiting);
  nowMs+=200;serviceCan();assert(!DtcWaiting);
  sendDtcRequest();can.rx.push_back({0x7E8,{2,0x43,0,0,0,0,0,0}});serviceCan();assert(vehicleData["dtc_count"]==0);
- sendDtcRequest();can.rx.push_back({0x7E8,{0x10,10,0x43,0,0,0,0,0}});serviceCan();assert(vehicleData["dtc_codes"]=="MULTI");
+ sendDtcRequest();can.rx.push_back({0x7E8,{0x10,10,0x43,0,0,0,0,0}});serviceCan();assert(vehicleData["dtc_codes"]=="MULTI");assert(vehicleData["dtc_count"].isNull());
  nowMs=30001;loop();pollUntilSend(1);assert(sendCalls==1);assert(dataArray.size()==1); // failure retains samples
  sendResult=true;nowMs=61000;loop();pollUntilSend(2);assert(sendCalls==2);assert(dataArray.size()==0);assert(vehicleData.isNull());
  // Actual reset dispatch and off-state AT exclusion.
@@ -540,7 +701,7 @@ int main(int argc,char** argv){
  assert(bg770a::isoUtc(epoch)=="2024-02-29T14:59:59+00:00");
  assert(std::string(Services.clock.source())=="http_fallback");assert(!SynchronousModem);
  WioNetwork.state=Network::NetworkState::Offline;assert(!getTime(fetched));
- std::cout<<"Actual sketch loop, AT recovery, CAN validation, legacy schema, DTC, queue, HTTP fallback tests passed\n";
+ std::cout<<"Actual sketch loop, AT recovery, CAN validation, nullable schema, DTC, queue, HTTP fallback tests passed\n";
 }
 '''
 source=source.replace('FIELD_ID',str(observed_rx['id'])).replace('FIELD_BYTES',','.join(str(n) for n in observed_rx['bytes'])).replace('FIELD_MILLIS',str(observed_rx['millis']))
@@ -549,5 +710,5 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','zero-records rejected-first-send bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
+    for scenario in os.environ.get('SKETCH_SCENARIOS','zero-records startup-gps-first startup-gps-only startup-gps-no-fix startup-no-fix-periodic-gps startup-no-fix-no-network startup-gps-recovery startup-ntp-first bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
         subprocess.run([str(exe),scenario],check=True)

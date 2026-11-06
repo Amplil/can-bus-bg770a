@@ -29,7 +29,7 @@ class ObdSession {
     if (waiting_ || (started_ && uint32_t(now-last_)<100)) return false;
     if (page_<6) {
       pid=uint8_t(page_*32);
-      if (page_ && support(pid)!=Support::Supported) { page_=6; return false; }
+      if (page_ && support(pid)!=Support::Supported) { page_=6; updateInitialRound(); return false; }
     } else {
       bool found=false;
       for (unsigned n=0;n<10;++n) {
@@ -46,6 +46,7 @@ class ObdSession {
     if (waiting_ && uint32_t(now-last_)>=200) {
       waiting_=false; timedOut_=true; timeoutEvent_=true; last_=now;
       if (pending_%32==0 && attempts_>=3) page_=6; // timeout is not unsupported
+      finishInitialRequest();
     }
   }
   // Legacy UART driver supplies 8 bytes but no actual DLC/IDE/RTR metadata.
@@ -68,9 +69,11 @@ class ObdSession {
       unsigned page=pending_/32;
       maps_[page]=(uint32_t(d[3])<<24)|(uint32_t(d[4])<<16)|(uint32_t(d[5])<<8)|d[6];
       known_[page]=true; page_=page+1; attempts_=0;
+      updateInitialRound();
       return false; // capabilities are not telemetry
     }
     for(unsigned i=0;i<10;++i)if(pids()[i]==pending_)observed_[i]=true;
+    finishInitialRequest();
     return true;
   }
   static unsigned length(uint8_t pid) {
@@ -87,6 +90,9 @@ class ObdSession {
   bool compatibilityEnabled() const { return allowUnknown_; }
   bool acceptedFrame() const { return accepted_; }
   bool waiting() const { return waiting_; }
+  // A complete initial telemetry sweep includes successful replies and bounded
+  // timeouts. Discovery is separate; ineligible PID positions are skipped.
+  bool initialRoundComplete() const { return initialRoundComplete_; }
   bool selected() const { return selected_; }
   uint32_t ecu() const { return ecu_; }
  private:
@@ -94,9 +100,24 @@ class ObdSession {
     static const uint8_t values[]={0x0C,0x0D,0x05,0x04,0x0F,0x11,0x31,0xA6,0x42,0x46};
     return values;
   }
+  void updateInitialRound() {
+    if(page_<6 || initialRoundComplete_)return;
+    for(unsigned i=0;i<10;++i) {
+      const auto state=support(pids()[i]);
+      if(state==Support::Unsupported || (!allowUnknown_ && state==Support::Unknown))
+        initialFinished_|=uint16_t(1U<<i);
+    }
+    initialRoundComplete_=initialFinished_==0x03FF;
+  }
+  void finishInitialRequest() {
+    for(unsigned i=0;i<10;++i)if(pids()[i]==pending_)initialFinished_|=uint16_t(1U<<i);
+    updateInitialRound();
+  }
   Reject reason_=Reject::None;
   bool timedOut_=false,timeoutEvent_=false;
   bool accepted_=false;
+  bool initialRoundComplete_=false;
+  uint16_t initialFinished_=0;
   bool allowUnknown_, observed_[10]={};
   bool extended_, waiting_=false, started_=false, selected_=false;
   bool known_[6]={};

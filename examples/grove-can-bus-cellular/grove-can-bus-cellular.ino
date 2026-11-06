@@ -84,6 +84,9 @@ static bool CanReady=false, HaveCanActivity=false, ModemSleeping=false, Synchron
 enum class StartupLocationState { Pending, Acquiring, Upload, Complete };
 static StartupLocationState StartupLocation=StartupLocationState::Pending;
 static JsonDocument StartupLocationDoc;
+static bool StartupObdFlushPending=false;
+static bool StartupObdRoundComplete=false;
+static bool StartupObdUploadAttempted=false;
 static bool StartupLocationAttempted=false;
 static uint32_t StartupLocationLastAttempt=0;
 static bool CellularReady=false;
@@ -284,7 +287,8 @@ static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
     WioCellular.getInterface().reset();
     Services.gnss.resetIssued(millis());
   }
-  const bool initialGnss=allowGnss && StartupLocation==StartupLocationState::Pending && deviceIMSI[0];
+  const bool initialGnss=allowGnss && StartupLocation==StartupLocationState::Pending &&
+    StartupObdRoundComplete && StartupObdUploadAttempted && deviceIMSI[0];
   const bool periodicGnss=allowGnss && !HeartbeatPending && StartupLocation==StartupLocationState::Complete && dataArray.size()==0;
   gpsSequence=Services.gnss.diagnostic().sequence;
   const auto command=Services.command(millis(),WioNetwork.config.pdpContextId,online,
@@ -293,7 +297,7 @@ static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
   if((initialGnss || periodicGnss) && command=="AT+CFUN=4\r") {
     StartupLocation=StartupLocationState::Acquiring;
     StartupLocationAttempted=false;
-    trace("GPS-STARTUP");Serial.println(initialGnss ? "acquiring first location before telemetry uploads" :
+    trace("GPS-STARTUP");Serial.println(initialGnss ? "initial OBD round/upload finished; acquiring first location" :
       "acquiring periodic location; fix will be uploaded independently of OBD");
   }
   if(!command.empty()) {trace("MODEM-TX");Serial.println(command.c_str());WioCellular.writeBinary(command.data(),command.size());}
@@ -429,6 +433,7 @@ static bool dispatchServiceLine(const std::string& line) {
   // or LTE recovery failure can clear the session's live fix.
   if(StartupLocation==StartupLocationState::Acquiring && queueStartupLocation()) {
     StartupLocation=StartupLocationState::Upload;
+    StartupObdFlushPending=true;
     trace("GPS-STARTUP");Serial.println("fix queued; waiting for LTE to send first");
   }
   if(line.compare(0,7,"+QNTP: ")==0) {
@@ -446,8 +451,9 @@ static bool dispatchServiceLine(const std::string& line) {
   return handled;
 }
 
-// Pause new OBD requests during GNSS acquisition. A dedicated document keeps
-// each startup/periodic fix across LTE recovery/retries while CAN resumes.
+// GPS owns the modem during acquisition, while OBD polling keeps filling its
+// queue. A separate document retains each fix across LTE recovery/retries.
+// The return value holds OBD uploads, never PID requests or CAN collection.
 static bool serviceStartupLocation() {
   if(StartupLocation==StartupLocationState::Complete)return false;
   if(!Services.gnssEnabled) {StartupLocation=StartupLocationState::Complete;return false;}
@@ -455,15 +461,18 @@ static bool serviceStartupLocation() {
   if(StartupLocation==StartupLocationState::Acquiring) {
     if(queueStartupLocation()) {
       StartupLocation=StartupLocationState::Upload;
+      StartupObdFlushPending=true;
       trace("GPS-STARTUP");Serial.println("fix queued; waiting for LTE to send first");
     } else if(Services.atIdle() || Services.gnss.disabled()) {
       StartupLocation=StartupLocationState::Complete;
-      trace("GPS-STARTUP");Serial.println("no fix within bounded attempt; resuming OBD telemetry");
+      StartupObdFlushPending=true;
+      trace("GPS-STARTUP");Serial.println("no fix within bounded attempt; queued OBD due after LTE recovery");
     }
   }
   if(StartupLocation==StartupLocationState::Pending && Services.gnss.disabled()) {
     StartupLocation=StartupLocationState::Complete;
-    trace("GPS-STARTUP");Serial.println("GNSS unavailable after recovery; resuming OBD telemetry");
+    StartupObdFlushPending=true;
+    trace("GPS-STARTUP");Serial.println("GNSS unavailable after recovery; queued OBD due after LTE recovery");
   }
   if(StartupLocation==StartupLocationState::Upload && CellularReady && !ModemSleeping &&
      canIdle() && Services.idle() && deviceIMSI[0] &&
@@ -472,7 +481,7 @@ static bool serviceStartupLocation() {
     StartupLocationDoc["imsi"]=deviceIMSI;
     if(cellularSend(StartupLocationDoc)) {
       StartupLocationDoc.clear();StartupLocation=StartupLocationState::Complete;
-      trace("GPS-STARTUP");Serial.println("first location acknowledged; resuming OBD telemetry");
+      trace("GPS-STARTUP");Serial.println("location acknowledged; OBD collection continues");
     }
   }
   if(StartupLocation==StartupLocationState::Upload) {
@@ -490,7 +499,8 @@ static bool serviceStartupLocation() {
   }
   // With no network/modem, retain startup intent while continuing CAN collection.
   return StartupLocation==StartupLocationState::Acquiring ||
-    (StartupLocation==StartupLocationState::Pending && CellularReady && cellularOnline());
+    (StartupLocation==StartupLocationState::Pending &&
+     (!StartupObdRoundComplete || StartupObdUploadAttempted) && CellularReady && cellularOnline());
 }
 
 
@@ -630,6 +640,17 @@ static uint32_t idleSleepDuration() {
 
 void loop() {
   serviceCan();
+  if(Services.gnssEnabled && StartupLocation==StartupLocationState::Pending &&
+     !StartupObdRoundComplete && canIdle() && (!CanReady || Obd.initialRoundComplete())) {
+    StartupObdRoundComplete=true;
+    StartupObdFlushPending=true;
+    // A silent/unavailable ECU or missing UTC produces no measurement to send.
+    StartupObdUploadAttempted=dataArray.size()==0;
+    // Preserve this completed OBD row while later polling collects during GPS.
+    vehicleData=JsonObject();
+    trace("OBD-STARTUP");Serial.printf("status=%s records=%u; first OBD upload due before GPS\n",
+      CanReady ? "round_complete" : "CAN_unavailable",unsigned(dataArray.size()));
+  }
   if(!CellularReady && canIdle() && Services.atIdle() && uint32_t(millis()-LastCellularAttempt)>=CELLULAR_RETRY_INTERVAL) {
     initializeCellular();
   }
@@ -638,7 +659,8 @@ void loop() {
   if(HaveCanActivity && ModemSleeping && Services.atIdle() && canIdle())netPowerOnRestart();
   if(CellularReady && canIdle() && Services.idle() && !ModemSleeping && !deviceIMSI[0] && getIMSI(deviceIMSI))JsonDoc["imsi"]=deviceIMSI;
   if(serviceHeartbeat()) {cooperativeDelay(10);return;}
-  if(serviceStartupLocation()) {cooperativeDelay(10);return;}
+  const bool startupLocationBusy=serviceStartupLocation();
+  if(!startupLocationBusy && StartupObdFlushPending && dataArray.size()==0 && canIdle())StartupObdFlushPending=false;
   static uint32_t lastClockRetry=millis();
   if(!HeartbeatPending && CellularReady && canIdle() && Services.idle() && !ModemSleeping && uint32_t(millis()-lastClockRetry)>=60000 &&
       strcmp(Services.clock.source(),"unsynced")==0) {
@@ -648,8 +670,14 @@ void loop() {
   static uint32_t lastDtcSend=millis(), lastDataReceivedTime=millis();
   static bool batch=false;
   const uint32_t now=millis();
+  // Finish any outstanding CAN reply, then give the startup backlog the next
+  // modem-idle window before beginning another PID or DTC request.
+  const bool flushReady=StartupObdFlushPending && !startupLocationBusy &&
+    dataArray.size()>0 && CellularReady && !ModemSleeping && Services.idle() && deviceIMSI[0];
+  const bool initialObdRound=Services.gnssEnabled && StartupLocation==StartupLocationState::Pending &&
+    !StartupObdRoundComplete;
   if(HaveCanActivity) { lastDataReceivedTime=LastCanActivity; HaveCanActivity=false; }
-  if(uint32_t(now-lastRotateSend)>=OBD_INTERVAL) {
+  if(!flushReady && (initialObdRound || uint32_t(now-lastRotateSend)>=OBD_INTERVAL)) {
     if(!batch) {
       vehicleData=JsonObject(); batch=true; batchStarted=now;
       if(!CanReady)Serial.println("CAN polling disabled: module configuration unconfirmed");
@@ -665,11 +693,12 @@ void loop() {
       Serial.println(Obd.support(pid)==bg770a::Support::Unknown ? " (capability unknown)" : "");
     }
     // Allow discovery through PID A0 and all current telemetry within the batch.
-    if(uint32_t(now-batchStarted)>=4000 && !Obd.waiting()) {
+    if(uint32_t(now-batchStarted)>=4000 && !Obd.waiting() &&
+       (!initialObdRound || Obd.initialRoundComplete() || !CanReady)) {
       lastRotateSend=now;batch=false;
     }
   }
-  if(uint32_t(now-lastDtcSend)>=DTC_INTERVAL && !Obd.waiting() && !DtcWaiting) {
+  if(!flushReady && uint32_t(now-lastDtcSend)>=DTC_INTERVAL && !Obd.waiting() && !DtcWaiting) {
     if(CanReady && Obd.selected())sendDtcRequest();
     lastDtcSend=now;
   }
@@ -689,26 +718,26 @@ void loop() {
   JsonDoc["time_sync_state"]=Services.clock.quality(Services.now(millis()));
 
   static bool deferLogged=false;
-  if(millis()-lastCellularSend>CELLULAR_INTERVAL && !canIdle()) {
+  const bool cellularDue=StartupObdFlushPending || uint32_t(millis()-lastCellularSend)>CELLULAR_INTERVAL;
+  if(cellularDue && !canIdle()) {
     ++CanStats.syncDeferred;
     if(!deferLogged) {trace("LTE-DEFER");Serial.println("OBD response pending; synchronous modem work postponed");deferLogged=true;}
   } else deferLogged=false;
   static uint32_t lastModemDefer=0;
-  if(millis()-lastCellularSend>CELLULAR_INTERVAL && canIdle() && !ModemSleeping &&
+  if(cellularDue && canIdle() && !ModemSleeping &&
       (!CellularReady || !Services.idle()) && uint32_t(millis()-lastModemDefer)>=5000) {
     trace("LTE-DEFER");Serial.printf("reason=%s registration=%d queue=%u; send remains due\n",
       !CellularReady?"modem_not_initialized":!Services.atIdle()?"AT_owner_busy":"registration_pending",
       Services.gnss.registrationStatus(),unsigned(dataArray.size()));
     lastModemDefer=millis();
   }
-  if(StartupLocation!=StartupLocationState::Upload &&
-      millis() - lastCellularSend > CELLULAR_INTERVAL && CellularReady && Services.atIdle() && canIdle() &&
+  if(!startupLocationBusy && cellularDue && CellularReady && Services.atIdle() && canIdle() &&
       (Services.idle() || ModemSleeping || dataArray.size()==0)) {
     discardEmptyVehicleRecords();
     if(arrayEmptyCheck(JsonDoc["data"])) {
       Serial.println("doc data is empty.");
       unsigned long emptyDuration = millis() - lastDataReceivedTime;
-      if(CellularReady && !HeartbeatPending && emptyDuration > DATA_EMPTY_TIMEOUT) { // DATA_EMPTY_TIMEOUT時間経過チェック
+      if(CellularReady && !HeartbeatPending && StartupLocation==StartupLocationState::Complete && emptyDuration > DATA_EMPTY_TIMEOUT) { // DATA_EMPTY_TIMEOUT時間経過チェック
         Serial.print("OBD2の受信データが");Serial.print(emptyDuration / 1000);Serial.println("秒間なかったためWioCellularとCAN BUSをOFFにします。");
         digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_OFF);
         netPowerOffWait();
@@ -729,8 +758,17 @@ void loop() {
       //lastDataReceivedDuration=0;
     }
     // Heartbeats use their own explicit timestamp-only document.
-    if(dataArray.size()==0) { lastCellularSend=millis();cooperativeDelay(10);return; }
+    if(dataArray.size()==0) {
+      if(StartupObdRoundComplete)StartupObdUploadAttempted=true;
+      StartupObdFlushPending=false;lastCellularSend=millis();cooperativeDelay(10);return;
+    }
     const bool delivered=cellularSend(JsonDoc);
+    if(StartupLocation==StartupLocationState::Pending && StartupObdRoundComplete && !StartupObdUploadAttempted) {
+      StartupObdUploadAttempted=true;
+      trace("OBD-STARTUP");Serial.printf("upload=%s; initial GPS eligible; unacknowledged records retained\n",
+        delivered ? "acknowledged" : "unconfirmed");
+    }
+    StartupObdFlushPending=false;
     if(delivered) {
       clearSentData(LastSentRecords);
     }
@@ -897,8 +935,11 @@ static void clearSentData(size_t count) {
 
 static bool cellularSend(const JsonDocument &doc) {
   LastSentRecords=0;
-  if(Services.gnssEnabled && StartupLocation!=StartupLocationState::Complete &&
-     &doc!=&StartupLocationDoc && &doc!=&HeartbeatDoc)return false;
+  const bool initialObdUpload=&doc==&JsonDoc && StartupLocation==StartupLocationState::Pending &&
+    StartupObdRoundComplete && !StartupObdUploadAttempted;
+  if(Services.gnssEnabled &&
+     (StartupLocation==StartupLocationState::Pending || StartupLocation==StartupLocationState::Acquiring) &&
+     !initialObdUpload && &doc!=&StartupLocationDoc && &doc!=&HeartbeatDoc)return false;
   if(!CellularReady || !canIdle() || !Services.idle() || !deviceIMSI[0] || ModemSleeping || doc["data"].size()==0)return false;
   // Enforce the invariant again at the transport boundary, including direct
   // callers. The loop removes empty rows only after pending CAN replies finish.

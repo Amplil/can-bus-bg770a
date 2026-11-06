@@ -105,6 +105,9 @@ static bool HeartbeatAcknowledged=false;
 static bool HeartbeatAttempted=false;
 static bool StartupLocationAttempted=false;
 static uint32_t StartupLocationLastAttempt=0;
+static bool StartupObdFlushPending=false;
+static bool StartupObdRoundComplete=false;
+static bool StartupObdUploadAttempted=false;
 static bool CellularReady=true;
 static uint32_t LastCellularAttempt=0;
 static constexpr uint32_t CELLULAR_RETRY_INTERVAL=60000;
@@ -147,6 +150,8 @@ static uint32_t idleSleepDuration();
 static unsigned socketOpens=0;
 static uint32_t socketDelay=0;
 static bool socketOpenResult=true,socketConnectResult=true;
+static bool rejectGpsOnly=false;
+static bool rejectInitialObd=false;
 static std::deque<std::string> SentPayloads;
 static std::deque<std::string> ReplyChunks={"200 {}\r\n"};
 using WioCellularModule=Module;
@@ -156,9 +161,14 @@ static const char* WioCellularResultToString(int){return "fixture-status";}
 template<class T>struct WioCellularTcpClient2 {
  std::deque<std::string> chunks=ReplyChunks;
  explicit WioCellularTcpClient2(T&){}
- bool open(int,const char*,int){++socketOpens;nowMs+=socketDelay;return socketOpenResult;}
+ bool open(int,const char*,int){assert(!Obd.waiting() && !DtcWaiting && Services.idle());++socketOpens;nowMs+=socketDelay;return socketOpenResult;}
  bool waitForConnect(){return socketConnectResult;}
- bool send(const char* bytes,size_t size){++sendCalls;SentPayloads.emplace_back(bytes,size);return sendResult;}
+ bool send(const char* bytes,size_t size){++sendCalls;SentPayloads.emplace_back(bytes,size);
+  if(rejectInitialObd && StartupLocation==StartupLocationState::Pending)chunks={"400 {\"error\":\"Invalid payload shape\"}"};
+  if(rejectGpsOnly){JsonDocument payload;assert(!deserializeJson(payload,SentPayloads.back()));
+   if(!payload["data"][0]["gps_time"].isNull() && payload["data"][0]["engine_rpm"].isNull())chunks={"400 {\"error\":\"Invalid payload shape\"}"};}
+  return sendResult;
+ }
  int getLastResult(){return 0;}
  bool receive(uint8_t* out,size_t cap,size_t* size,int remaining){assert(remaining>0);nowMs+=1;
   if(chunks.empty()){*size=0;return true;}
@@ -185,13 +195,31 @@ static void pollUntilSend(unsigned expected) {
 }
 static void startupReply(const char* command) {
  const std::string sent=std::string(command)+"\r";
+ // Concurrent OBD polling may defer the next AT write until its 200ms reply
+ // window closes. Advance only that pending window, without scheduling a PID.
+ if(WioCellular.uart.tx.size()<sent.size() ||
+    WioCellular.uart.tx.compare(WioCellular.uart.tx.size()-sent.size(),sent.size(),sent)!=0) {
+  if(Obd.waiting() || DtcWaiting){nowMs+=201;serviceCan();}
+  serviceModem(true,false);
+ }
  assert(WioCellular.uart.tx.size()>=sent.size());
  assert(WioCellular.uart.tx.compare(WioCellular.uart.tx.size()-sent.size(),sent.size(),sent)==0);
  assert(dispatchServiceLine(command));assert(dispatchServiceLine("OK"));loop();
 }
+static uint32_t initialGpsStartedAt=0;
+static void waitForInitialGps() {
+ // GPS-focused regressions still take the real bounded no-reply OBD startup
+ // path unless they explicitly disable an unavailable CAN module.
+ for(unsigned n=0;n<1000 && StartupLocation==StartupLocationState::Pending;++n) {
+  loop();
+  if(StartupLocation==StartupLocationState::Pending)nowMs+=10;
+ }
+ assert(StartupLocation==StartupLocationState::Acquiring);
+ if(!initialGpsStartedAt)initialGpsStartedAt=nowMs;
+}
 static void completeStartupGnss(bool hasFix=true,bool registered=true,unsigned priorSends=0) {
- loop();assert(StartupLocation==StartupLocationState::Acquiring);
- assert(sendCalls==priorSends && can.sent.empty());
+ waitForInitialGps();
+ assert(sendCalls==priorSends);
  startupReply("AT+CFUN=4");startupReply("AT+QGPS=1");
  if(hasFix) {
   nowMs+=1000;loop();
@@ -212,11 +240,166 @@ static size_t logCount(const std::string& token) {
  while((position=Serial.output.find(token,position))!=std::string::npos){++result;position+=token.size();}
  return result;
 }
+static void runConcurrentStartup(bool hasFix,bool rejectGps=false,bool rejectFirstObd=false) {
+ Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;
+ Services.clock.seedFallback(1793968496LL,Services.now(0));rejectGpsOnly=rejectGps;rejectInitialObd=rejectFirstObd;
+ std::size_t atOffset=0,canOffset=0;
+ unsigned searchRequests=0,searchReplies=0,bitmapReplies=0;
+ uint32_t restoredAt=0,firstObdSendAt=0,searchStartedAt=0;
+ const unsigned char firstPids[]={0x0C,0x0D,0x05,0x04,0x0F,0x11,0x31,0xA6,0x42,0x46};
+ std::deque<unsigned char> initialPids;
+ JsonDocument expected,firstRound;
+ bool gpsStarted=false,initialUploaded=false;
+ bool registrationRestored=false;
+ for(unsigned step=0;step<8000;++step) {
+  const auto previousSends=SentPayloads.size();
+  loop();
+  for(std::size_t n=previousSends;n<SentPayloads.size();++n) {
+   JsonDocument sent;assert(!deserializeJson(sent,SentPayloads[n]));
+   if(!gpsStarted) {
+    assert(!initialUploaded && sent["data"].size()==1 && firstRound.set(sent["data"][0]));
+    assert(StartupObdRoundComplete && StartupObdUploadAttempted);
+    assert(initialPids.size()==10 && firstRound["engine_rpm"]==2000 && firstRound["vehicle_speed"]==42);
+    assert(!firstRound["ambient_air_temp"].isNull());initialUploaded=true;
+   } else if(!sent["data"][0]["engine_rpm"].isNull() && !firstObdSendAt)firstObdSendAt=nowMs;
+  }
+  // Respond to real writes made by the sketch, preserving the AT ownership
+  // boundary and simulating LTE restoration separately from the GPS fix.
+  for(;;) {
+   const auto end=WioCellular.uart.tx.find('\r',atOffset);
+   if(end==std::string::npos)break;
+   const auto command=WioCellular.uart.tx.substr(atOffset,end-atOffset);atOffset=end+1;
+   assert(dispatchServiceLine(command));
+   if(command=="AT+CFUN=4") {
+    assert(!gpsStarted && StartupObdRoundComplete && Obd.initialRoundComplete() && !Obd.waiting());
+    assert(bitmapReplies==6 && initialPids.size()==10);
+    assert(std::equal(initialPids.begin(),initialPids.end(),firstPids));
+    assert(initialUploaded && sendCalls==1);
+    assert(rejectFirstObd ? dataArray.size()==1 : dataArray.size()==0);
+    gpsStarted=true;
+   }
+   if(command=="AT+QGPSLOC=2") {
+    if(hasFix && nowMs>=18000) {
+     assert(dispatchServiceLine("+QGPSLOC: 123456.789,35.12345,139.12345,1.2,12.0,3,0.00,0.0,0.0,061126,08"));
+     assert(dispatchServiceLine("OK"));
+    } else assert(dispatchServiceLine("+CME ERROR: 516"));
+   } else if(command=="AT+CEREG?") {
+    assert(searchRequests>0 && searchReplies>0 && socketOpens==1);
+    assert(dataArray.size()>0 && expected.set(JsonDoc));
+    assert(dispatchServiceLine("+CEREG: 1,1"));assert(dispatchServiceLine("OK"));
+    registrationRestored=true;restoredAt=nowMs;
+   } else {
+    assert(command=="AT+CFUN=4" || command=="AT+QGPS=1" || command=="AT+QGPSEND" ||
+           command=="AT+CFUN=1" || command=="AT+CEREG=1");
+    assert(dispatchServiceLine("OK"));
+    if(command=="AT+QGPS=1")searchStartedAt=nowMs;
+   }
+  }
+  while(canOffset<can.sent.size()) {
+   const auto request=can.sent[canOffset++];
+   // Freeze the acquisition snapshot while checking its eventual delivery;
+   // later scheduled requests may time out, but do not add unrelated rows.
+   if(registrationRestored)continue;
+   if(request[1]==3) {can.rx.push_back({0x7E8,{2,0x43,0,0,0,0,0,0}});continue;}
+   assert(request[1]==1);
+   if(StartupLocation==StartupLocationState::Acquiring)++searchRequests;
+   if(request[2]%32==0) {
+    can.rx.push_back({0x7E8,{6,0x41,request[2],0xFF,0xFF,0xFF,0xFF,0}});
+    if(!gpsStarted)++bitmapReplies;
+   }
+   else if(request[2]==0x0C)can.rx.push_back({0x7E8,{4,0x41,0x0C,0x1F,0x40,0,0,0}});
+   else {
+    const auto length=bg770a::ObdSession::length(request[2]);assert(length>0 && length<=4);
+    can.rx.push_back({0x7E8,{static_cast<unsigned char>(2+length),0x41,request[2],42,0,0,0,0}});
+   }
+   serviceCan();
+   if(!gpsStarted && request[2]%32!=0)initialPids.push_back(request[2]);
+   if(!gpsStarted && initialPids.size()<10) {
+    assert(!StartupObdRoundComplete && StartupLocation==StartupLocationState::Pending);
+    assert(WioCellular.uart.tx.find("AT+CFUN=4")==std::string::npos);
+   }
+   if(StartupLocation==StartupLocationState::Acquiring && request[2]%32!=0)++searchReplies;
+  }
+  if(!registrationRestored)assert(socketOpens==(initialUploaded?1U:0U));
+  if(registrationRestored && dataArray.size()==0 && firstObdSendAt)break;
+  nowMs+=10;
+ }
+ assert(gpsStarted && registrationRestored && firstObdSendAt>=restoredAt && firstObdSendAt-restoredAt<1000);
+ assert(dataArray.size()==0 && searchRequests>0 && searchReplies>0);
+ if(hasFix)assert(firstObdSendAt<CELLULAR_INTERVAL);
+ else {assert(restoredAt-searchStartedAt>=60000 && restoredAt-searchStartedAt<61000);assert(expected["data"].size()>=3);}
+ if(rejectFirstObd) {
+  assert(expected["data"][0]["time"]==firstRound["time"]);
+  assert(expected["data"][0]["engine_rpm"]==firstRound["engine_rpm"]);
+ } else assert(expected["data"][0]["time"]!=firstRound["time"]);
+ std::size_t observed=0;
+ for(std::size_t n=1;n<SentPayloads.size();++n) {
+  const auto& payload=SentPayloads[n];
+  assert(payload.size()<=CELLULAR_PAYLOAD_LIMIT);
+  JsonDocument sent;assert(!deserializeJson(sent,payload));
+  for(JsonObjectConst row:sent["data"].as<JsonArrayConst>()) {
+   if(row["engine_rpm"].isNull())continue;
+   const JsonObjectConst original=expected["data"][observed++].as<JsonObjectConst>();
+   assert(!original.isNull() && row["time"]==original["time"]);
+   assert(row["engine_rpm"]==original["engine_rpm"] && row["vehicle_speed"]==original["vehicle_speed"]);
+  }
+ }
+ assert(observed==expected["data"].size());
+ for(std::size_t n=1;n<expected["data"].size();++n)assert(expected["data"][n]["time"]!=expected["data"][n-1]["time"]);
+ if(rejectGps)assert(StartupLocation==StartupLocationState::Upload && StartupLocationDoc["data"].size()==1);
+ else assert(StartupLocation==StartupLocationState::Complete);
+}
 int main(int argc,char** argv){
  // Legacy scenarios start from an acknowledged heartbeat so their existing
  // telemetry/GNSS assertions retain their original setup. Boot scenarios use
  // the actual firmware default: no heartbeat has been acknowledged yet.
  if(argc<=1 || std::string(argv[1]).find("heartbeat-startup-")!=0)HeartbeatAcknowledged=true;
+ // GPS transport/diagnostic scenarios isolate the stage after the first OBD
+ // upload. The startup-obd-* scenarios exercise that full preceding stage.
+ if(argc>1) {
+  const std::string scenario=argv[1];
+  if(scenario.find("startup-gps-")==0 || scenario=="startup-no-fix-periodic-gps" ||
+     scenario=="startup-no-fix-no-network" || scenario=="startup-ntp-first" ||
+     scenario=="gps-observability" || scenario=="gps-upload-failures" || scenario=="gps-command-timeout-log") {
+   StartupObdRoundComplete=true;StartupObdUploadAttempted=true;
+  }
+ }
+ if(argc>1 && std::string(argv[1])=="startup-obd-early-fix") {
+  runConcurrentStartup(true);
+  std::cout<<"Real PID requests/replies buffer during GPS search; early fix immediately flushes original OBD readings before30s\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="startup-obd-no-fix") {
+  runConcurrentStartup(false);
+  std::cout<<"60s no-fix startup buffers multiple timestamped OBD rounds and promptly drains acknowledged prefixes after LTE returns\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="startup-obd-gps-rejected") {
+  runConcurrentStartup(true,true);
+  std::cout<<"Rejected GPS acknowledgment retains its fix independently while buffered OBD immediately uploads successfully\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="startup-obd-first-rejected") {
+  runConcurrentStartup(true,false,true);
+  std::cout<<"Initial OBD upload precedes GPS even after rejection; original readings remain queued and upload after GPS\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="startup-obd-no-ecu") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;
+  Services.clock.seedFallback(1793968496LL,Services.now(0));
+  while(StartupLocation==StartupLocationState::Pending && nowMs<6000) {
+   loop();
+   if(!Obd.initialRoundComplete()) {
+    assert(WioCellular.uart.tx.find("AT+CFUN=4")==std::string::npos);
+    assert(socketOpens==0 && !StartupObdRoundComplete);
+   }
+   nowMs+=10;
+  }
+  assert(StartupLocation==StartupLocationState::Acquiring && nowMs<6000);
+  assert(Obd.initialRoundComplete() && StartupObdRoundComplete && StartupObdUploadAttempted);
+  assert(dataArray.size()==0 && socketOpens==0 && CanStats.telemetry==0);
+  assert(can.sent.size()==13);
+  for(unsigned n=0;n<3;++n)assert(can.sent[n][2]==0);
+  const unsigned char expectedPids[]={0x0C,0x0D,0x05,0x04,0x0F,0x11,0x31,0xA6,0x42,0x46};
+  for(unsigned n=0;n<10;++n)assert(can.sent[n+3][2]==expectedPids[n]);
+  std::cout<<"Absent ECU completes bounded discovery and one ten-PID round before GPS without fabricating an OBD upload\n";return 0;
+ }
  if(argc>1 && std::string(argv[1])=="gps-observability") {
   // Synthetic modem replies: coordinates are published only after final OK.
   Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;CanReady=false;
@@ -412,7 +595,7 @@ int main(int argc,char** argv){
   // fix independently of CAN, rather than merely extending a session constant.
   Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;CanReady=false;
   loop();assert(StartupLocation==StartupLocationState::Acquiring);
-  assert(Serial.output.find("search_timeout_ms=180000")!=std::string::npos);
+  assert(Serial.output.find("search_timeout_ms=60000")!=std::string::npos);
   startupReply("AT+CFUN=4");startupReply("AT+QGPS=1");
   nowMs=30000;loop();
   assert(StartupLocation==StartupLocationState::Acquiring && sendCalls==0);
@@ -440,16 +623,18 @@ int main(int argc,char** argv){
   std::cout<<"First GPS fix acquired at40s survives former30s cutoff and is acknowledged without an ECU response\n";return 0;
  }
  if(argc>1 && std::string(argv[1])=="startup-gps-first") {
-  Services.ntpEnabled=false;Services.gnssEnabled=true;
-  // A queued OBD row must not precede the first acquired GPS upload.
+  Services.ntpEnabled=false;Services.gnssEnabled=true;CanReady=false;
+  Services.clock.seedFallback(1793968496LL,Services.now(0));
+  // Try the acquired GPS row first, then release the OBD backlog independently
+  // of that row's acknowledgment. Each failed document keeps its own timestamp.
   initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;sendResult=true;
   ReplyChunks={"400 ","{\"error\":\"Invalid payload: decode or JSON failed\",\"private\":\"fixture-private-response\"}"};
-  completeStartupGnss();assert(sendCalls==1);
+  completeStartupGnss();assert(sendCalls==2);
   assert(dataArray.size()==1 && StartupLocation==StartupLocationState::Upload);
   assert(StartupLocationDoc["data"].size()==1 && Services.gnss.modemIdle());
   assert(Serial.output.find("reason=payload_decode")!=std::string::npos);
   assert(Serial.output.find("fixture-private-response")==std::string::npos);
-  JsonDocument sent;assert(!deserializeJson(sent,SentPayloads.back()));
+  JsonDocument sent;assert(!deserializeJson(sent,SentPayloads.front()));
   JsonObjectConst row=sent["data"][0].as<JsonObjectConst>();
   assert(row["time"]=="2026-11-06T12:34:56+00:00");
   assert(row["gps_time"]=="2026-11-06T12:34:56.789+00:00");
@@ -459,18 +644,20 @@ int main(int argc,char** argv){
    "intake_air_temp","throttle_position","distance_traveled","odometer",
    "control_module_voltage","ambient_air_temp","dtc_count","dtc_codes"};
   for(const char* field:fields)assert(row.containsKey(field) && row[field].isNull());
-  nowMs+=1000;loop();assert(sendCalls==1 && dataArray.size()==1);
+  JsonDocument obd;assert(!deserializeJson(obd,SentPayloads[1]));
+  assert(obd["data"][0]["engine_rpm"]==2000);
+  nowMs+=1000;loop();assert(sendCalls==2 && dataArray.size()==1);
   // Keep the initial fix and its acquisition time even after the fresh-fix window.
-  nowMs+=bg770a::GnssSession::RetryMs+1;loop();assert(sendCalls==2);
+  nowMs+=bg770a::GnssSession::RetryMs+1;loop();assert(sendCalls==4);
   assert(StartupLocation==StartupLocationState::Upload && dataArray.size()==1);
-  JsonDocument retry;assert(!deserializeJson(retry,SentPayloads.back()));
+  JsonDocument retry;assert(!deserializeJson(retry,SentPayloads[2]));
   assert(retry["data"][0]["gps_time"]==row["gps_time"]);
   assert(retry["data"][0]["latitude"]==row["latitude"]);
   ReplyChunks={"200 {\"ok\":true}"};
   nowMs+=31000;serviceCan();assert(!serviceStartupLocation());
-  assert(sendCalls==3 && StartupLocation==StartupLocationState::Complete);
+  assert(sendCalls==5 && StartupLocation==StartupLocationState::Complete);
   assert(dataArray.size()==1 && StartupLocationDoc["data"].size()==0);
-  std::cout<<"Startup GPS precedes queued OBD without a prior clock; failed ACK retains the acquired fix for bounded retries and success releases OBD\n";return 0;
+  std::cout<<"Startup GPS and buffered OBD each retain original timestamps after rejected acknowledgments and retry independently\n";return 0;
  }
  if(argc>1 && std::string(argv[1])=="startup-gps-only") {
   Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;
@@ -489,7 +676,9 @@ int main(int argc,char** argv){
   completeStartupGnss(false);
   assert(StartupLocation==StartupLocationState::Complete && sendCalls==0);
   assert(StartupLocationDoc["data"].size()==0 && dataArray.size()==0);
-  assert(nowMs<bg770a::GnssSession::InitialAcquisitionMs+1000);
+  // Search is bounded; stopping GNSS and restoring LTE use separate AT slots.
+  assert(nowMs<bg770a::GnssSession::InitialAcquisitionMs+2000);
+  for(unsigned n=0;n<50 && !Obd.waiting();++n){nowMs+=10;loop();}
   assert(can.sent.size()>0 && Obd.waiting());
   assert(Serial.output.find("status=no_fix_timeout")!=std::string::npos);
   assert(logCount("[GPS-FIX]")==0 && logCount("[GPS-ACK]")==0);
@@ -501,6 +690,8 @@ int main(int argc,char** argv){
   assert(sendCalls==0 && StartupLocation==StartupLocationState::Complete);
   // No ECU ever replies and no upload has succeeded. The ten-minute attempt
   // must nevertheless acquire and send GPS through the independent document.
+  // With no CAN activity the post-search loop may already enter idle sleep.
+  if(ModemSleeping)netPowerOnRestart();
   CanReady=false;can.sent.clear();nowMs=bg770a::GnssSession::RetryMs;serviceCan();
   serviceModem(true,true);assert(StartupLocation==StartupLocationState::Acquiring);
   sendResult=true;completeStartupGnss();
@@ -516,6 +707,7 @@ int main(int argc,char** argv){
   completeStartupGnss(false,false);
   assert(StartupLocation==StartupLocationState::Complete && sendCalls==0);
   assert(Services.atIdle() && !Services.idle());
+  for(unsigned n=0;n<50 && !Obd.waiting();++n){nowMs+=10;loop();}
   assert(Obd.waiting() && can.sent.size()>0);
   assert(dataArray.size()==0 && StartupLocationDoc["data"].size()==0);
   std::cout<<"No-fix startup releases CAN collection even while LTE registration is unavailable\n";return 0;
@@ -1111,5 +1303,5 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','gps-observability gps-upload-failures gps-payload-prefix gps-command-timeout-log qntp-utc-metadata zero-records startup-gps-delayed-fix startup-gps-first startup-gps-only startup-gps-no-fix startup-no-fix-periodic-gps startup-no-fix-no-network startup-gps-recovery startup-ntp-first bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-hourly heartbeat-retry heartbeat-unsynced heartbeat-independent-cadence heartbeat-registration heartbeat-pending-can heartbeat-keeps-polling heartbeat-offline-polling heartbeat-startup-ready heartbeat-startup-unsynced heartbeat-startup-identity heartbeat-startup-lte-backlog heartbeat-startup-retry heartbeat-gps-rejection heartbeat-sleep-deadline config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
+    for scenario in os.environ.get('SKETCH_SCENARIOS','startup-obd-early-fix startup-obd-no-fix startup-obd-gps-rejected startup-obd-first-rejected startup-obd-no-ecu gps-observability gps-upload-failures gps-payload-prefix gps-command-timeout-log qntp-utc-metadata zero-records startup-gps-delayed-fix startup-gps-first startup-gps-only startup-gps-no-fix startup-no-fix-periodic-gps startup-no-fix-no-network startup-gps-recovery startup-ntp-first bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-hourly heartbeat-retry heartbeat-unsynced heartbeat-independent-cadence heartbeat-registration heartbeat-pending-can heartbeat-keeps-polling heartbeat-offline-polling heartbeat-startup-ready heartbeat-startup-unsynced heartbeat-startup-identity heartbeat-startup-lte-backlog heartbeat-startup-retry heartbeat-gps-rejection heartbeat-sleep-deadline config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
         subprocess.run([str(exe),scenario],check=True)

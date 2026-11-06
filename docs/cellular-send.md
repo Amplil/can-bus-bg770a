@@ -17,10 +17,17 @@ upload, even though no upload had been accepted.
 
 ## Changes
 
-- After network/time setup and device identification, the firmware makes its
-  first bounded GNSS acquisition before normal OBD polling or telemetry uploads.
+- After network/time setup and device identification, the firmware immediately
+  polls one complete OBD round, including capability discovery and replies or
+  bounded timeouts for every eligible telemetry PID. It attempts to upload that
+  round over LTE immediately, before beginning the first GPS search. Failed
+  attempts retain the OBD record for retry while allowing GPS to proceed. A
+  round with no timestamped measurements skips the empty upload. During the
+  bounded GNSS acquisition, OBD PID polling and reply collection continue to
+  fill the existing bounded 12-record queue. Further OBD uploads become due immediately
+  when the search ends, including a no-fix timeout, and begin once LTE is ready.
   A valid fix creates a GPS-only row and is sent as soon as LTE is restored,
-  without waiting for an OBD reply. A no-fix attempt returns to normal OBD work.
+  independently of ECU availability, after any pending CAN reply finishes.
   Every startup or periodic fix creates its own GPS-only row, so later fixes
   also upload when the vehicle returns no OBD data. Subsequent GNSS acquisitions
   wait for any queued fix's confirmed delivery and an empty OBD queue. A startup no-fix result still
@@ -36,7 +43,10 @@ upload, even though no upload had been accepted.
 - LTE reattachment after GNSS has a 120-second deadline. Failure enters the
   existing physical-reset recovery path and disables optional GNSS for that boot.
 - Until the first confirmed fix after a modem power cycle, each GNSS search has
-  a 180-second budget. Subsequent searches after that fix retain the 30-second
+  a 60-second budget from the `AT+QGPS=1` acknowledgment, including any in-flight
+  location query. A query still awaiting a final response at the deadline uses
+  modem reset recovery; GNSS stop and LTE restoration take additional time.
+  Subsequent searches after that fix retain the 30-second
   budget. A no-fix result does not shorten the next search. The start log reports
   the active budget as `search_timeout_ms`.
 - After the startup attempt, GNSS acquisition starts are due every ten minutes
@@ -54,8 +64,10 @@ upload, even though no upload had been accepted.
   30-second retry interval. Periodic GNSS waits for this upload to be confirmed
   and for the queue to drain. The queued row retains its original acquisition
   timestamp even when delivery is delayed beyond the cached-location lifetime.
-  OBD collection resumes once the fix is queued; ordinary OBD uploads and idle
-  sleep wait for its acknowledgment. The separate GPS document is preserved
+  OBD collection continues throughout acquisition. The buffered OBD queue drains
+  in acknowledged payloads of up to 1,024 bytes, about one second apart. GPS
+  delivery retries proceed independently of OBD uploads; idle sleep waits for
+  the GPS acknowledgment. The separate GPS document is preserved
   when the bounded OBD queue drops its oldest samples during prolonged failure.
 - OBD numeric fields and DTC results start as JSON `null` and change only after
   accepted replies. Unanswered, rejected and unsupported PID readings remain
@@ -183,23 +195,27 @@ settings, deployed dashboard code, or device identifiers were changed.
 Run `bash tests/cellular/run_tests.sh` with `ARDUINOJSON_INCLUDE` and
 `WIOCELLULAR_INCLUDE` pointing to the installed libraries' `src` directories.
 
-- The GPS-first startup code with QNTP UTC correction, GPS diagnostics and the
-  extended initial fix window compiles offline with Arduino CLI 1.2.0 for Wio
+- Initial OBD collection/upload followed by concurrent GPS/OBD collection, with
+  QNTP UTC correction, GPS diagnostics
+  and the 60-second initial search compiles offline with Arduino CLI 1.2.0 for Wio
   BG770A board 1.0 (`SeeedJP:nrf52:wio_bg770a:board_version=1_0`), using installed
   ArduinoJson 7.4.2, WioCellular 0.3.12 and SeeedJP nRF52 Boards 1.5.0. It uses
-  174,700 bytes of program storage and 12,668 bytes of global RAM. The core emits
+  179,788 bytes of program storage and 12,740 bytes of global RAM. The core emits
   its three existing ignored `used` attribute warnings; compilation has no errors.
   Verification uses the installed dependencies and does not upload firmware.
-- The complete cellular host suite passes with GPS-first startup, QNTP UTC parsing and GPS diagnostics.
+- The complete cellular host suite covers startup buffering, QNTP UTC parsing and GPS diagnostics.
   Initial-fix regressions now prove that polling continues past 30 seconds,
   a first fix at about 40 seconds is uploaded and acknowledged through the
-  extracted sketch, no-fix attempts stop at 180 seconds and retain that budget
+  extracted sketch, no-fix attempts stop at 60 seconds and retain that budget
   for a retry, and searches after a valid fix use 30 seconds. Timer rollover is
   covered. These are synthetic modem responses, not a physical GPS fix.
-  Actual extracted-sketch regressions cover a first GPS upload before queued
-  OBD data and without a prior clock, GPS-only delivery without an ECU response,
+  Actual extracted-sketch regressions cover a complete first OBD round and its
+  immediate LTE upload before GPS, retention after a rejected initial upload,
+  a bounded first round without an ECU response, GPS-only delivery without a prior clock,
   retained fixes and 30-second retries after rejection, and ten-minute periodic
-  acquisition. No-fix cases release CAN collection even while LTE registration
+  acquisition. PID requests and validated replies continue during the search,
+  and the OBD backlog becomes due immediately after an early fix or timeout.
+  Rejected GPS delivery does not block OBD delivery. No-fix cases retain CAN collection even while LTE registration
   is unavailable; a later periodic fix can upload without a prior successful
   upload. A validated fix survives a subsequent GNSS stop failure and modem reset
   with its original acquisition time. NTP ownership remains serialized before
@@ -231,7 +247,8 @@ Run `bash tests/cellular/run_tests.sh` with `ARDUINOJSON_INCLUDE` and
   and bounded batches whose pending GPS row is outside the sent prefix.
   An accepted OBD-only batch explicitly reports zero GPS data.
 
-The NTP offset correction, GPS-first startup, the ten-minute cadence and location reporting through the
+The NTP offset correction, concurrent startup GPS/OBD collection, buffered delivery,
+the ten-minute cadence and location reporting through the
 updated dashboard require a new physical end-to-end check. The physical retest
 below establishes earlier delivery and LTE recovery behavior, not validation of
 these GPS and nullable-reading changes.

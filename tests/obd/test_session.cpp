@@ -102,5 +102,74 @@ int main() {
  rpmPad[1]=0x7F;assert(!paddedRpm.accept(0x7E8,rpmPad,8,107));rpmPad[1]=0x41;
  rpmPad[2]=0x0D;assert(!paddedRpm.accept(0x7E8,rpmPad,8,108));rpmPad[2]=0x0C;
  assert(paddedRpm.accept(0x7E8,rpmPad,8,109));
+ // Initial GPS handoff waits for a complete telemetry sweep, including the
+ // final reply, rather than mistaking discovery or one acquired PID for a round.
+ {
+  ObdSession first(false,true);uint32_t now=0;
+  assert(!first.initialRoundComplete());
+  for(unsigned attempt=0;attempt<3;++attempt) {
+   assert(first.next(now,p) && p==0);
+   first.tick(now+200);now+=300;
+   assert(!first.initialRoundComplete());
+  }
+  const uint8_t expected[]={0x0C,0x0D,0x05,0x04,0x0F,0x11,0x31,0xA6,0x42,0x46};
+  for(unsigned i=0;i<10;++i) {
+   assert(first.next(now,p) && p==expected[i]);
+   assert(!first.initialRoundComplete());
+   uint8_t reply[]={static_cast<uint8_t>(2+ObdSession::length(p)),0x41,p,42,0,0,0,0};
+   if(i==9) {
+    assert(!first.accept(0x7E9,reply,8,now+1));
+    reply[0]=2;assert(!first.accept(0x7E8,reply,8,now+2));reply[0]=3;
+    assert(!first.initialRoundComplete() && first.waiting());
+   }
+   assert(first.accept(0x7E8,reply,8,now+3));now+=103;
+   assert(first.initialRoundComplete()==(i==9));
+  }
+  assert(first.next(now,p) && p==0x0C);
+  assert(first.initialRoundComplete() && first.waiting()); // Sticky across later rounds.
+  first=ObdSession(false,true);assert(!first.initialRoundComplete());
+ }
+ // A silent vehicle still gets exactly one bounded discovery/sweep attempt,
+ // including a timeout for the last PID, across the uptime rollover.
+ {
+  ObdSession silent(false,true);uint32_t now=UINT32_MAX-1500U;
+  for(unsigned i=0;i<13;++i) {
+   assert(silent.next(now,p));assert((i<3)==(p==0));
+   silent.tick(uint32_t(now+199));assert(!silent.initialRoundComplete());
+   silent.tick(uint32_t(now+200));
+   assert(silent.initialRoundComplete()==(i==12));now+=300;
+  }
+ }
+ // Known exclusions and policy-disabled unknown PIDs count as skipped; a
+ // supported PID must still finish before the startup round is complete.
+ {
+  ObdSession supported;assert(supported.next(0,p));
+  uint8_t bits[]={6,0x41,0,0,0x18,0,0,0};
+  assert(!supported.accept(0x7E8,bits,8,1));assert(!supported.initialRoundComplete());
+  assert(!supported.next(101,p));assert(!supported.initialRoundComplete());
+  assert(supported.next(102,p) && p==0x0C);
+  uint8_t reply[]={4,0x41,0x0C,0,0,0,0,0};
+  assert(supported.accept(0x7E8,reply,8,103));assert(!supported.initialRoundComplete());
+  assert(supported.next(203,p) && p==0x0D);reply[0]=3;reply[2]=0x0D;
+  assert(supported.accept(0x7E8,reply,8,204));assert(supported.initialRoundComplete());
+ }
+ for(bool fallback:{false,true}) {
+  ObdSession excludedAll(false,fallback);uint32_t now=0;
+  for(unsigned pageIndex=0;pageIndex<6;++pageIndex) {
+   assert(excludedAll.next(now,p) && p==pageIndex*32);
+   uint8_t bits[]={6,0x41,p,0,0,0,static_cast<uint8_t>(pageIndex<5),0};
+   assert(!excludedAll.accept(0x7E8,bits,8,now+1));now+=101;
+   assert(excludedAll.initialRoundComplete()==(pageIndex==5));
+  }
+  assert(!excludedAll.next(now,p));assert(excludedAll.initialRoundComplete());
+ }
+ {
+  ObdSession strict;uint32_t now=0;
+  for(unsigned attempt=0;attempt<3;++attempt) {
+   assert(strict.next(now,p) && p==0);strict.tick(now+200);now+=300;
+   assert(strict.initialRoundComplete()==(attempt==2));
+  }
+  assert(!strict.next(now,p)); // Unknown telemetry remains disallowed.
+ }
  std::cout<<"OBD session regression tests passed\n";
 }

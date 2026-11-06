@@ -22,7 +22,7 @@ public:
   static constexpr uint32_t AcquisitionMs = 30000;
   // An initial autonomous fix can take longer than the periodic search window.
   // Keep this budget until a valid fix is confirmed, including after no-fix retries.
-  static constexpr uint32_t InitialAcquisitionMs = 180000;
+  static constexpr uint32_t InitialAcquisitionMs = 60000;
   static constexpr uint32_t RetryMs = 600000; // Ten minutes between acquisition starts.
   static constexpr uint32_t ReattachmentMs = 120000;
 private:
@@ -98,6 +98,17 @@ private:
     fix_ = GnssFix{}; candidate_ = GnssFix{}; registered_ = false;
     awaitingReattachment_ = false;
     disabled_ = true; pendingWrite_ = false; state_ = State::ResetNeeded;
+  }
+  bool expireAcquisition(uint32_t now) {
+    if ((state_ != State::PollWait && state_ != State::Poll) ||
+        uint32_t(now - acquisition_) < acquisitionTimeoutMs()) return false;
+    report(Event::AcquisitionTimeout,now,lastPollError_);
+    // A sent poll must not extend the search deadline or accept a late fix.
+    // Reset establishes a fresh AT boundary when its final result is missing;
+    // an unsent poll can safely be replaced by the normal stop command.
+    if (state_ == State::Poll && !pendingWrite_) resetNeeded();
+    else { candidate_ = GnssFix{}; command(State::Stop,"AT+QGPSEND",now); }
+    return true;
   }
   void finish(bool ok, uint32_t now, int cmeError = -1) {
     if(!ok && state_!=State::Poll)report(Event::CommandError,now,cmeError);
@@ -191,6 +202,7 @@ public:
     registrationStatus_=-1;queryRegistrationStatus_=-1;awaitingReattachment_=false;
   }
   void tick(uint32_t now) {
+    if (expireAcquisition(now)) return;
     if (pending() && uint32_t(now - since_) >= 20000) {
       report(Event::CommandTimeout,now);resetNeeded();return;
     }
@@ -214,10 +226,7 @@ public:
       prepareRegistrationQuery(now); return;
     }
     if (state_ == State::PollWait) {
-      if (uint32_t(now - acquisition_) >= acquisitionTimeoutMs()) {
-        report(Event::AcquisitionTimeout,now,lastPollError_);
-        command(State::Stop, "AT+QGPSEND", now);
-      } else if (uint32_t(now - since_) >= 1000)
+      if (uint32_t(now - since_) >= 1000)
         command(State::Poll, "AT+QGPSLOC=2", now);
     }
   }
@@ -253,6 +262,7 @@ public:
     if (state_ == State::BootWait && text == "APP RDY") {
       state_ = State::BootSettle; since_ = now; return true;
     }
+    if (expireAcquisition(now)) return false;
     if (!pending()) return false;
     if (text == command_ || text == command_ + "\r") { echo_ = true; return true; }
     if (state_ == State::Poll && echo_ && text.compare(0,10,"+QGPSLOC: ") == 0) {

@@ -20,6 +20,7 @@ void restore(GnssSession& s, uint32_t t) {
 }
 int main() {
   const char* sample="+QGPSLOC: 123456.000,35.12345,139.12345,1.2,12.0,3,0.00,0.0,0.0,041126,08";
+  static_assert(GnssSession::InitialAcquisitionMs==60000,"Initial GPS search must stop at 60 seconds");
   // A first fix can arrive after the former 30-second cutoff. Keep polling
   // through a cold search, including millis rollover, then use the shorter
   // window only for a later acquisition after a confirmed successful fix.
@@ -51,7 +52,7 @@ int main() {
     assert(cold.diagnostic().elapsedMs==GnssSession::AcquisitionMs);
   }
   // Timing out without any fix must not downgrade the next search to the
-  // short window. A no-fix attempt still terminates at the three-minute bound.
+  // short window. A no-fix attempt still terminates at the 60-second bound.
   {
     GnssSession neverFixed;start(neverFixed,0);
     assert(neverFixed.line("+CME ERROR: 516",1000));
@@ -71,6 +72,49 @@ int main() {
     neverFixed.tick(GnssSession::RetryMs+GnssSession::InitialAcquisitionMs);
     assert(neverFixed.state()==GnssSession::State::Stop);
     assert(neverFixed.diagnostic().event==GnssSession::Event::AcquisitionTimeout);
+  }
+  // The deadline also applies between issuing a poll and receiving its final
+  // result. A pending transaction cannot overrun the bound or publish a late
+  // candidate, and recovery must not write QGPSEND across that AT boundary.
+  for(const uint32_t base:{0U,UINT32_MAX-2000U}) {
+    const auto deadline=uint32_t(base+60000);
+    GnssSession inFlight;start(inFlight,base);
+    assert(inFlight.line("+CME ERROR: 516",uint32_t(base+1000)));
+    inFlight.tick(uint32_t(base+59000));
+    assert(inFlight.takeCommand()=="AT+QGPSLOC=2\r");
+    assert(inFlight.line("AT+QGPSLOC=2",uint32_t(base+59000)));
+    assert(inFlight.line(sample,uint32_t(deadline-1)));
+    inFlight.tick(deadline);
+    assert(inFlight.state()==GnssSession::State::ResetNeeded && inFlight.disabled());
+    assert(inFlight.diagnostic().event==GnssSession::Event::AcquisitionTimeout);
+    assert(inFlight.diagnostic().elapsedMs==60000 && !inFlight.fix().valid);
+    assert(inFlight.takeCommand().empty());
+    assert(!inFlight.line("OK",uint32_t(deadline+1)) && !inFlight.fix().valid);
+
+    // A final OK arriving at the deadline must be rejected even when no tick
+    // has run yet; the modem dispatch path can receive before the next tick.
+    GnssSession finalAtDeadline;start(finalAtDeadline,base);
+    assert(finalAtDeadline.line("+CME ERROR: 516",uint32_t(base+1000)));
+    finalAtDeadline.tick(uint32_t(base+59000));
+    assert(finalAtDeadline.takeCommand()=="AT+QGPSLOC=2\r");
+    assert(finalAtDeadline.line("AT+QGPSLOC=2",uint32_t(base+59000)));
+    assert(finalAtDeadline.line(sample,uint32_t(deadline-1)));
+    assert(!finalAtDeadline.line("OK",deadline));
+    assert(finalAtDeadline.state()==GnssSession::State::ResetNeeded);
+    assert(finalAtDeadline.diagnostic().event==GnssSession::Event::AcquisitionTimeout);
+    assert(!finalAtDeadline.fix().valid && finalAtDeadline.takeCommand().empty());
+
+    // If CAN activity delayed dispatch of the latest poll, it remains unsent
+    // and can be replaced by QGPSEND without resetting a healthy modem.
+    GnssSession unsent;start(unsent,base);
+    assert(unsent.line("+CME ERROR: 516",uint32_t(base+1000)));
+    unsent.tick(uint32_t(deadline-1));
+    assert(unsent.state()==GnssSession::State::Poll);
+    unsent.tick(deadline);
+    assert(unsent.state()==GnssSession::State::Stop && !unsent.disabled());
+    assert(unsent.diagnostic().event==GnssSession::Event::AcquisitionTimeout);
+    assert(unsent.diagnostic().elapsedMs==60000);
+    restore(unsent,uint32_t(deadline+1));
   }
   // Synthetic responses exercise observability without a real antenna/modem.
   // A parsed candidate is not a confirmed fix until the matching final OK.

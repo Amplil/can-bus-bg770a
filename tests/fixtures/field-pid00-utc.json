@@ -1,0 +1,19 @@
+{
+  "provenance": "User-supplied failing-run excerpt, 2026-11-05. Only observed request/response/time facts retained; no device identity. Not a corrected-hardware capture.",
+  "configuration": {"can_kbps": 500, "id_bits": 11, "request_id": 2015, "uart_baud": 9600},
+  "events": [
+    {"kind": "ntp_ready", "millis": 19743, "reported_utc": "2026-11-05T06:38:43+00:00"},
+    {"kind": "tx", "millis": 19750, "id": 2015, "bytes": [2, 1, 0, 0, 0, 0, 0, 0]},
+    {"kind": "queued_log", "millis": 19765, "reported_utc": "2026-11-05T06:38:43+00:00"},
+    {"kind": "rx", "millis": 19780, "id": 2024, "bytes": [7, 65, 0, 255, 255, 255, 255, 255], "reported_utc": "2026-12-24T23:41:30+00:00", "reported_decision": "DROP PCI/application length"},
+    {"kind": "timeout", "millis": 19950, "pid": 0},
+    {"kind": "tx", "millis": 20056, "id": 2015, "bytes": [2, 1, 0, 0, 0, 0, 0, 0]},
+    {"kind": "queued_log", "millis": 20071},
+    {"kind": "modem_state", "millis": 20072, "reported_utc": "2027-02-12T16:44:17+00:00"},
+    {"kind": "rx", "millis": 20085, "id": 2024, "bytes": [7, 65, 0, 255, 255, 255, 255, 255], "reported_utc": "2027-02-12T16:44:17+00:00", "reported_decision": "DROP PCI/application length"}
+  ],
+  "regression_interleaving": {
+    "description": "Code-derived interleaving of observed low ticks; the repeated 19750 is the stale captured variable, not an additional hardware observation.",
+    "ticks": [19750, 19765, 19750, 19780]
+  }
+}

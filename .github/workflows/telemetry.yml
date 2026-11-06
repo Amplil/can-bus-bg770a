@@ -1,0 +1,33 @@
+name: Telemetry regression
+on: [push, pull_request]
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: bblanchon/ArduinoJson
+          ref: v7.4.3
+          path: .test-deps/ArduinoJson
+      - run: |
+          bash tests/ntp/run_tests.sh
+          bash tests/gnss/run_tests.sh
+          bash tests/integration/run_tests.sh
+        env:
+          ARDUINOJSON_INCLUDE: ${{ github.workspace }}/.test-deps/ArduinoJson/src
+  target:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install platformio==6.2.0
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-bg770a-telemetry-v1
+      - run: pio run

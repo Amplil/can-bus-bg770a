@@ -139,6 +139,7 @@ static bool queueStartupLocation();
 static bool serviceStartupLocation();
 static unsigned socketOpens=0;
 static uint32_t socketDelay=0;
+static bool socketOpenResult=true,socketConnectResult=true;
 static std::deque<std::string> SentPayloads;
 static std::deque<std::string> ReplyChunks={"200 {}\r\n"};
 using WioCellularModule=Module;
@@ -148,8 +149,8 @@ static const char* WioCellularResultToString(int){return "fixture-status";}
 template<class T>struct WioCellularTcpClient2 {
  std::deque<std::string> chunks=ReplyChunks;
  explicit WioCellularTcpClient2(T&){}
- bool open(int,const char*,int){++socketOpens;nowMs+=socketDelay;return true;}
- bool waitForConnect(){return true;}
+ bool open(int,const char*,int){++socketOpens;nowMs+=socketDelay;return socketOpenResult;}
+ bool waitForConnect(){return socketConnectResult;}
  bool send(const char* bytes,size_t size){++sendCalls;SentPayloads.emplace_back(bytes,size);return sendResult;}
  int getLastResult(){return 0;}
  bool receive(uint8_t* out,size_t cap,size_t* size,int remaining){assert(remaining>0);nowMs+=1;
@@ -165,7 +166,7 @@ String addMillisTime();
 void sendDtcRequest();
 bool arrayEmptyCheck(JsonArrayConst);
 '''+defines+'\n'+constants+'\n'
-for signature in ['static bool canIdle()', 'static bool cellularOnline()', 'static void trace(', 'static const char* rejectionName(', 'static void traceFrame(', 'static void tickCan(', 'static void canSummary()', 'static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(', 'static bool waitForCellularNetwork(',
+for signature in ['static bool canIdle()', 'static bool cellularOnline()', 'static void trace(', 'static bool hasGpsPosition(', 'static size_t gpsRowCount(', 'static std::string gpsPayloadTime(', 'static void logGpsPosition(', 'static void logGpsPayload(', 'static void logGpsDiagnostic()', 'static const char* rejectionName(', 'static void traceFrame(', 'static void tickCan(', 'static void canSummary()', 'static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(', 'static bool waitForCellularNetwork(',
  'static void attachFreshLocation()', 'static bool queueStartupLocation()', 'static bool dispatchServiceLine(', 'static bool serviceStartupLocation()', 'static bool cellularSend(const JsonDocument &doc)', 'void initCAN() {', 'String dtcToString(', 'void processDtcData(unsigned char* data)',
  'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void clearSentData(', 'static void discardEmptyVehicleRecords() {', 'static void initializeVehicleDataSchema() {',
  'String addMillisTime() {', 'bool getTime(char* time) {', 'bool arrayEmptyCheck(', 'void sendDtcRequest() {','void loop() {']:
@@ -192,14 +193,147 @@ static void completeStartupGnss(bool hasFix=true,bool registered=true) {
   assert(dispatchServiceLine("OK"));loop();
   assert(StartupLocationDoc["data"].size()==1);
  } else {
-  nowMs+=bg770a::GnssSession::AcquisitionMs;loop();
+  nowMs+=Services.gnss.acquisitionTimeoutMs();loop();
   assert(!Services.gnss.fix().valid);
  }
  startupReply("AT+QGPSEND");startupReply("AT+CFUN=1");startupReply("AT+CEREG=1");
  assert(dispatchServiceLine("AT+CEREG?"));
  assert(dispatchServiceLine(registered?"+CEREG: 1,1":"+CEREG: 1,0"));assert(dispatchServiceLine("OK"));loop();
 }
+static size_t logCount(const std::string& token) {
+ size_t result=0,position=0;
+ while((position=Serial.output.find(token,position))!=std::string::npos){++result;position+=token.size();}
+ return result;
+}
 int main(int argc,char** argv){
+ if(argc>1 && std::string(argv[1])=="gps-observability") {
+  // Synthetic modem replies: coordinates are published only after final OK.
+  Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;CanReady=false;
+  loop();assert(StartupLocation==StartupLocationState::Acquiring);
+  assert(Serial.output.find("[GPS-ACQUIRE]")!=std::string::npos);
+  assert(logCount("[GPS-FIX]")==0 && logCount("[GPS-ACK]")==0);
+  startupReply("AT+CFUN=4");startupReply("AT+QGPS=1");
+  nowMs+=1000;loop();assert(dispatchServiceLine("AT+QGPSLOC=2"));
+  assert(dispatchServiceLine("+CME ERROR: 516"));loop();
+  assert(Serial.output.find("status=no_fix cme_error=516")!=std::string::npos);
+  assert(logCount("[GPS-FIX]")==0 && sendCalls==0);
+  nowMs+=1000;loop();assert(dispatchServiceLine("AT+QGPSLOC=2"));
+  assert(dispatchServiceLine("+QGPSLOC: fixture-private-invalid-location"));
+  assert(Serial.output.find("status=invalid_response")!=std::string::npos);
+  assert(Serial.output.find("fixture-private-invalid-location")==std::string::npos);
+  assert(dispatchServiceLine("OK"));loop();assert(!Services.gnss.fix().valid);
+  nowMs+=1000;loop();assert(dispatchServiceLine("AT+QGPSLOC=2"));
+  assert(dispatchServiceLine("+QGPSLOC: 123456.789,0.00000,0.00000,1.2,0.0,3,0.00,0.0,0.0,061126,08"));
+  assert(!Services.gnss.fix().valid && logCount("[GPS-FIX]")==0);
+  assert(dispatchServiceLine("OK"));
+  assert(Services.gnss.fix().valid && logCount("[GPS-FIX]")==1);
+  assert(Serial.output.find("status=acquired gps_utc=2026-11-06T12:34:56.789+00:00")!=std::string::npos);
+  assert(Serial.output.find("latitude=0.000000 longitude=0.000000 altitude_m=0.0")!=std::string::npos);
+  assert(StartupLocation==StartupLocationState::Upload && StartupLocationDoc["data"].size()==1);
+  assert(logCount("[GPS-QUEUE]")==1 && logCount("status=awaiting_ack")==0);
+  loop();startupReply("AT+QGPSEND");startupReply("AT+CFUN=1");startupReply("AT+CEREG=1");
+  assert(dispatchServiceLine("AT+CEREG?"));assert(dispatchServiceLine("+CEREG: 1,1"));
+  assert(dispatchServiceLine("OK"));loop();
+  assert(sendCalls==1 && StartupLocation==StartupLocationState::Complete);
+  assert(Serial.output.find("direct_gps_rows=1 root_location=0 records=1")!=std::string::npos);
+  assert(Serial.output.find("source=record")!=std::string::npos);
+  assert(logCount("status=awaiting_ack")==1);
+  assert(logCount("status=accepted server_status=200 direct_gps_rows=1 root_location=0")==1);
+  assert(logCount("[GPS-FIX]")==1);
+  std::cout<<"GPS diagnostics distinguish polling/errors/candidates from a confirmed zero-coordinate fix, queued payload and positive upload acknowledgment\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="gps-upload-failures") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;CanReady=false;
+  socketOpenResult=false;completeStartupGnss();
+  assert(sendCalls==0 && StartupLocationDoc["data"].size()==1);
+  assert(Serial.output.find("status=open_failed")!=std::string::npos);
+  assert(logCount("status=awaiting_ack")==0 && logCount("status=accepted server_status=")==0);
+  socketOpenResult=true;socketConnectResult=false;nowMs+=31000;serviceCan();serviceStartupLocation();
+  assert(sendCalls==0 && StartupLocationDoc["data"].size()==1);
+  assert(Serial.output.find("status=connect_failed")!=std::string::npos);
+  socketConnectResult=true;sendResult=false;nowMs+=31000;serviceCan();serviceStartupLocation();
+  assert(sendCalls==1 && StartupLocationDoc["data"].size()==1);
+  assert(Serial.output.find("status=send_failed")!=std::string::npos);
+  assert(logCount("status=awaiting_ack")==0);
+  sendResult=true;ReplyChunks={"400 {\"private\":\"fixture-private-response\"}"};
+  nowMs+=31000;serviceCan();serviceStartupLocation();
+  assert(sendCalls==2 && StartupLocationDoc["data"].size()==1);
+  assert(logCount("status=awaiting_ack")==1 && logCount("status=accepted server_status=")==0);
+  assert(Serial.output.find("status=unconfirmed server_status=400 direct_gps_rows=1 root_location=0 retained=1")!=std::string::npos);
+  assert(Serial.output.find("fixture-private-response")==std::string::npos);
+  ReplyChunks={"200 {\"ok\":true}"};nowMs+=31000;serviceCan();serviceStartupLocation();
+  assert(sendCalls==3 && StartupLocation==StartupLocationState::Complete && StartupLocationDoc["data"].size()==0);
+  assert(logCount("status=awaiting_ack")==2 && logCount("status=accepted server_status=200 direct_gps_rows=1 root_location=0")==1);
+  std::cout<<"GPS upload diagnostics report open/connect/send/ACK failures and retain the fix; only a positive endpoint ACK reports accepted\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="gps-payload-prefix") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;sendResult=true;CanReady=false;
+  Services.clock.seedFallback(1793968496LL,Services.now(0));loop();Serial.output.clear();
+  for(unsigned n=0;n<6;++n){initializeVehicleDataSchema();vehicleData["engine_rpm"]=1000+n;}
+  vehicleData["latitude"]=35.12345;vehicleData["longitude"]=139.12345;
+  vehicleData["gps_time"]="2026-11-06T12:34:56.789+00:00";
+  assert(cellularSend(JsonDoc) && LastSentRecords<6);
+  assert(Serial.output.find("direct_gps_rows=0 root_location=0 records=")!=std::string::npos);
+  assert(logCount("status=accepted server_status=200 direct_gps_rows=0 root_location=0")==1);
+  assert(logCount("[GPS-POSITION]")==0);
+  clearSentData(LastSentRecords);bool sawGps=false;
+  while(dataArray.size()) {
+   Serial.output.clear();assert(cellularSend(JsonDoc));
+   JsonDocument sent;assert(!deserializeJson(sent,SentPayloads.back()));
+   bool containsGps=false;for(JsonObjectConst row:sent["data"].as<JsonArrayConst>())if(!row["latitude"].isNull())containsGps=true;
+   assert((logCount("status=accepted server_status=200 direct_gps_rows=1 root_location=0")==1)==containsGps);
+   sawGps=sawGps||containsGps;clearSentData(LastSentRecords);
+  }
+  assert(sawGps);
+  // A root-level fix is a separate, explicitly counted GPS representation.
+  JsonDocument envelope;envelope["imsi"]="fixture-device";
+  JsonObject record=envelope["data"].to<JsonArray>().add<JsonObject>();
+  bg770a::initializeObdFields(record);record["time"]="2026-11-06T12:34:56+00:00";record["engine_rpm"]=1000;
+  JsonObject location=envelope["location"].to<JsonObject>();
+  location["latitude"]=35.12345;location["longitude"]=139.12345;location["altitude_m"]=0;
+  location["utc_hhmmss"]="123456.789";location["date_ddmmyy"]="061126";
+  location["hdop"]=1.2;location["fix_type"]=3;location["satellites"]=8;location["age_ms"]=0;location["source"]="gnss";
+  Serial.output.clear();assert(cellularSend(envelope));
+  assert(Serial.output.find("direct_gps_rows=0 root_location=1 records=1")!=std::string::npos);
+  assert(Serial.output.find("source=root_location")!=std::string::npos);
+  assert(Serial.output.find("gps_utc=2026-11-06T12:34:56.789+00:00")!=std::string::npos);
+  assert(logCount("status=accepted server_status=200 direct_gps_rows=0 root_location=1")==1);
+  std::cout<<"GPS payload/ACK counts describe only the actual transmitted prefix and distinguish direct GPS rows from root location metadata\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="gps-command-timeout-log") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;CanReady=false;loop();
+  nowMs+=20000;loop();
+  assert(Services.gnss.disabled() && WioCellular.uart.resets==1);
+  assert(Serial.output.find("status=command_timeout")!=std::string::npos);
+  assert(Serial.output.find("disabled=1")!=std::string::npos);
+  assert(logCount("[GPS-FIX]")==0 && logCount("[GPS-ACK]")==0 && sendCalls==0);
+  std::cout<<"GNSS command timeout and disabled recovery are visible without falsely claiming a fix or upload\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="qntp-utc-metadata") {
+  Services.ntpEnabled=true;Services.gnssEnabled=false;sendResult=true;
+  loop();assert(StartupLocation==StartupLocationState::Complete);
+  assert(dispatchServiceLine(Services.ntp.command()));assert(dispatchServiceLine("OK"));
+  // Synthetic QNTP input based on documented UTC semantics, not a claimed
+  // raw response captured from the user's nine-hour-offset field excerpt.
+  assert(dispatchServiceLine("+QNTP: 0,\"2026/11/06,13:01:57+36\""));
+  loop();assert(deviceIMSI[0]); // Identity retrieval resumes after NTP releases AT ownership.
+  assert(addMillisTime()=="2026-11-06T13:01:57+00:00");
+  initializeVehicleDataSchema();vehicleData["engine_rpm"]=1234;
+  assert(vehicleData["time"]=="2026-11-06T13:01:57+00:00");
+  assert(vehicleData["time_source"]=="ntp");
+  assert(cellularSend(JsonDoc) && LastSentRecords==1);
+  JsonDocument payload;assert(!deserializeJson(payload,SentPayloads.back()));
+  assert(payload["data"][0]["time"]=="2026-11-06T13:01:57+00:00");
+  assert(Serial.output.find("[LTE-SEND] 2026-11-06T13:01:57+00:00")!=std::string::npos);
+  assert(Serial.output.find("response_time=2026/11/06,13:01:57+36 interpreted_utc=2026-11-06T13:01:57+00:00")!=std::string::npos);
+  assert(Serial.output.find("2026-11-06T04:01:57+00:00")==std::string::npos);
+  assert(dispatchServiceLine("+QNTP: 0,\"fixture-private-invalid-time\""));
+  assert(Serial.output.find("fixture-private-invalid-time")==std::string::npos);
+  // HTTP offset syntax remains local-time based and subtracts its offset once.
+  int64_t epoch;assert(bg770a::parseHttpTime("2026-11-06T22:01:57+09:00",epoch));
+  assert(bg770a::isoUtc(epoch)=="2026-11-06T13:01:57+00:00");
+  std::cout<<"Synthetic QNTP UTC digits survive nonzero suffix metadata through clock, diagnostics, record and actual sender; HTTP offsets convert once\n";return 0;
+ }
  if(argc>1 && std::string(argv[1])=="zero-records") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
   Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
@@ -262,6 +396,38 @@ int main(int argc,char** argv){
   }
   std::cout<<"Unavailable OBD values serialize as null; validated zero speed, zero temperature and no-fault DTC remain measured; empty rows excluded\n";return 0;
  }
+ if(argc>1 && std::string(argv[1])=="startup-gps-delayed-fix") {
+  // The real sketch must keep searching past 30s and deliver a later first
+  // fix independently of CAN, rather than merely extending a session constant.
+  Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;CanReady=false;
+  loop();assert(StartupLocation==StartupLocationState::Acquiring);
+  assert(Serial.output.find("search_timeout_ms=180000")!=std::string::npos);
+  startupReply("AT+CFUN=4");startupReply("AT+QGPS=1");
+  nowMs=30000;loop();
+  assert(StartupLocation==StartupLocationState::Acquiring && sendCalls==0);
+  assert(dispatchServiceLine("AT+QGPSLOC=2"));
+  assert(dispatchServiceLine("+CME ERROR: 516"));loop();
+  assert(logCount("status=no_fix_timeout")==0 && logCount("[GPS-FIX]")==0);
+  nowMs=40000;loop();assert(dispatchServiceLine("AT+QGPSLOC=2"));
+  assert(dispatchServiceLine("+QGPSLOC: 123456.789,35.12345,139.12345,1.2,12.0,3,0.00,0.0,0.0,061126,08"));
+  assert(logCount("[GPS-FIX]")==0);
+  assert(dispatchServiceLine("OK"));loop();
+  assert(logCount("[GPS-FIX]")==1 && sendCalls==0);
+  const auto elapsed=Services.gnss.diagnostic().elapsedMs;
+  assert(elapsed>bg770a::GnssSession::AcquisitionMs && elapsed<=40000);
+  assert(Serial.output.find("elapsed_ms="+std::to_string(elapsed))!=std::string::npos);
+  startupReply("AT+QGPSEND");startupReply("AT+CFUN=1");startupReply("AT+CEREG=1");
+  assert(dispatchServiceLine("AT+CEREG?"));
+  assert(dispatchServiceLine("+CEREG: 1,1"));assert(dispatchServiceLine("OK"));loop();
+  assert(sendCalls==1 && StartupLocation==StartupLocationState::Complete);
+  assert(logCount("[GPS-ACK]")==1 && dataArray.size()==0 && can.sent.empty());
+  JsonDocument sent;assert(!deserializeJson(sent,SentPayloads.back()));
+  JsonObjectConst row=sent["data"][0].as<JsonObjectConst>();
+  assert(row["gps_time"]=="2026-11-06T12:34:56.789+00:00");
+  assert(std::abs(row["latitude"].as<double>()-35.12345)<0.00001);
+  assert(row["engine_rpm"].isNull() && row["vehicle_speed"].isNull());
+  std::cout<<"First GPS fix acquired at40s survives former30s cutoff and is acknowledged without an ECU response\n";return 0;
+ }
  if(argc>1 && std::string(argv[1])=="startup-gps-first") {
   Services.ntpEnabled=false;Services.gnssEnabled=true;
   // A queued OBD row must not precede the first acquired GPS upload.
@@ -312,8 +478,10 @@ int main(int argc,char** argv){
   completeStartupGnss(false);
   assert(StartupLocation==StartupLocationState::Complete && sendCalls==0);
   assert(StartupLocationDoc["data"].size()==0 && dataArray.size()==0);
-  assert(nowMs<bg770a::GnssSession::AcquisitionMs+1000);
+  assert(nowMs<bg770a::GnssSession::InitialAcquisitionMs+1000);
   assert(can.sent.size()>0 && Obd.waiting());
+  assert(Serial.output.find("status=no_fix_timeout")!=std::string::npos);
+  assert(logCount("[GPS-FIX]")==0 && logCount("[GPS-ACK]")==0);
   std::cout<<"Startup no-fix acquisition ends at its bound, restores LTE and resumes OBD without fabricated GPS\n";return 0;
  }
  if(argc>1 && std::string(argv[1])=="startup-no-fix-periodic-gps") {
@@ -710,5 +878,5 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','zero-records startup-gps-first startup-gps-only startup-gps-no-fix startup-no-fix-periodic-gps startup-no-fix-no-network startup-gps-recovery startup-ntp-first bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
+    for scenario in os.environ.get('SKETCH_SCENARIOS','gps-observability gps-upload-failures gps-payload-prefix gps-command-timeout-log qntp-utc-metadata zero-records startup-gps-delayed-fix startup-gps-first startup-gps-only startup-gps-no-fix startup-no-fix-periodic-gps startup-no-fix-no-network startup-gps-recovery startup-ntp-first bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
         subprocess.run([str(exe),scenario],check=True)

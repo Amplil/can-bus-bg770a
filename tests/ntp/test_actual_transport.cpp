@@ -69,5 +69,14 @@ int main() {
    assert(h.session.modemIdle());assert(!h.synced());nowMs=60000;assert(h.clock.ready(nowMs)); }
  { Harness h;h.begin();h.module.uart.inject("OK\r\n"+ntp);h.pump();assert(!h.synced());assert(!h.session.modemIdle()); }
  { Harness h;assert(!h.session.begin(0,1,"host\"\rAT+RESET"));assert(h.session.modemIdle());assert(h.module.uart.written.empty()); }
- std::cout<<"Actual upstream AtClient transport: 10 scenarios passed; all read waits were zero.\n";
+ // Synthetic nonzero metadata replies pass through the real dispatcher without
+ // applying that metadata to the UTC clock digits, even byte by byte.
+ int64_t expected;assert(ntp_candidate::parse("2026/11/06,13:01:57+00",expected));
+ for(const char* suffix:{"+36","-28"}) {
+  Harness h;h.begin();
+  const auto reply=h.session.command()+"\r\r\nOK\r\n+QNTP: 0,\"2026/11/06,13:01:57"+suffix+"\"\r\n";
+  for(char c:reply) {h.module.uart.inject(std::string(1,c));h.pump(1);}
+  h.pump();int64_t epoch;assert(h.clock.utc(nowMs,epoch) && epoch==expected);
+ }
+ std::cout<<"Actual upstream AtClient transport: response ordering, fragmentation and UTC timezone metadata passed; all read waits were zero.\n";
 }

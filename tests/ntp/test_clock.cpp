@@ -4,7 +4,7 @@
 using ntp_candidate::NtpClock;
 const char* ok="+QNTP: 0,\"2026/11/04,09:00:00+36\"";
 int main() {
- int64_t e=0,base=0; ntp_candidate::parse("2026/11/04,00:00:00+00",base);
+ int64_t e=0,base=0; ntp_candidate::parse("2026/11/04,09:00:00+00",base);
  NtpClock c;
  assert(!c.utc(0,e)); assert(!c.urc("+OTHER: 0",0));
  assert(c.begin(0)); assert(!c.begin(1)); c.accepted(1); assert(!c.utc(1,e));
@@ -24,5 +24,13 @@ int main() {
  NtpClock query; query.begin(0); query.accepted(1); query.urc("+QNTP: \"server\",123",2); assert(query.state()==NtpClock::State::Pending);
  NtpClock delayed; delayed.begin(0); delayed.accepted(1); delayed.urc(ok,130001);
  assert(delayed.state()==NtpClock::State::Quarantined); assert(!delayed.utc(130002,e));
+ // Synthetic positive and negative timezone metadata must not shift QNTP UTC.
+ int64_t expected;assert(ntp_candidate::parse("2026/11/06,13:01:57+00",expected));
+ for(const char* suffix:{"+00","+36","-28","+56","-48","+23"}) {
+  NtpClock utc;assert(utc.begin(0));utc.accepted(1);
+  assert(utc.urc(std::string("+QNTP: 0,\"2026/11/06,13:01:57")+suffix+"\"",100));
+  assert(utc.utc(1100,e) && e==expected+1);
+  assert(std::string(utc.source())=="ntp" && std::string(utc.quality(1100))=="synced");
+ }
  std::cout << "NTP state-machine tests passed\n";
 }

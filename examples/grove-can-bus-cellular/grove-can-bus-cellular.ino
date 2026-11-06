@@ -134,6 +134,83 @@ static void trace(const char* event) {
     Serial.print(bg770a::isoUtc(epoch).c_str());Serial.print(" ");
   } else Serial.print("UTC=unsynced ");
 }
+static void logGpsDiagnostic() {
+  const auto& diagnostic=Services.gnss.diagnostic();
+  using E=bg770a::GnssSession::Event;
+  if(diagnostic.event==E::None)return;
+  if(diagnostic.event==E::FixAcquired) {
+    const auto& fix=Services.gnss.fix();
+    if(!fix.valid)return;
+    trace("GPS-FIX");Serial.printf("status=acquired gps_utc=%s latitude=%.6f longitude=%.6f altitude_m=%.1f hdop=%.1f satellites=%u fix_type=%u polls=%u elapsed_ms=%lu\n",
+      bg770a::gnssIsoUtc(fix).c_str(),fix.latitude,fix.longitude,fix.altitude,fix.hdop,
+      fix.satellites,fix.fix,diagnostic.pollCount,static_cast<unsigned long>(diagnostic.elapsedMs));
+    return;
+  }
+  if(diagnostic.event==E::AcquisitionStarted) {
+    trace("GPS-ACQUIRE");Serial.printf("status=started search_timeout_ms=%lu\n",
+      static_cast<unsigned long>(Services.gnss.acquisitionTimeoutMs()));return;
+  }
+  if(diagnostic.event==E::PollNoFix || diagnostic.event==E::PollError ||
+     diagnostic.event==E::InvalidResponse || diagnostic.event==E::DuplicateFix) {
+    const char* status=diagnostic.event==E::InvalidResponse?"invalid_response":
+      diagnostic.event==E::DuplicateFix?"duplicate_fix":
+      diagnostic.event==E::PollNoFix || diagnostic.cmeError==516?"no_fix":"modem_error";
+    trace("GPS-POLL");Serial.printf("status=%s cme_error=%d polls=%u elapsed_ms=%lu\n",
+      status,diagnostic.cmeError,diagnostic.pollCount,static_cast<unsigned long>(diagnostic.elapsedMs));return;
+  }
+  if(diagnostic.event==E::AcquisitionTimeout) {
+    trace("GPS-ACQUIRE");Serial.printf("status=no_fix_timeout cme_error=%d polls=%u elapsed_ms=%lu disabled=%u\n",
+      diagnostic.cmeError,diagnostic.pollCount,static_cast<unsigned long>(diagnostic.elapsedMs),unsigned(Services.gnss.disabled()));return;
+  }
+  static const char* const states[]={"Idle","Offline","Start","PollWait","Poll","Stop","Online",
+    "RestoreUrc","Registration","FlowControl","FlowSettle","ResetNeeded","BootWait","BootSettle"};
+  const char* status=diagnostic.event==E::CommandError?"command_error":
+    diagnostic.event==E::CommandTimeout?"command_timeout":
+    diagnostic.event==E::ReattachmentTimeout?"reattachment_timeout":"recovery";
+  trace("GPS-ERROR");Serial.printf("status=%s state=%s cme_error=%d polls=%u elapsed_ms=%lu disabled=%u\n",
+    status,states[unsigned(diagnostic.state)],diagnostic.cmeError,diagnostic.pollCount,
+    static_cast<unsigned long>(diagnostic.elapsedMs),unsigned(Services.gnss.disabled()));
+}
+static bool hasGpsPosition(JsonObjectConst record) {
+  if(!record["latitude"].is<double>() || !record["longitude"].is<double>())return false;
+  const double latitude=record["latitude"].as<double>(),longitude=record["longitude"].as<double>();
+  return std::isfinite(latitude) && latitude>=-90 && latitude<=90 &&
+    std::isfinite(longitude) && longitude>=-180 && longitude<=180;
+}
+static size_t gpsRowCount(const JsonDocument& doc) {
+  size_t count=0;
+  for(JsonObjectConst record:doc["data"].as<JsonArrayConst>())if(hasGpsPosition(record))++count;
+  return count;
+}
+static std::string gpsPayloadTime(JsonObjectConst record,bool rootLocation) {
+  if(!rootLocation) {
+    const char* timestamp=record["gps_time"].as<const char*>();int64_t epoch;
+    return timestamp && bg770a::parseHttpTime(timestamp,epoch)?timestamp:"unknown";
+  }
+  const char* utc=record["utc_hhmmss"].as<const char*>();
+  const char* date=record["date_ddmmyy"].as<const char*>();
+  if(!utc || !date || !bg770a::detail::utcValid(utc) || !bg770a::detail::dateValid(date))return "unknown";
+  bg770a::GnssFix fix;fix.valid=true;
+  std::memcpy(fix.utc,utc,sizeof(fix.utc));std::memcpy(fix.date,date,sizeof(fix.date));
+  return bg770a::gnssIsoUtc(fix);
+}
+static void logGpsPosition(const char* source,JsonObjectConst record,bool rootLocation=false) {
+  if(!hasGpsPosition(record))return;
+  trace("GPS-POSITION");Serial.printf("source=%s gps_utc=%s latitude=%.6f longitude=%.6f",
+    source,gpsPayloadTime(record,rootLocation).c_str(),record["latitude"].as<double>(),record["longitude"].as<double>());
+  const auto altitude=record[rootLocation?"altitude_m":"altitude"];
+  if(altitude.is<double>() && std::isfinite(altitude.as<double>()))Serial.printf(" altitude_m=%.1f",altitude.as<double>());
+  else Serial.print(" altitude_m=unknown");
+  if(rootLocation && record["age_ms"].is<unsigned long>())Serial.printf(" cache_age_ms=%lu",record["age_ms"].as<unsigned long>());
+  Serial.println();
+}
+static void logGpsPayload(const JsonDocument& batch) {
+  const bool rootLocation=hasGpsPosition(batch["location"].as<JsonObjectConst>());
+  trace("GPS-PAYLOAD");Serial.printf("direct_gps_rows=%u root_location=%u records=%u\n",
+    unsigned(gpsRowCount(batch)),unsigned(rootLocation),unsigned(batch["data"].size()));
+  for(JsonObjectConst record:batch["data"].as<JsonArrayConst>())logGpsPosition("record",record);
+  if(rootLocation)logGpsPosition("root_location",batch["location"].as<JsonObjectConst>(),true);
+}
 static const char* rejectionName(bg770a::ObdSession::Reject reason) {
   using R=bg770a::ObdSession::Reject;
   switch(reason) {
@@ -181,7 +258,9 @@ static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
   if(!CellularReady || ModemSleeping)return;
   for(int i=0;i<4;++i) WioCellular.doWork(0);
   if(SynchronousModem)return;
+  auto gpsSequence=Services.gnss.diagnostic().sequence;
   Services.tick(millis());
+  if(Services.gnss.diagnostic().sequence!=gpsSequence)logGpsDiagnostic();
   static int lastNtp=-1,lastGnss=-1;
   const int ntp=int(Services.ntp.phase()),gnss=int(Services.gnss.state());
   if(ntp!=lastNtp || gnss!=lastGnss) {
@@ -202,8 +281,10 @@ static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
   }
   const bool initialGnss=allowGnss && StartupLocation==StartupLocationState::Pending && deviceIMSI[0];
   const bool periodicGnss=allowGnss && StartupLocation==StartupLocationState::Complete && dataArray.size()==0;
+  gpsSequence=Services.gnss.diagnostic().sequence;
   const auto command=Services.command(millis(),WioNetwork.config.pdpContextId,online,
                                       allowNtp,initialGnss || periodicGnss);
+  if(Services.gnss.diagnostic().sequence!=gpsSequence)logGpsDiagnostic();
   if((initialGnss || periodicGnss) && command=="AT+CFUN=4\r") {
     StartupLocation=StartupLocationState::Acquiring;
     StartupLocationAttempted=false;
@@ -329,11 +410,16 @@ static bool queueStartupLocation() {
   record["altitude"]=fix.altitude;
   record["time_source"]="gnss";record["time_sync_state"]="synced";
   record["utc_epoch_s"]=epoch;
-  return !StartupLocationDoc.overflowed() && bg770a::hasTelemetryMeasurement(record);
+  if(StartupLocationDoc.overflowed() || !bg770a::hasTelemetryMeasurement(record))return false;
+  trace("GPS-QUEUE");Serial.printf("status=queued gps_utc=%s records=1 retained_until_ack=1\n",timestamp.c_str());
+  logGpsPosition("queued",record);
+  return true;
 }
 
 static bool dispatchServiceLine(const std::string& line) {
+  const auto gpsSequence=Services.gnss.diagnostic().sequence;
   const bool handled=Services.line(line,millis());
+  if(Services.gnss.diagnostic().sequence!=gpsSequence)logGpsDiagnostic();
   // Capture a validated fix at the response boundary, before a later GNSS stop
   // or LTE recovery failure can clear the session's live fix.
   if(StartupLocation==StartupLocationState::Acquiring && queueStartupLocation()) {
@@ -342,6 +428,15 @@ static bool dispatchServiceLine(const std::string& line) {
   }
   if(line.compare(0,7,"+QNTP: ")==0) {
     trace("NTP-RESULT");Serial.printf("source=%s quality=%s result=%s\n",Services.clock.source(),Services.clock.quality(Services.now(millis())),Services.clock.lastError());
+    // Print only a validated, fixed-length clock sample, never arbitrary URCs.
+    // This distinguishes modem clock digits from the timezone metadata and
+    // makes a future firmware-specific interpretation mismatch observable.
+    int64_t epoch;
+    if(line.size()==33 && line.compare(7,3,"0,\"")==0 && line.back()=='"' &&
+       ntp_candidate::parseQntpUtc(line.substr(10,22),epoch)) {
+      trace("NTP-SAMPLE");Serial.printf("response_time=%s interpreted_utc=%s\n",
+        line.substr(10,22).c_str(),bg770a::isoUtc(epoch).c_str());
+    }
   }
   return handled;
 }
@@ -373,6 +468,19 @@ static bool serviceStartupLocation() {
     if(cellularSend(StartupLocationDoc)) {
       StartupLocationDoc.clear();StartupLocation=StartupLocationState::Complete;
       trace("GPS-STARTUP");Serial.println("first location acknowledged; resuming OBD telemetry");
+    }
+  }
+  if(StartupLocation==StartupLocationState::Upload) {
+    static uint32_t lastWait=0;static const char* lastReason="";
+    const char* reason=!CellularReady?"modem_not_ready":ModemSleeping?"modem_sleeping":
+      !canIdle()?"OBD_response_pending":!Services.atIdle()?"modem_recovery_or_AT_busy":
+      !Services.gnss.canSend()?"lte_registration":!deviceIMSI[0]?"device_identity":"retry_interval";
+    if(std::strcmp(lastReason,reason)!=0 || uint32_t(millis()-lastWait)>=5000) {
+      lastWait=millis();lastReason=reason;
+      const uint32_t elapsed=uint32_t(millis()-StartupLocationLastAttempt);
+      const uint32_t retry=StartupLocationAttempted && elapsed<CELLULAR_INTERVAL?CELLULAR_INTERVAL-elapsed:0;
+      trace("GPS-UPLOAD");Serial.printf("status=waiting reason=%s registration=%d direct_gps_rows_pending=%u next_retry_ms=%lu retained=1\n",
+        reason,Services.gnss.registrationStatus(),unsigned(gpsRowCount(StartupLocationDoc)),static_cast<unsigned long>(retry));
     }
   }
   // With no network/modem, retain startup intent while continuing CAN collection.
@@ -750,12 +858,14 @@ static bool cellularSend(const JsonDocument &doc) {
     trace("LTE-OPEN");Serial.println("starting synchronous socket open (no pending OBD)");
     if (!client.open(WioNetwork.config.pdpContextId, HOST, PORT)) {
       Serial.printf("ERROR: Failed to open %s\n", WioCellularResultToString(client.getLastResult()));
+      trace("GPS-UPLOAD");Serial.printf("status=open_failed direct_gps_rows_pending=%u retained=1\n",unsigned(gpsRowCount(doc)));
       return false;
     }
 
     trace("LTE-CONNECT");Serial.println("waiting for TCP connection (no pending OBD)");
     if (!client.waitForConnect()) {
       Serial.printf("ERROR: Failed to connect %s\n", WioCellularResultToString(client.getLastResult()));
+      trace("GPS-UPLOAD");Serial.printf("status=connect_failed direct_gps_rows_pending=%u retained=1\n",unsigned(gpsRowCount(doc)));
       return false;
     }
 
@@ -765,16 +875,22 @@ static bool cellularSend(const JsonDocument &doc) {
     JsonDocument batch;
     const size_t batchRecords=bg770a::makeTelemetryBatch(doc,batch,CELLULAR_PAYLOAD_LIMIT);
     if(!batchRecords) {
-      trace("LTE-PAYLOAD");Serial.println("single record/envelope exceeds byte limit or allocation failed; retaining queue");return false;
+      trace("LTE-PAYLOAD");Serial.println("single record/envelope exceeds byte limit or allocation failed; retaining queue");
+      trace("GPS-UPLOAD");Serial.printf("status=batch_failed direct_gps_rows_pending=%u retained=1\n",unsigned(gpsRowCount(doc)));return false;
     }
     serializeJson(batch, str);
     Serial.print(str.size());Serial.print(" bytes (payload redacted)");
     Serial.println();
     trace("LTE-BATCH");Serial.printf("records=%u total_queue=%u bytes=%u limit=%u\n",unsigned(batchRecords),unsigned(doc["data"].size()),unsigned(str.size()),unsigned(CELLULAR_PAYLOAD_LIMIT));
+    const size_t gpsRows=gpsRowCount(batch);
+    const bool rootLocation=hasGpsPosition(batch["location"].as<JsonObjectConst>());
+    logGpsPayload(batch);
     if (!client.send(str.data(), str.size())) {
       Serial.printf("ERROR: Failed to send socket %s\n", WioCellularResultToString(client.getLastResult()));
+      trace("GPS-UPLOAD");Serial.printf("status=send_failed direct_gps_rows_pending=%u root_location=%u retained=1\n",unsigned(gpsRows),unsigned(rootLocation));
       return false;
     }
+    trace("GPS-UPLOAD");Serial.printf("status=awaiting_ack direct_gps_rows=%u root_location=%u\n",unsigned(gpsRows),unsigned(rootLocation));
 
     Serial.println("Receiving");
     static uint8_t recvData[WioCellular.RECEIVE_SOCKET_SIZE_MAX];
@@ -796,8 +912,10 @@ static bool cellularSend(const JsonDocument &doc) {
     trace("LTE-ACK");Serial.print("Endpoint status: ");Serial.println(ack.status());
     if(ack.result()!=bg770a::EndpointAck::Result::Accepted) {
       trace("LTE-REJECT");Serial.printf("status=%u reason=%s response_bytes=%u; response body redacted\n",ack.status(),ack.diagnostic(),unsigned(ack.receivedBytes()));
+      trace("GPS-ACK");Serial.printf("status=unconfirmed server_status=%u direct_gps_rows=%u root_location=%u retained=1\n",ack.status(),unsigned(gpsRows),unsigned(rootLocation));
       Serial.println("Endpoint rejected/unconfirmed; retaining records");return false;
     }
+    trace("GPS-ACK");Serial.printf("status=accepted server_status=%u direct_gps_rows=%u root_location=%u\n",ack.status(),unsigned(gpsRows),unsigned(rootLocation));
     LastSentRecords=batchRecords;
 
   }

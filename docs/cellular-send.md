@@ -35,6 +35,10 @@ upload, even though no upload had been accepted.
   confirm recovery without a new unsolicited notification reaching WioNetwork.
 - LTE reattachment after GNSS has a 120-second deadline. Failure enters the
   existing physical-reset recovery path and disables optional GNSS for that boot.
+- Until the first confirmed fix after a modem power cycle, each GNSS search has
+  a 180-second budget. Subsequent searches after that fix retain the 30-second
+  budget. A no-fix result does not shorten the next search. The start log reports
+  the active budget as `search_timeout_ms`.
 - After the startup attempt, GNSS acquisition starts are due every ten minutes
   from the previous start, after the initial attempt completes and the OBD queue
   drains. If the initial attempt found a fix, its upload must first be confirmed.
@@ -70,6 +74,58 @@ upload, even though no upload had been accepted.
   category such as `request_shape`, `payload_decode`, `data_empty`, `time_format`,
   `payload_shape`, `authentication_failed`, or `endpoint_rejected`. Server-supplied
   strings, identifiers, URLs, and response bodies are never printed.
+
+## GPS diagnostics
+
+GPS acquisition and delivery have separate log stages. Polling commands alone
+do not establish that a fix was acquired or sent. Valid coordinates are printed
+to the local USB serial monitor; device identity, authentication, full payloads,
+server response bodies and malformed modem text remain redacted.
+
+| Log | Meaning |
+| --- | --- |
+| `GPS-ACQUIRE status=started` | An acquisition attempt has started; `search_timeout_ms` gives the configured search window. |
+| `GPS-POLL status=no_fix cme_error=516` | The modem has no fix yet. Other errors include their numeric code; invalid and repeated responses have distinct statuses. |
+| `GPS-FIX status=acquired` | A validated fix received its matching final OK. The log includes UTC acquisition time, latitude, longitude, altitude, HDOP, satellites and fix type. |
+| `GPS-QUEUE status=queued` | The acquired fix was copied into the retained GPS upload document. `GPS-POSITION source=queued` prints its stored coordinates. |
+| `GPS-UPLOAD status=waiting` | A queued fix is waiting for the stated modem, LTE, CAN or retry condition. The row is retained; waiting logs are limited to changes or five-second intervals. |
+| `GPS-PAYLOAD` | Describes the actual bounded JSON batch. `direct_gps_rows` counts coordinate-bearing rows; `root_location=1` means the envelope also contains a cached position. These fields are separate because the cached position can replace a row's coordinates on ingestion. |
+| `GPS-POSITION source=record` / `source=root_location` | Coordinates and acquisition time actually included in that batch. A root location also shows its cache age. |
+| `GPS-UPLOAD status=awaiting_ack` | The modem accepted the batch write. Endpoint acceptance is still pending. |
+| `GPS-ACK status=accepted` | A supported positive endpoint acknowledgement was received. GPS counts describe this acknowledged batch, not the rest of the queue. |
+| `GPS-ACK status=unconfirmed` | The endpoint rejected the batch or acceptance was not established; records remain queued. Socket/batch/send failures also explicitly report retained records. |
+| `GPS-ACQUIRE status=no_fix_timeout` / `GPS-ERROR` | Search timeout, command error/timeout, LTE reattachment timeout or recovery. `disabled=1` means further GNSS attempts are disabled for this boot. |
+
+`direct_gps_rows=0 root_location=0` explicitly identifies an OBD-only batch.
+A positive endpoint acknowledgement does not independently prove database
+storage or map rendering. The numeric no-fix code is documented in Quectel's
+[GNSS application note, Table 6](https://www.quectel.com/content/uploads/2024/04/Quectel_BG77xA-GLBG95xA-GL_GNSS_Application_Note_V1.0.pdf).
+
+At 22:24 JST on November 6, a read-only check of the configured dashboard
+database found 1,377 telemetry rows and no rows with coordinates, while the
+latest telemetry receipt was 22:23:57 JST. Both the GPS timestamp and nullable
+OBD migrations were confirmed applied in the preceding 22:20 check. This
+establishes missing stored GPS
+data at that time; it does not distinguish a failed fix from a rejected GPS
+upload. The supplied 22:14 trace shows startup polling but no fix or GPS-bearing
+payload, so the new stage logs are needed to distinguish those outcomes.
+
+The actual Serial Monitor was inspected again for the 22:30 startup. The first
+two queries returned 505 (session not active), followed by 516 (no fix). At
+22:30:41.220 the old search limit ended the attempt with
+`status=no_fix_timeout cme_error=516 polls=29 elapsed_ms=30000 disabled=0`.
+GNSS stopped, LTE was restored with `CFUN=1`, and registration remained 0.
+The later `reattachment_timeout elapsed_ms=120000 disabled=1` entered the
+existing modem recovery path. This run acquired no coordinates; polling alone
+was not a GPS upload. No registration-parser defect was found.
+
+The 30-second first-fix limit was shorter than the 39-second average cold-start
+acquisition reported in Quectel's
+[BG770A-GL Low Power Design Guide, Table 13](https://quectel.com/content/uploads/2024/04/Quectel_BG770A-GL_Low_Power_Design_Guide_V1.0.pdf).
+The longer initial budget addresses that premature cutoff; it does not guarantee
+a fix or resolve the separately observed LTE reattachment failure. Seeed's
+[hardware manual](https://seeedjp.github.io/Wiki/Wio_BG770A/hardware.html)
+specifies a separate passive GNSS antenna and does not support active antennas.
 
 ## Endpoint contract and the original 400
 
@@ -114,13 +170,19 @@ settings, deployed dashboard code, or device identifiers were changed.
 Run `bash tests/cellular/run_tests.sh` with `ARDUINOJSON_INCLUDE` and
 `WIOCELLULAR_INCLUDE` pointing to the installed libraries' `src` directories.
 
-- The GPS-first startup code compiles offline with Arduino CLI 1.2.0 for Wio
+- The GPS-first startup code with QNTP UTC correction, GPS diagnostics and the
+  extended initial fix window compiles offline with Arduino CLI 1.2.0 for Wio
   BG770A board 1.0 (`SeeedJP:nrf52:wio_bg770a:board_version=1_0`), using installed
   ArduinoJson 7.4.2, WioCellular 0.3.12 and SeeedJP nRF52 Boards 1.5.0. It uses
-  166,412 bytes of program storage and 12,628 bytes of global RAM. The core emits
+  174,700 bytes of program storage and 12,668 bytes of global RAM. The core emits
   its three existing ignored `used` attribute warnings; compilation has no errors.
   Verification uses the installed dependencies and does not upload firmware.
-- The complete cellular host suite passes with the GPS-first startup code.
+- The complete cellular host suite passes with GPS-first startup, QNTP UTC parsing and GPS diagnostics.
+  Initial-fix regressions now prove that polling continues past 30 seconds,
+  a first fix at about 40 seconds is uploaded and acknowledged through the
+  extracted sketch, no-fix attempts stop at 180 seconds and retain that budget
+  for a retry, and searches after a valid fix use 30 seconds. Timer rollover is
+  covered. These are synthetic modem responses, not a physical GPS fix.
   Actual extracted-sketch regressions cover a first GPS upload before queued
   OBD data and without a prior clock, GPS-only delivery without an ECU response,
   retained fixes and 30-second retries after rejection, and ten-minute periodic
@@ -142,8 +204,21 @@ Run `bash tests/cellular/run_tests.sh` with `ARDUINOJSON_INCLUDE` and
   measurements. The actual-sketch regression sends a validated zero-speed-only
   response and a confirmed no-fault DTC reply, checks malformed and timed-out RPM
   leave readings unavailable, and rejects a completely unmeasured row.
+- The NTP regression uses a synthetic QNTP response with UTC clock digits
+  `13:01:57` and timezone indicator `+36`. It checks that clock formatting,
+  record time, safe `NTP-SAMPLE` diagnostics and the actual serialized upload
+  all retain `13:01:57+00:00`. A separate HTTP `22:01:57+09:00` case converts
+  its ISO offset once to the same UTC instant. This synthetic response is not
+  substituted for the original modem result, which the field log did not print.
+- GPS diagnostic regressions distinguish a candidate response from a fix
+  accepted after final OK, and cover no-fix code 516, malformed-response privacy,
+  duplicate fixes, acquisition/command/reattachment timeouts and disabled GNSS.
+  Actual-sketch tests exercise valid zero coordinates, GPS queue retention,
+  failed socket open/connect/write, rejected acknowledgements, root locations,
+  and bounded batches whose pending GPS row is outside the sent prefix.
+  An accepted OBD-only batch explicitly reports zero GPS data.
 
-GPS-first startup, the ten-minute cadence and location reporting through the
+The NTP offset correction, GPS-first startup, the ten-minute cadence and location reporting through the
 updated dashboard require a new physical end-to-end check. The physical retest
 below establishes earlier delivery and LTE recovery behavior, not validation of
 these GPS and nullable-reading changes.

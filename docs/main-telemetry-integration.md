@@ -43,6 +43,27 @@ Only a matching command echo, final OK, and valid `+QNTP` success notification
 commit an NTP sample. An initial OK does not prove synchronization. Dates, leap
 days and modem quarter-hour offsets are validated. UTC is extended from millis
 with a 64-bit monotonic counter; resync is due every six hours, stale after 24.
+The BG770A QNTP decoder treats its clock digits as UTC and validates the trailing
+timezone indicator as metadata. It does not subtract that indicator again.
+HTTP ISO timestamps use a separate offset-aware path: `22:01:57+09:00` becomes
+`13:01:57+00:00`. GNSS fixes already carry UTC. These source conversions are
+independent of the dashboard's selectable JST/UTC presentation.
+
+`NTP-SAMPLE` prints only a validated, fixed-length `response_time` and its
+`interpreted_utc`, allowing the modem's response to be checked against an
+independent clock. The supplied November 6 send trace showed `04:01:57+00:00`
+at monitor time `22:01:57` JST; the correct UTC for that monitor time is
+`13:01:57`. The subsequently inspected startup monitor also showed the nine-hour
+error immediately at `NTP-RESULT`, with `source=ntp`. Neither trace includes the
+original QNTP result. The regression response `13:01:57+36` is synthetic: the
+former offset subtraction maps it to `04:01:57`, and the QNTP-specific path
+retains `13:01:57`. Existing stored or queued records are not rewritten.
+
+Reference: [Quectel BG770A TCP/IP application note, section 2.3.14](https://quectel.com/content/uploads/2024/02/Quectel_BG770A-GLBG95xA-GL_TCPIP_Application_Note_V1.1.pdf)
+and [Seeed's BG770A clock interface](https://seeedjp.github.io/wio_cellular/classwiocellular_1_1module_1_1bg770a_1_1commands_1_1Bg770aHardwareRelatedCommands.html),
+which exposes the GMT clock and time difference separately. The diagnostic
+records the actual response so firmware-specific behavior can be distinguished.
+
 Startup services CAN while waiting for NTP (135-second overall wait). Existing
 WorldTimeAPI HTTP fallback is retained with two bounded attempts, complete JSON
 validation and offset parsing. It is labeled `http_fallback`, never `ntp`. HTTP
@@ -82,8 +103,11 @@ confirmed. A no-fix startup result permits periodic acquisition even before any
 upload succeeds. Each valid periodic fix also creates a GPS-only row and is sent
 independently of OBD replies; any such queued fix must be acknowledged before a
 further acquisition starts. NTP, active CAN replies, queued telemetry, LTE availability and
-modem ownership can defer a periodic acquisition. GNSS temporarily takes LTE offline, searches for
-up to 30 seconds, stops GNSS and restores LTE/registration. A pending command may
+modem ownership can defer a periodic acquisition. GNSS temporarily takes LTE offline.
+Before the first confirmed fix in a modem power cycle, each attempt searches for
+up to 180 seconds; after a valid fix, subsequent attempts use 30 seconds.
+A no-fix result keeps the longer budget for the next eligible attempt.
+The firmware then stops GNSS and restores LTE/registration. A pending command may
 add its 20-second deadline. CAN receive/validation continues during this process.
 Command errors or uncertain boundaries use bounded reset/boot recovery.
 

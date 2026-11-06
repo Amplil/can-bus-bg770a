@@ -39,12 +39,13 @@ source=r'''
 #include <new>
 static uint32_t nowMs=0;
 static bool advanceMillis=false;
+static bool allowStartupReadWait=false;
 uint32_t millis(){const auto value=nowMs;if(advanceMillis)++nowMs;return value;}
 void delay(unsigned ms){nowMs+=ms;}
 #include "module/at_client/AtClient.hpp"
 struct Uart {
  std::deque<unsigned char> rx;std::string tx;unsigned resets=0;
- void waitReadAvailable(int t){assert(t==0);}
+ void waitReadAvailable(int t){assert(t==0 || (allowStartupReadWait && t>0 && t<=10));nowMs+=t;}
  int read(){if(rx.empty())return -1;auto c=rx.front();rx.pop_front();return c;}
  void write(int c){tx+=char(c);}
  void reset(){++resets;}
@@ -55,6 +56,8 @@ struct Network {
  struct Config{int pdpContextId=1;}config;
  NetworkState state=NetworkState::Connected;
  NetworkState getNetworkState(){return state;}
+ bool canCommunicate(){return state==NetworkState::Connected;}
+ static const char* networkStateToString(NetworkState state){return state==NetworkState::Connected?"Connected":"Offline";}
 } WioNetwork;
 using WioCellularNetwork=Network;
 struct String:std::string {
@@ -91,6 +94,11 @@ static char deviceIMSI[20]={};
 static bg770a::TelemetryServices Services;
 static bg770a::ObdSession Obd(false,true);
 static bool CanReady=true,TelemetryAttempted=false,HaveCanActivity=false,ModemSleeping=false,DtcWaiting=false,SynchronousModem=false,HeartbeatPending=false;
+static bool CellularReady=true;
+static uint32_t LastCellularAttempt=0;
+static constexpr uint32_t CELLULAR_RETRY_INTERVAL=60000;
+static unsigned cellularInitCalls=0;
+static bool initializeCellular(){++cellularInitCalls;LastCellularAttempt=millis();return false;}
 static bg770a::CanDiagnostics CanStats;
 static bool DtcExpired=false;
 static uint32_t DtcStarted=0;
@@ -143,7 +151,7 @@ String addMillisTime();
 void sendDtcRequest();
 bool arrayEmptyCheck(JsonArrayConst);
 '''+defines+'\n'+constants+'\n'
-for signature in ['static bool canIdle()', 'static void trace(', 'static const char* rejectionName(', 'static void traceFrame(', 'static void tickCan(', 'static void canSummary()', 'static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(',
+for signature in ['static bool canIdle()', 'static void trace(', 'static const char* rejectionName(', 'static void traceFrame(', 'static void tickCan(', 'static void canSummary()', 'static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(', 'static bool waitForCellularNetwork(',
  'static void attachFreshLocation()', 'static bool cellularSend(const JsonDocument &doc)', 'void initCAN() {', 'String dtcToString(', 'void processDtcData(unsigned char* data)',
  'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void initializeVehicleDataSchema() {',
  'String addMillisTime() {', 'bool getTime(char* time) {', 'bool arrayEmptyCheck(', 'void sendDtcRequest() {','void loop() {']:
@@ -154,6 +162,35 @@ static void pollUntilSend(unsigned expected) {
  assert(sendCalls==expected);
 }
 int main(int argc,char** argv){
+ if(argc>1 && std::string(argv[1])=="cellular-network-wait") {
+  allowStartupReadWait=true;
+  WioNetwork.state=Network::NetworkState::Offline;
+  can.rx.push_back({0x123,{2,1,0x0C,0,0,0,0,0}});
+  assert(!waitForCellularNetwork(11000));
+  assert(nowMs>=11000 && nowMs<=11010 && CellularReady && CanStats.received==1);
+  size_t count=0,pos=0;while((pos=Serial.output.find("[LTE-WAIT]",pos))!=std::string::npos){++count;++pos;}
+  assert(count==3 && Serial.output.find("[LTE-TIMEOUT]")!=std::string::npos);
+  assert(WioCellular.uart.tx.empty() && httpCalls==0 && identityCalls==0);
+  WioNetwork.state=Network::NetworkState::Connected;
+  assert(waitForCellularNetwork(11000));
+  assert(Serial.output.find("[LTE-READY]")!=std::string::npos);
+  std::cout<<"Actual LTE wait reports every 5s, services CAN, returns on timeout without abort, and accepts later connectivity\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="cellular-unavailable") {
+  Services.ntpEnabled=true;Services.gnssEnabled=true;CellularReady=false;
+  const auto before=WioCellular.uart.tx;
+  char value[64];assert(!getTime(value) && httpCalls==0);
+  initializeVehicleDataSchema();assert(!cellularSend(JsonDoc) && socketOpens==0);
+  nowMs=10000;loop();assert(Obd.waiting() && !can.sent.empty());
+  assert(identityCalls==0 && WioCellular.uart.tx==before);
+  nowMs=60000;Obd=bg770a::ObdSession(false,true);uint8_t pid;assert(Obd.next(nowMs,pid));
+  assert(Obd.waiting());loop();assert(cellularInitCalls==0);
+  nowMs+=201;loop();assert(cellularInitCalls==1);
+  nowMs+=10;loop();assert(cellularInitCalls==1);
+  assert(powerOffs==0 && identityCalls==0 && httpCalls==0);
+  assert(WioCellular.uart.tx==before);
+  std::cout<<"Unavailable cellular leaves CAN polling active, suppresses modem work and sleep, and retries only in an idle gap after 60s\n";return 0;
+ }
  if(argc>1 && std::string(argv[1])=="synthetic-padded-values") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
   Services.clock.seedFallback(1735689599LL,Services.now(0));
@@ -402,5 +439,5 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
+    for scenario in os.environ.get('SKETCH_SCENARIOS','cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
         subprocess.run([str(exe),scenario],check=True)

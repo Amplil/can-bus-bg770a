@@ -18,6 +18,7 @@
 #include <obd-session.h>
 #include <endpoint-ack.h>
 #include <can-diagnostics.h>
+#include <cellular-startup.h>
 #include <obd-dtc.h>
 #include <functional>
 #include <utility>
@@ -48,6 +49,8 @@ static const char HOST[] = "uni.soracom.io";
 static constexpr int PORT = 23080;
 static constexpr int POWER_ON_TIMEOUT = 1000 * 20;     // [ms]
 static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 3;  // [ms]
+static constexpr uint32_t RADIO_OFF_TIMEOUT = 20000; // Registration polling, excluding AT command timeouts
+static constexpr uint32_t CELLULAR_RETRY_INTERVAL = 60000;
 static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // [ms]
 static JsonDocument JsonDoc;
 //JsonObject vehicleData = JsonDoc.to<JsonObject>();
@@ -73,6 +76,8 @@ WioCAN can;
 static bg770a::TelemetryServices Services;
 static bg770a::ObdSession Obd(OBD_CAN_EXTENDED, OBD_ALLOW_UNKNOWN_PIDS);
 static bool CanReady=false, TelemetryAttempted=false, HaveCanActivity=false, ModemSleeping=false, SynchronousModem=false;
+static bool CellularReady=false;
+static uint32_t LastCellularAttempt=0;
 static bg770a::CanDiagnostics CanStats;
 static bool DtcExpired=false;
 static bool DtcWaiting=false;
@@ -151,7 +156,7 @@ static void canSummary() {
 
 static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
   Services.now(millis());
-  if(ModemSleeping)return;
+  if(!CellularReady || ModemSleeping)return;
   for(int i=0;i<4;++i) WioCellular.doWork(0);
   if(SynchronousModem)return;
   Services.tick(millis());
@@ -220,6 +225,49 @@ static void cooperativeDelay(uint32_t duration) {
   do { serviceModem();serviceCan();delay(1); }
   while(uint32_t(millis()-start)<duration);
 }
+static bool initializeCellular() {
+  CellularReady=false;
+  const uint32_t started=millis();
+  trace("CELLULAR-POWER");Serial.println("powerOn starting; APP RDY timeout=20000 ms per attempt, plus library AT timeouts");
+  const auto powerResult=WioCellular.powerOn(POWER_ON_TIMEOUT);
+  trace("CELLULAR-POWER");Serial.printf("result=%s elapsed_ms=%lu\n",WioCellularResultToString(powerResult),static_cast<unsigned long>(millis()-started));
+  if(powerResult!=WioCellularResult::Ok) {
+    LastCellularAttempt=millis();
+    trace("CELLULAR-ERROR");Serial.println("powerOn failed; CAN continues, modem retry in 60 s");
+    return false;
+  }
+  Services.powerCycle();
+  CellularReady=bg770a::beginCellularNetwork(WioCellular,WioNetwork,RADIO_OFF_TIMEOUT,
+    []() -> uint32_t {return millis();},
+    [](uint32_t duration) {
+      const uint32_t began=millis();
+      do {WioCellular.doWork(10);serviceCan();delay(1);} while(uint32_t(millis()-began)<duration);
+    },
+    [](const char* stage,WioCellularResult result,int registration) {
+      trace("CELLULAR-INIT");Serial.printf("stage=%s result=%s registration=%d\n",stage,WioCellularResultToString(result),registration);
+    });
+  LastCellularAttempt=millis();
+  trace("CELLULAR-INIT");Serial.println(CellularReady ? "configuration complete; radio enabled" : "failed; CAN continues, modem retry in 60 s");
+  return CellularReady;
+}
+static bool waitForCellularNetwork(uint32_t timeout) {
+  const uint32_t started=millis();
+  uint32_t lastStatus=started;
+  bool first=true;
+  while(CellularReady) {
+    if(first || uint32_t(millis()-lastStatus)>=5000) {
+      first=false;lastStatus=millis();
+      trace("LTE-WAIT");Serial.printf("state=%s elapsed_ms=%lu timeout_ms=%lu\n",
+        WioCellularNetwork::networkStateToString(WioNetwork.getNetworkState()),
+        static_cast<unsigned long>(millis()-started),static_cast<unsigned long>(timeout));
+      if(WioNetwork.canCommunicate()) {trace("LTE-READY");Serial.println("PDP communication available");return true;}
+    }
+    if(uint32_t(millis()-started)>=timeout)break;
+    WioCellular.doWork(10);serviceCan();delay(1);
+  }
+  trace("LTE-TIMEOUT");Serial.println("continuing CAN; LTE registration will continue in the main loop");
+  return false;
+}
 static void attachFreshLocation() {
   JsonDoc.remove("location");
   const auto& fix=Services.gnss.fix();
@@ -267,14 +315,16 @@ void setup() {
 
   digitalWrite(LED_BUILTIN, HIGH);
 
-  Serial.println("Cellular bus initialized");
+  trace("CELLULAR-BEGIN");Serial.println("initializing board/modem interface");
   // Network configuration
   WioNetwork.config.searchAccessTechnology = SEARCH_ACCESS_TECHNOLOGY;
   WioNetwork.config.ltemBand = LTEM_BAND;
   WioNetwork.config.apn = APN;
   WioCellular.begin();
-  // Power on the cellular module
-  if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) abort();
+  trace("CELLULAR-BEGIN");Serial.println("board/modem interface initialized");
+  // begin() switches Grove power off, so CAN must be initialized after it.
+  Serial.println("Initializing CAN bus before LTE connection");
+  initCAN();
   Services.ntpEnabled=TELEMETRY_NTP;
   Services.gnssEnabled=TELEMETRY_GNSS;
   ServicesHandler=WioCellular.registerUrcHandler2([](const std::string& line) {
@@ -284,12 +334,12 @@ void setup() {
     }
     return handled;
   });
-  WioNetwork.begin();
-  // Wait for communication available
-  if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) abort();
-
-  Serial.println("CAN bus initialized");
-  initCAN();
+  WioNetwork.abortHandler=[](const char* file,int line) {
+    trace("CELLULAR-ERROR");Serial.printf("network library AT failure at %s:%d\n",file,line);
+    abort();
+  };
+  if(initializeCellular())waitForCellularNetwork(NETWORK_TIMEOUT);
+  else Serial.println("LTE unavailable; CAN diagnostics remain active; timestamped records wait for UTC");
 
   char startupTime[64];
   // Preserve bounded HTTP fallback when NTP cannot provide a validated sample.
@@ -317,12 +367,15 @@ void setup() {
 
 void loop() {
   serviceCan();
+  if(!CellularReady && canIdle() && Services.atIdle() && uint32_t(millis()-LastCellularAttempt)>=CELLULAR_RETRY_INTERVAL) {
+    initializeCellular();
+  }
   serviceModem();
   canSummary();
   if(HaveCanActivity && ModemSleeping && Services.atIdle() && canIdle())netPowerOnRestart();
-  if(canIdle() && Services.idle() && !ModemSleeping && !deviceIMSI[0] && getIMSI(deviceIMSI))JsonDoc["imsi"]=deviceIMSI;
+  if(CellularReady && canIdle() && Services.idle() && !ModemSleeping && !deviceIMSI[0] && getIMSI(deviceIMSI))JsonDoc["imsi"]=deviceIMSI;
   static uint32_t lastClockRetry=millis();
-  if(canIdle() && Services.idle() && !ModemSleeping && uint32_t(millis()-lastClockRetry)>=60000 &&
+  if(CellularReady && canIdle() && Services.idle() && !ModemSleeping && uint32_t(millis()-lastClockRetry)>=60000 &&
       strcmp(Services.clock.source(),"unsynced")==0) {
     char time[64]; getTime(time);lastClockRetry=millis();
   }
@@ -379,7 +432,7 @@ void loop() {
     if(arrayEmptyCheck(JsonDoc["data"])) {
       Serial.println("doc data is empty.");
       unsigned long emptyDuration = millis() - lastDataReceivedTime;
-      if(emptyDuration > DATA_EMPTY_TIMEOUT) { // DATA_EMPTY_TIMEOUT時間経過チェック
+      if(CellularReady && emptyDuration > DATA_EMPTY_TIMEOUT) { // DATA_EMPTY_TIMEOUT時間経過チェック
         unsigned long lastACKDuration = millis() - lastACKTime;
         if(lastACKDuration > ACK_INTERVAL && !HeartbeatPending) {
           HeartbeatPending=true;
@@ -561,7 +614,7 @@ void clearData() {
 }
 
 static bool cellularSend(const JsonDocument &doc) {
-  if(!canIdle() || !Services.idle() || !deviceIMSI[0] || ModemSleeping || doc["data"].size()==0)return false;
+  if(!CellularReady || !canIdle() || !Services.idle() || !deviceIMSI[0] || ModemSleeping || doc["data"].size()==0)return false;
   trace("LTE-SEND");Serial.printf("queue=%u; payload redacted\n",unsigned(doc["data"].size()));
   Serial.println("### Sending Combined Vehicle Data Object");
   Serial.print("Connecting ");
@@ -651,7 +704,7 @@ void printData(T &stream, const void *data, size_t size) {
 
 // Get IMSI from SIM card
 bool getIMSI(char* imsi) {
-  if(!canIdle() || !Services.idle())return false;
+  if(!CellularReady || !canIdle() || !Services.idle())return false;
   trace("MODEM-IDENTITY");Serial.println("query starting; value remains redacted");
   Serial.println("Getting IMSI...");
   
@@ -760,7 +813,7 @@ static bool getTimeFromWorldTimeApiHttp(char* time) {
 }
 
 bool getTime(char* time) {
-  if(!canIdle())return false;
+  if(!CellularReady || !canIdle())return false;
   trace("TIME");Serial.println("synchronization/fallback requested");
   if(WioNetwork.getNetworkState()!=WioCellularNetwork::NetworkState::Connected)return false;
   const uint32_t start=millis();
@@ -804,7 +857,7 @@ bool arrayEmptyCheck(JsonArrayConst arr) { // doc["data"]のすべての要素�
 }
 
 void netPowerOffWait() {
-  if(!canIdle() || !Services.atIdle())return;
+  if(!CellularReady || !canIdle() || !Services.atIdle())return;
   trace("POWER-OFF");Serial.println("idle, no pending OBD");
   ModemSleeping=true;
   // Power off the cellular module
@@ -834,24 +887,8 @@ void netPowerOffWait() {
 void netPowerOnRestart() { // powerOnを開始する
   if(!canIdle())return;
   trace("POWER-ON");Serial.println("restarting modem; no pending OBD");
-  // Power on the cellular module
-  auto start = millis(); // 計測用
-  Serial.print("powerOn開始");Serial.println(start);
-  if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) abort();
-  Serial.print("powerOn完了にかかった時間(ms)");Serial.println(millis() - start);
-  
-  Services.powerCycle();
-  WioNetwork.begin();
-  start = millis();
-  Serial.print("ネットワーク再開を開始します。");Serial.println(start);
-  const bool networkFlag=WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT);
-  if (networkFlag) {
-    ModemSleeping=false;
-    Serial.print("ネットワークが再開できるまでの時間(ms)");Serial.println(millis() - start);
-  }
-  else{
-    Serial.print("ERROR: ネットワークが再開できませんでした。");Serial.println(millis());
-  }
+  ModemSleeping=false;
+  if(initializeCellular())waitForCellularNetwork(NETWORK_TIMEOUT);
 }
 
 void initCAN() {

@@ -39,8 +39,12 @@ int main() {
     nowMs=1000; session.tick(nowMs);
     exchange("AT+QGPSLOC=2", "+QGPSLOC: 123456.000,35.12345,139.12345,1.2,12.0,3,0.00,0.0,0.0,041126,08\r\n");
     assert(session.fix().valid); exchange("AT+QGPSEND"); exchange("AT+CFUN=1");
-    exchange("AT+CEREG=1"); exchange("AT+CEREG?", "+CEREG: 1,1\r\n+CEREG: 1\r\n");
-    assert(networkUrc==1); assert(session.canSend());
+    exchange("AT+CEREG=1");
+    exchange("AT+CEREG?", "+CEREG: 1, \t5 \t\r\n+CEREG: 5,\"1234\",\"12345678\",7\r\n");
+    assert(networkUrc==1); assert(session.canSend() && session.registrationStatus()==5);
+    inject("+CEREG: 0\r\n");nowMs=6000;session.tick(nowMs);
+    exchange("AT+CEREG?", "+CEREG: 1, 1\r\n+CEREG: 2,\"1234\",\"12345678\",7\r\n");
+    assert(networkUrc==3);assert(!session.canSend() && session.registrationStatus()==2);
   }
   std::cout << "Actual WioCellular transport passed (fragmented and complete lines)\n";
 }

@@ -74,6 +74,7 @@ int main() {
   assert(registration.line("+CEREG: 1,5",10000));
   assert(!registration.canSend()); // Publish only after matching successful result.
   registration.line("OK",10000); assert(registration.canSend());
+  assert(registration.registrationStatus()==5);
   assert(!registration.line("+CEREG: 3",10001)); assert(!registration.canSend());
 
   // Query responses and single-status URCs can be interleaved on the UART.
@@ -96,6 +97,67 @@ int main() {
   interleaved.line("AT+CEREG?",15004);
   assert(interleaved.line("+CEREG: 1,15",15004)); // Never accept a status prefix.
   interleaved.line("OK",15005); assert(!interleaved.canSend());
+  assert(interleaved.registrationStatus()==15);
+
+  // Whitespace is allowed around complete integer tokens, including roaming.
+  GnssSession spaced;
+  assert(!spaced.line("+CEREG: \t0 \t",0));assert(spaced.registrationStatus()==0);
+  spaced.tick(5000);assert(spaced.takeCommand()=="AT+CEREG?\r");
+  spaced.line("AT+CEREG?",5000);
+  assert(spaced.line("+CEREG: 1 \t, \t5 \t",5000));
+  assert(spaced.registrationStatus()==0 && !spaced.canSend());
+  spaced.line("OK",5001);assert(spaced.canSend() && spaced.registrationStatus()==5);
+  assert(!spaced.line("+CEREG: \t15 \t",5002));
+  assert(!spaced.canSend() && spaced.registrationStatus()==15);
+  spaced.tick(10001);assert(spaced.takeCommand()=="AT+CEREG?\r");
+  spaced.line("AT+CEREG?",10001);
+  assert(spaced.line("+CEREG: 1, 1junk",10001));
+  spaced.line("OK",10002);assert(!spaced.canSend() && spaced.registrationStatus()==-1);
+
+  // During a query, extended URCs use their first integer as the status.
+  // The location tokens must never be treated as the queried status.
+  GnssSession extended;
+  extended.line("+CEREG: 0",0);extended.tick(5000);
+  assert(extended.takeCommand()=="AT+CEREG?\r");extended.line("AT+CEREG?",5000);
+  assert(extended.line("+CEREG: 1, 5",5000));
+  assert(!extended.line("+CEREG: 2, \"1234\",\"12345678\",7",5001));
+  extended.line("OK",5002);assert(!extended.canSend() && extended.registrationStatus()==2);
+  extended.tick(10002);assert(extended.takeCommand()=="AT+CEREG?\r");
+  extended.line("AT+CEREG?",10002);
+  assert(extended.line("+CEREG: 1,2",10002));
+  assert(!extended.line("+CEREG: 5 \t, \"1234\",\"12345678\",7",10003));
+  extended.line("OK",10004);assert(extended.canSend() && extended.registrationStatus()==5);
+
+  // Failed LTE reattachment after CFUN=1 recovers within two minutes, across
+  // millis rollover as well. A successful registration cancels that deadline.
+  for(const uint32_t base:{0U,UINT32_MAX-60000U}) {
+    GnssSession stalled;
+    assert(stalled.begin(base));answer(stalled,"AT+CFUN=4",base);
+    answer(stalled,"AT+QGPS=1",base,"ERROR");
+    answer(stalled,"AT+QGPSEND",base);
+    answer(stalled,"AT+CFUN=1",base);
+    answer(stalled,"AT+CEREG=1",base);
+    assert(stalled.takeCommand()=="AT+CEREG?\r");
+    stalled.line("AT+CEREG?",base);stalled.line("+CEREG: 1, 2",base);stalled.line("OK",base);
+    for(uint32_t elapsed=5000;elapsed<120000;elapsed+=5000) {
+      stalled.tick(uint32_t(base+elapsed));assert(stalled.takeCommand()=="AT+CEREG?\r");
+      stalled.line("AT+CEREG?",uint32_t(base+elapsed));
+      stalled.line("+CEREG: 1, 2",uint32_t(base+elapsed));
+      stalled.line("OK",uint32_t(base+elapsed));
+      assert(stalled.modemIdle() && !stalled.canSend() && stalled.registrationStatus()==2);
+    }
+    stalled.tick(uint32_t(base+120000));
+    assert(stalled.state()==GnssSession::State::ResetNeeded);
+    assert(!stalled.canSend() && stalled.takeCommand().empty());
+    stalled.resetIssued(uint32_t(base+120001));assert(stalled.registrationStatus()==-1);
+
+    GnssSession restored;start(restored,base);
+    restored.line("+CME ERROR: 516",uint32_t(base+1000));
+    restored.tick(uint32_t(base+30000));
+    restore(restored,uint32_t(base+30001));
+    restored.tick(uint32_t(base+150001));
+    assert(restored.canSend() && restored.state()==GnssSession::State::Idle);
+  }
 
   GnssSession registrationError;
   registrationError.line("+CEREG: 0",0); registrationError.tick(5000);

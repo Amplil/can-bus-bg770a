@@ -25,6 +25,7 @@ source=r'''
 #include <telemetry-time.h>
 #include <obd-session.h>
 #include <endpoint-ack.h>
+#include <telemetry-batch.h>
 #include <can-diagnostics.h>
 #include <obd-dtc.h>
 #include <cassert>
@@ -93,10 +94,12 @@ static JsonObject vehicleData;
 static char deviceIMSI[20]={};
 static bg770a::TelemetryServices Services;
 static bg770a::ObdSession Obd(false,true);
-static bool CanReady=true,TelemetryAttempted=false,HaveCanActivity=false,ModemSleeping=false,DtcWaiting=false,SynchronousModem=false,HeartbeatPending=false;
+static bool CanReady=true,TelemetryDelivered=false,HaveCanActivity=false,ModemSleeping=false,DtcWaiting=false,SynchronousModem=false,HeartbeatPending=false;
 static bool CellularReady=true;
 static uint32_t LastCellularAttempt=0;
 static constexpr uint32_t CELLULAR_RETRY_INTERVAL=60000;
+static constexpr size_t CELLULAR_PAYLOAD_LIMIT=1024;
+static size_t LastSentRecords=0;
 static unsigned cellularInitCalls=0;
 static bool initializeCellular(){++cellularInitCalls;LastCellularAttempt=millis();return false;}
 static bg770a::CanDiagnostics CanStats;
@@ -123,9 +126,11 @@ void initCAN();
 void netPowerOffWait(){assert(Services.atIdle());++powerOffs;ModemSleeping=true;}
 void netPowerOnRestart(){assert(Services.atIdle());++powerOns;Services.powerCycle();ModemSleeping=false;WioNetwork.state=Network::NetworkState::Connected;}
 void clearData();
+static void clearSentData(size_t);
 static bool cellularSend(const JsonDocument&);
 static unsigned socketOpens=0;
 static uint32_t socketDelay=0;
+static std::deque<std::string> SentPayloads;
 static std::deque<std::string> ReplyChunks={"200 {}\r\n"};
 using WioCellularModule=Module;
 static constexpr const char* HOST="fixture.invalid";
@@ -136,7 +141,7 @@ template<class T>struct WioCellularTcpClient2 {
  explicit WioCellularTcpClient2(T&){}
  bool open(int,const char*,int){++socketOpens;nowMs+=socketDelay;return true;}
  bool waitForConnect(){return true;}
- bool send(const char*,size_t){++sendCalls;return sendResult;}
+ bool send(const char* bytes,size_t size){++sendCalls;SentPayloads.emplace_back(bytes,size);return sendResult;}
  int getLastResult(){return 0;}
  bool receive(uint8_t* out,size_t cap,size_t* size,int remaining){assert(remaining>0);nowMs+=1;
   if(chunks.empty()){*size=0;return true;}
@@ -151,9 +156,9 @@ String addMillisTime();
 void sendDtcRequest();
 bool arrayEmptyCheck(JsonArrayConst);
 '''+defines+'\n'+constants+'\n'
-for signature in ['static bool canIdle()', 'static void trace(', 'static const char* rejectionName(', 'static void traceFrame(', 'static void tickCan(', 'static void canSummary()', 'static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(', 'static bool waitForCellularNetwork(',
+for signature in ['static bool canIdle()', 'static bool cellularOnline()', 'static void trace(', 'static const char* rejectionName(', 'static void traceFrame(', 'static void tickCan(', 'static void canSummary()', 'static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(', 'static bool waitForCellularNetwork(',
  'static void attachFreshLocation()', 'static bool cellularSend(const JsonDocument &doc)', 'void initCAN() {', 'String dtcToString(', 'void processDtcData(unsigned char* data)',
- 'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void initializeVehicleDataSchema() {',
+ 'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void clearSentData(', 'static void initializeVehicleDataSchema() {',
  'String addMillisTime() {', 'bool getTime(char* time) {', 'bool arrayEmptyCheck(', 'void sendDtcRequest() {','void loop() {']:
     source+=function(signature)+'\n'
 source+=r'''
@@ -162,6 +167,78 @@ static void pollUntilSend(unsigned expected) {
  assert(sendCalls==expected);
 }
 int main(int argc,char** argv){
+ if(argc>1 && std::string(argv[1])=="rejected-first-send") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;sendResult=true;
+  ReplyChunks={"400 ","{\"error\":\"Invalid payload: decode or JSON failed\",\"private\":\"fixture-private-response\"}"};
+  nowMs=30001;loop();pollUntilSend(1);
+  assert(dataArray.size()==1 && !TelemetryDelivered);
+  assert(Services.gnss.state()==bg770a::GnssSession::State::Idle);
+  assert(WioCellular.uart.tx.find("AT+CFUN=4")==std::string::npos);
+  assert(Serial.output.find("reason=payload_decode")!=std::string::npos);
+  assert(Serial.output.find("fixture-private-response")==std::string::npos);
+  ReplyChunks={"200 {\"ok\":true}"};
+  nowMs+=31000;loop();pollUntilSend(2);
+  assert(dataArray.size()==0 && TelemetryDelivered);
+  assert(WioCellular.uart.tx.find("AT+CFUN=4")!=std::string::npos);
+  std::cout<<"Rejected first send retains data and LTE; fragmented error classified privately; GNSS waits until accepted delivery\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="bounded-send-prefix") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  for(unsigned n=0;n<8;++n){initializeVehicleDataSchema();vehicleData["engine_rpm"]=1000+n;}
+  sendResult=true;ReplyChunks={"400 {\"error\":\"Invalid payload shape\"}"};
+  assert(!cellularSend(JsonDoc) && LastSentRecords==0 && dataArray.size()==8);
+  JsonDocument failed;assert(!deserializeJson(failed,SentPayloads.back()));
+  assert(SentPayloads.back().size()<=CELLULAR_PAYLOAD_LIMIT && failed["data"].size()<8);
+  ReplyChunks={"200 {\"ok\":true}"};
+  unsigned remaining=8,expected=1000;
+  while(remaining) {
+   assert(cellularSend(JsonDoc) && LastSentRecords>0 && LastSentRecords<=remaining);
+   JsonDocument batch;assert(!deserializeJson(batch,SentPayloads.back()));
+   assert(SentPayloads.back().size()<=CELLULAR_PAYLOAD_LIMIT);
+   for(JsonObjectConst row:batch["data"].as<JsonArrayConst>())assert(row["engine_rpm"]==expected++);
+   remaining-=LastSentRecords;clearSentData(LastSentRecords);
+   assert(dataArray.size()==remaining && vehicleData.isNull());
+  }
+  assert(expected==1008);
+  std::cout<<"Actual sender bounds each complete JSON batch and removes only accepted record prefixes; 400 retains every record\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="bounded-backlog-drain") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  for(unsigned n=0;n<8;++n){initializeVehicleDataSchema();vehicleData["engine_rpm"]=1000+n;}
+  sendResult=true;nowMs=30001;loop();pollUntilSend(1);
+  assert(dataArray.size()>0 && dataArray.size()<8);
+  const auto firstSentAt=nowMs;
+  for(unsigned n=0;n<400 && sendCalls<2;++n){nowMs+=10;loop();}
+  assert(sendCalls==2 && uint32_t(nowMs-firstSentAt)<5000);
+  assert(dataArray.size()>0 && dataArray.size()<7);
+  std::cout<<"Accepted partial batch schedules the next prefix promptly instead of waiting 30s per queued record\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="registration-resumes-send") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;sendResult=true;
+  Services.line("+CEREG: 0",1000);nowMs=30000;Services.tick(nowMs);
+  assert(Services.gnss.takeCommand()=="AT+CEREG?\r");
+  // Complete a negative query before the send deadline, leaving an idle AT
+  // boundary but registration still pending.
+  Services.line("AT+CEREG?",nowMs);Services.line("+CEREG: 1, 2",nowMs);Services.line("OK",nowMs);
+  nowMs=30001;
+  for(unsigned n=0;n<50 && Serial.output.find("registration_pending")==std::string::npos;++n){loop();nowMs+=10;}
+  assert(sendCalls==0 && dataArray.size()==1 && !Services.idle());
+  assert(Serial.output.find("registration_pending")!=std::string::npos);
+  // Recovery can be confirmed by a query alone, without a new network URC.
+  nowMs+=5000;Services.tick(nowMs);assert(Services.gnss.takeCommand()=="AT+CEREG?\r");
+  Services.line("AT+CEREG?",nowMs);Services.line("+CEREG: 1, 5",nowMs);Services.line("OK",nowMs);
+  WioNetwork.state=Network::NetworkState::Offline;
+  assert(Services.idle() && cellularOnline());
+  for(unsigned n=0;n<50 && sendCalls==0;++n){loop();nowMs+=10;}
+  assert(sendCalls==1 && dataArray.size()==0);
+  std::cout<<"Registration deferral stays visible and due; whitespace-tolerant confirmed query resumes sending without network URC\n";return 0;
+ }
  if(argc>1 && std::string(argv[1])=="cellular-network-wait") {
   allowStartupReadWait=true;
   WioNetwork.state=Network::NetworkState::Offline;
@@ -439,5 +516,5 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
+    for scenario in os.environ.get('SKETCH_SCENARIOS','rejected-first-send bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-deferred config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
         subprocess.run([str(exe),scenario],check=True)

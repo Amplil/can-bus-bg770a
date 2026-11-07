@@ -18,7 +18,7 @@ def function(signature):
     return sketch[start:end]
 headers=(root/'src/grove-can-bus.h').read_text()
 defines='\n'.join(re.findall(r'^#define (?:PID_|CAN_RATE_).*',headers,re.M))
-constants=sketch[sketch.index('static constexpr int OBD_INTERVAL'):sketch.index('WioCAN can;')]
+constants=sketch[sketch.index('static constexpr size_t OBD_QUEUE_LIMIT'):sketch.index('WioCAN can;')]
 source=r'''
 #include <ArduinoJson.h>
 #include <telemetry-services.h>
@@ -29,6 +29,7 @@ source=r'''
 #include <telemetry-record.h>
 #include <can-diagnostics.h>
 #include <obd-dtc.h>
+#include <unsynced-responses.h>
 #include <cassert>
 #include <array>
 #include <deque>
@@ -116,6 +117,7 @@ static size_t LastSentRecords=0;
 static unsigned cellularInitCalls=0;
 static bool initializeCellular(){++cellularInitCalls;LastCellularAttempt=millis();return false;}
 static bg770a::CanDiagnostics CanStats;
+static bg770a::UnsyncedResponses Unsynced;
 static bool DtcExpired=false;
 static uint32_t DtcStarted=0;
 static uint32_t LastCanActivity=0;
@@ -176,7 +178,7 @@ template<class T>struct WioCellularTcpClient2 {
   std::copy(part.begin(),part.end(),out);*size=part.size();return true;
  }
 };
-static void initializeVehicleDataSchema();
+static void initializeVehicleDataSchema(uint64_t receivedMono);
 void updateVehicleData(unsigned char,unsigned char*);
 void processDtcData(unsigned char*);
 String addMillisTime();
@@ -185,7 +187,7 @@ bool arrayEmptyCheck(JsonArrayConst);
 '''+defines+'\n'+constants+'\n'
 for signature in ['static bool canIdle()', 'static bool cellularOnline()', 'static void trace(', 'static bool hasGpsPosition(', 'static size_t gpsRowCount(', 'static std::string gpsPayloadTime(', 'static void logGpsPosition(', 'static void logGpsPayload(', 'static void logGpsDiagnostic()', 'static const char* rejectionName(', 'static void traceFrame(', 'static void tickCan(', 'static void canSummary()', 'static void serviceModem(', 'static void serviceCan()', 'static void cooperativeDelay(', 'static bool waitForCellularNetwork(',
  'static void attachFreshLocation()', 'static bool queueStartupLocation()', 'static bool dispatchServiceLine(', 'static bool serviceStartupLocation()', 'static bool cellularSend(const JsonDocument &doc)', 'void initCAN() {', 'String dtcToString(', 'void processDtcData(unsigned char* data)',
- 'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void clearSentData(', 'static void discardEmptyVehicleRecords() {', 'static void initializeVehicleDataSchema() {',
+ 'void updateVehicleData(unsigned char pid,', 'void clearData() {', 'static void clearSentData(', 'static void discardEmptyVehicleRecords() {', 'static void initializeVehicleDataSchema(uint64_t',
  'String addMillisTime() {', 'bool getTime(char* time) {', 'bool arrayEmptyCheck(', 'void sendDtcRequest() {', 'static bool serviceHeartbeat()', 'static uint32_t idleSleepDuration()', 'void loop() {']:
     source+=function(signature)+'\n'
 source+=r'''
@@ -244,7 +246,7 @@ static void runConcurrentStartup(bool hasFix,bool rejectGps=false,bool rejectFir
  Services.ntpEnabled=false;Services.gnssEnabled=true;sendResult=true;
  Services.clock.seedFallback(1793968496LL,Services.now(0));rejectGpsOnly=rejectGps;rejectInitialObd=rejectFirstObd;
  std::size_t atOffset=0,canOffset=0;
- unsigned searchRequests=0,searchReplies=0,bitmapReplies=0;
+ unsigned searchRequests=0,searchReplies=0,bitmapReplies=0,initialRows=0;
  uint32_t restoredAt=0,firstObdSendAt=0,searchStartedAt=0;
  const unsigned char firstPids[]={0x0C,0x0D,0x05,0x04,0x0F,0x11,0x31,0xA6,0x42,0x46};
  std::deque<unsigned char> initialPids;
@@ -257,11 +259,11 @@ static void runConcurrentStartup(bool hasFix,bool rejectGps=false,bool rejectFir
   for(std::size_t n=previousSends;n<SentPayloads.size();++n) {
    JsonDocument sent;assert(!deserializeJson(sent,SentPayloads[n]));
    if(!gpsStarted) {
-    assert(!initialUploaded && sent["data"].size()==1 && firstRound.set(sent["data"][0]));
+    assert(!initialUploaded && sent["data"].size()>1 && sent["data"].size()<=10 && firstRound.set(sent["data"][0]));
     assert(StartupObdRoundComplete && StartupObdUploadAttempted);
-    assert(initialPids.size()==10 && firstRound["engine_rpm"]==2000 && firstRound["vehicle_speed"]==42);
-    assert(!firstRound["ambient_air_temp"].isNull());initialUploaded=true;
-   } else if(!sent["data"][0]["engine_rpm"].isNull() && !firstObdSendAt)firstObdSendAt=nowMs;
+    assert(initialPids.size()==10 && firstRound["engine_rpm"]==2000 && sent["data"][1]["vehicle_speed"]==42);
+    initialRows=sent["data"].size();initialUploaded=true;
+   } else if(bg770a::hasVehicleMeasurement(sent["data"][0].as<JsonObjectConst>()) && !firstObdSendAt)firstObdSendAt=nowMs;
   }
   // Respond to real writes made by the sketch, preserving the AT ownership
   // boundary and simulating LTE restoration separately from the GPS fix.
@@ -275,7 +277,7 @@ static void runConcurrentStartup(bool hasFix,bool rejectGps=false,bool rejectFir
     assert(bitmapReplies==6 && initialPids.size()==10);
     assert(std::equal(initialPids.begin(),initialPids.end(),firstPids));
     assert(initialUploaded && sendCalls==1);
-    assert(rejectFirstObd ? dataArray.size()==1 : dataArray.size()==0);
+    assert(rejectFirstObd ? dataArray.size()==10 : dataArray.size()==10-initialRows);
     gpsStarted=true;
    }
    if(command=="AT+QGPSLOC=2") {
@@ -338,10 +340,10 @@ static void runConcurrentStartup(bool hasFix,bool rejectGps=false,bool rejectFir
   assert(payload.size()<=CELLULAR_PAYLOAD_LIMIT);
   JsonDocument sent;assert(!deserializeJson(sent,payload));
   for(JsonObjectConst row:sent["data"].as<JsonArrayConst>()) {
-   if(row["engine_rpm"].isNull())continue;
+   if(!row["gps_time"].isNull())continue;
    const JsonObjectConst original=expected["data"][observed++].as<JsonObjectConst>();
    assert(!original.isNull() && row["time"]==original["time"]);
-   assert(row["engine_rpm"]==original["engine_rpm"] && row["vehicle_speed"]==original["vehicle_speed"]);
+   std::string a,b;serializeJson(row,a);serializeJson(original,b);assert(a==b);
   }
  }
  assert(observed==expected["data"].size());
@@ -463,10 +465,10 @@ int main(int argc,char** argv){
  if(argc>1 && std::string(argv[1])=="gps-payload-prefix") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;sendResult=true;CanReady=false;
   Services.clock.seedFallback(1793968496LL,Services.now(0));loop();Serial.output.clear();
-  for(unsigned n=0;n<6;++n){initializeVehicleDataSchema();vehicleData["engine_rpm"]=1000+n;}
+  for(unsigned n=0;n<30;++n){initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=1000+n;}
   vehicleData["latitude"]=35.12345;vehicleData["longitude"]=139.12345;
   vehicleData["gps_time"]="2026-11-06T12:34:56.789+00:00";
-  assert(cellularSend(JsonDoc) && LastSentRecords<6);
+  assert(cellularSend(JsonDoc) && LastSentRecords<30);
   assert(Serial.output.find("direct_gps_rows=0 root_location=0 records=")!=std::string::npos);
   assert(logCount("status=accepted server_status=200 direct_gps_rows=0 root_location=0")==1);
   assert(logCount("[GPS-POSITION]")==0);
@@ -512,12 +514,12 @@ int main(int argc,char** argv){
   assert(dispatchServiceLine("+QNTP: 0,\"2026/11/06,13:01:57+36\""));
   loop();assert(deviceIMSI[0]); // Identity retrieval resumes after NTP releases AT ownership.
   assert(addMillisTime()=="2026-11-06T13:01:57+00:00");
-  initializeVehicleDataSchema();vehicleData["engine_rpm"]=1234;
-  assert(vehicleData["time"]=="2026-11-06T13:01:57+00:00");
-  assert(vehicleData["time_source"]=="ntp");
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=1234;
+  assert(vehicleData["time"]=="2026-11-06T13:01:57.010+00:00");
+  assert(!vehicleData.containsKey("time_source"));
   assert(cellularSend(JsonDoc) && LastSentRecords==1);
   JsonDocument payload;assert(!deserializeJson(payload,SentPayloads.back()));
-  assert(payload["data"][0]["time"]=="2026-11-06T13:01:57+00:00");
+  assert(payload["data"][0]["time"]=="2026-11-06T13:01:57.010+00:00");
   assert(Serial.output.find("[LTE-SEND] 2026-11-06T13:01:57+00:00")!=std::string::npos);
   assert(Serial.output.find("response_time=2026/11/06,13:01:57+36 interpreted_utc=2026-11-06T13:01:57+00:00")!=std::string::npos);
   assert(Serial.output.find("2026-11-06T04:01:57+00:00")==std::string::npos);
@@ -528,6 +530,67 @@ int main(int argc,char** argv){
   assert(bg770a::isoUtc(epoch)=="2026-11-06T13:01:57+00:00");
   std::cout<<"Synthetic QNTP UTC digits survive nonzero suffix metadata through clock, diagnostics, record and actual sender; HTTP offsets convert once\n";return 0;
  }
+ if(argc>1 && std::string(argv[1])=="response-receipt-times") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
+  uint8_t pid;assert(Obd.next(0,pid));
+  const uint8_t bitmap[]={6,0x41,0,0,0x18,0,0,0};
+  assert(!Obd.accept(0x7E8,bitmap,8,1));
+  assert(!Obd.next(101,pid));assert(Obd.next(102,pid) && pid==0x0C);
+  nowMs=103;can.rx.push_back({0x7E8,{4,0x41,0x0C,0,0,0,0,0},7});
+  serviceCan();assert(dataArray.size()==1 && dataArray[0]["engine_rpm"]==0);
+  assert(dataArray[0]["time"]=="2024-12-31T23:59:59.110+00:00");
+  assert(Obd.next(211,pid) && pid==0x0D);
+  nowMs=212;can.rx.push_back({0x7E8,{3,0x41,0x0D,42,0,0,0,0}});
+  serviceCan();assert(dataArray.size()==2 && dataArray[1]["vehicle_speed"]==42);
+  assert(dataArray[1]["time"]=="2024-12-31T23:59:59.212+00:00");
+  assert(dataArray[0].size()==2 && dataArray[1].size()==2);
+  // Equal receipt milliseconds are retained verbatim, never made unique.
+  sendDtcRequest();can.rx.push_back({0x7E8,{2,0x43,0,0,0,0,0,0}});serviceCan();
+  sendDtcRequest();can.rx.push_back({0x7E8,{4,0x43,1,0x01,0xAF,0,0,0}});serviceCan();
+  assert(dataArray.size()==4 && dataArray[2]["time"]==dataArray[3]["time"]);
+  assert(dataArray[2]["dtc_count"]==0 && dataArray[3]["dtc_count"]==1);
+  // Trace/millis advances after receive cannot shift the recorded timestamp.
+  sendDtcRequest();can.rx.push_back({0x7E8,{2,0x43,0,0,0,0,0,0}});
+  advanceMillis=true;const auto expected=nowMs+1;serviceCan();advanceMillis=false;
+  assert(dataArray[4]["time"]==bg770a::isoUtcMilliseconds(1735689599000LL+expected));
+  JsonDoc["location"]["latitude"]=35;JsonDoc["location"]["longitude"]=139;
+  sendResult=false;assert(!cellularSend(JsonDoc));const auto first=SentPayloads.back();
+  // Resync steps UTC backwards: old rows must not be rewritten at send/retry.
+  nowMs=1000;assert(Services.clock.begin(Services.now(nowMs)));
+  Services.clock.accepted(Services.now(nowMs));
+  assert(Services.clock.urc("+QNTP: 0,\"2024/12/30,00:00:00+00\"",Services.now(nowMs)));
+  sendResult=true;assert(cellularSend(JsonDoc));assert(SentPayloads.back()==first);
+  JsonDocument sent;assert(!deserializeJson(sent,first));assert(sent["location"].isNull());
+  assert(sent["data"].size()==5 && first.size()<=1024);
+  std::cout<<"Actual receive boundary: distinct/equal ms, zero, sparse responses, log delay, resync and immutable retry; no cached root GPS\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="unsynced-retention") {
+  Services.ntpEnabled=false;Services.gnssEnabled=false;
+  uint8_t pid;assert(Obd.next(0,pid));const uint8_t bitmap[]={6,0x41,0,0,0x18,0,0,0};
+  assert(!Obd.accept(0x7E8,bitmap,8,1));
+  for(unsigned n=0;n<125;++n) {
+   nowMs=1000+n;sendDtcRequest();can.rx.push_back({0x7E8,{2,0x43,0,0,0,0,0,0}});serviceCan();
+  }
+  assert(dataArray.size()==0 && Unsynced.size()==120 && Unsynced.dropped()==5);
+  assert(Unsynced.at(0).receivedMono==1005 && Unsynced.at(119).receivedMono==1124);
+  assert(Unsynced.at(0).bytes[1]==0x43 && Unsynced.at(0).id==0x7E8);
+  assert(logCount("[UNSYNCED-DROP-OLDEST]")==5);
+  Services.clock.seedFallback(1735689599LL,Services.now(nowMs));
+  serviceCan();assert(dataArray.size()==0 && Unsynced.size()==120);
+  static_assert(sizeof(bg770a::UnsyncedResponses)<3000,"bounded raw RAM quarantine");
+  std::cout<<"Unsynced responses keep original monotonic/raw data in bounded RAM, count overflow and never synthesize UTC after sync\n";return 0;
+ }
+ if(argc>1 && std::string(argv[1])=="periodic-gps-backlog") {
+  Services.ntpEnabled=false;Services.gnssEnabled=true;CanReady=false;
+  StartupLocation=StartupLocationState::Complete;
+  Services.clock.seedFallback(1735689599LL,Services.now(0));
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=1234;
+  serviceModem(true,true);
+  assert(dataArray.size()==1 && Services.gnss.state()==bg770a::GnssSession::State::Offline);
+  assert(WioCellular.uart.tx=="AT+CFUN=4\r");
+  std::cout<<"Periodic GNSS starts with retained OBD backlog instead of requiring an empty queue\n";return 0;
+ }
  if(argc>1 && std::string(argv[1])=="zero-records") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
   Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
@@ -537,8 +600,8 @@ int main(int argc,char** argv){
   const char* fields[]={"engine_rpm","vehicle_speed","coolant_temp","engine_load",
    "intake_air_temp","throttle_position","distance_traveled","odometer",
    "control_module_voltage","ambient_air_temp","dtc_count","dtc_codes"};
-  initializeVehicleDataSchema();
-  for(const char* field:fields)assert(vehicleData.containsKey(field) && vehicleData[field].isNull());
+  initializeVehicleDataSchema(Services.now(millis()));
+  for(const char* field:fields)assert(!vehicleData.containsKey(field) && vehicleData[field].isNull());
   vehicleData["latitude"]=35;vehicleData["battery_level"]=99;
   assert(!bg770a::hasVehicleMeasurement(vehicleData));
   assert(!cellularSend(JsonDoc) && socketOpens==0);
@@ -570,13 +633,13 @@ int main(int argc,char** argv){
   assert(stoppedRow["vehicle_speed"]==0);
   for(const char* field:fields)if(std::strcmp(field,"vehicle_speed"))assert(stoppedRow[field].isNull());
   clearSentData(LastSentRecords);
-  initializeVehicleDataSchema();vehicleData["engine_rpm"]=0;vehicleData["vehicle_speed"]=0;
-  initializeVehicleDataSchema();vehicleData["coolant_temp"]=0;
-  initializeVehicleDataSchema();vehicleData["intake_air_temp"]=-40;
-  initializeVehicleDataSchema();vehicleData["control_module_voltage"]=12.4;
-  initializeVehicleDataSchema();vehicleData["dtc_count"]=1;vehicleData["dtc_codes"]="P01AF";
-  initializeVehicleDataSchema();vehicleData["dtc_codes"]=" \t";
-  initializeVehicleDataSchema();
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=0;vehicleData["vehicle_speed"]=0;
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["coolant_temp"]=0;
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["intake_air_temp"]=-40;
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["control_module_voltage"]=12.4;
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["dtc_count"]=1;vehicleData["dtc_codes"]="P01AF";
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["dtc_codes"]=" \t";
+  initializeVehicleDataSchema(Services.now(millis()));
   discardEmptyVehicleRecords();assert(dataArray.size()==5 && vehicleData.isNull());
   assert(dataArray[0]["engine_rpm"]==0 && dataArray[0]["vehicle_speed"]==0);
   assert(dataArray[1]["coolant_temp"]==0 && dataArray[2]["intake_air_temp"]==-40);
@@ -627,7 +690,7 @@ int main(int argc,char** argv){
   Services.clock.seedFallback(1793968496LL,Services.now(0));
   // Try the acquired GPS row first, then release the OBD backlog independently
   // of that row's acknowledgment. Each failed document keeps its own timestamp.
-  initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;sendResult=true;
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=2000;sendResult=true;
   ReplyChunks={"400 ","{\"error\":\"Invalid payload: decode or JSON failed\",\"private\":\"fixture-private-response\"}"};
   completeStartupGnss();assert(sendCalls==2);
   assert(dataArray.size()==1 && StartupLocation==StartupLocationState::Upload);
@@ -752,13 +815,13 @@ int main(int argc,char** argv){
  if(argc>1 && std::string(argv[1])=="bounded-send-prefix") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
   Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
-  for(unsigned n=0;n<8;++n){initializeVehicleDataSchema();vehicleData["engine_rpm"]=1000+n;}
+  for(unsigned n=0;n<40;++n){initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=1000+n;}
   sendResult=true;ReplyChunks={"400 {\"error\":\"Invalid payload shape\"}"};
-  assert(!cellularSend(JsonDoc) && LastSentRecords==0 && dataArray.size()==8);
+  assert(!cellularSend(JsonDoc) && LastSentRecords==0 && dataArray.size()==40);
   JsonDocument failed;assert(!deserializeJson(failed,SentPayloads.back()));
-  assert(SentPayloads.back().size()<=CELLULAR_PAYLOAD_LIMIT && failed["data"].size()<8);
+  assert(SentPayloads.back().size()<=CELLULAR_PAYLOAD_LIMIT && failed["data"].size()<40);
   ReplyChunks={"200 {\"ok\":true}"};
-  unsigned remaining=8,expected=1000;
+  unsigned remaining=40,expected=1000;
   while(remaining) {
    assert(cellularSend(JsonDoc) && LastSentRecords>0 && LastSentRecords<=remaining);
    JsonDocument batch;assert(!deserializeJson(batch,SentPayloads.back()));
@@ -767,25 +830,25 @@ int main(int argc,char** argv){
    remaining-=LastSentRecords;clearSentData(LastSentRecords);
    assert(dataArray.size()==remaining && vehicleData.isNull());
   }
-  assert(expected==1008);
+  assert(expected==1040);
   std::cout<<"Actual sender bounds each complete JSON batch and removes only accepted record prefixes; 400 retains every record\n";return 0;
  }
  if(argc>1 && std::string(argv[1])=="bounded-backlog-drain") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
   Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
-  for(unsigned n=0;n<8;++n){initializeVehicleDataSchema();vehicleData["engine_rpm"]=1000+n;}
+  for(unsigned n=0;n<40;++n){initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=1000+n;}
   sendResult=true;nowMs=30001;loop();pollUntilSend(1);
-  assert(dataArray.size()>0 && dataArray.size()<8);
+  assert(dataArray.size()>0 && dataArray.size()<40);
   const auto firstSentAt=nowMs;
   for(unsigned n=0;n<400 && sendCalls<2;++n){nowMs+=10;loop();}
   assert(sendCalls==2 && uint32_t(nowMs-firstSentAt)<5000);
-  assert(dataArray.size()>0 && dataArray.size()<7);
+  assert(dataArray.size()>0 && dataArray.size()<39);
   std::cout<<"Accepted partial batch schedules the next prefix promptly instead of waiting 30s per queued record\n";return 0;
  }
  if(argc>1 && std::string(argv[1])=="registration-resumes-send") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
   Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
-  initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;sendResult=true;
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=2000;sendResult=true;
   Services.line("+CEREG: 0",1000);nowMs=30000;Services.tick(nowMs);
   assert(Services.gnss.takeCommand()=="AT+CEREG?\r");
   // Complete a negative query before the send deadline, leaving an idle AT
@@ -822,7 +885,7 @@ int main(int argc,char** argv){
   Services.ntpEnabled=true;Services.gnssEnabled=true;CellularReady=false;
   const auto before=WioCellular.uart.tx;
   char value[64];assert(!getTime(value) && httpCalls==0);
-  initializeVehicleDataSchema();assert(!cellularSend(JsonDoc) && socketOpens==0);
+  initializeVehicleDataSchema(Services.now(millis()));assert(!cellularSend(JsonDoc) && socketOpens==0);
   nowMs=10000;loop();assert(Obd.waiting() && !can.sent.empty());
   assert(identityCalls==0 && WioCellular.uart.tx==before);
   nowMs=60000;Obd=bg770a::ObdSession(false,true);uint8_t pid;assert(Obd.next(nowMs,pid));
@@ -901,7 +964,7 @@ int main(int argc,char** argv){
  if(argc>1 && std::string(argv[1])=="pending-socket") {
   Services.ntpEnabled=false;Services.gnssEnabled=false;
   Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
-  initializeVehicleDataSchema();vehicleData["engine_rpm"]=1234;sendResult=true;socketDelay=500;
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=1234;sendResult=true;socketDelay=500;
   nowMs=30001;loop();assert(Obd.waiting() && socketOpens==0);
   assert(!cellularSend(JsonDoc) && socketOpens==0);
   can.rx.push_back({0x7E8,{6,0x41,0,0,0x18,0,0,0}});
@@ -946,7 +1009,7 @@ int main(int argc,char** argv){
   Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
   sendResult=true;nowMs=30001;loop();assert(sendCalls==0 && socketOpens==0);
   assert(!cellularSend(JsonDoc));assert(socketOpens==0);
-  initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=2000;
   ReplyChunks={"4","00 {\"error\":\"Invalid payload shape\",\"details\":{\"formErrors\":[],\"fieldErrors\":{\"data\":[\"data must contain at least one record\"]}}}"};
   nowMs=61020;loop();pollUntilSend(1);assert(dataArray.size()==1 && sendCalls==1);
   ReplyChunks={"20","7 {\"status\":\"partial\"}"};
@@ -1012,7 +1075,7 @@ int main(int argc,char** argv){
   // Successful OBD uploads and ten-minute GPS uploads must never postpone the
   // next heartbeat. Normal telemetry also remains queued when heartbeat sends.
   for(unsigned n=1;n<=5;++n) {
-   nowMs=n*600000;initializeVehicleDataSchema();vehicleData["vehicle_speed"]=0;
+   nowMs=n*600000;initializeVehicleDataSchema(Services.now(millis()));vehicleData["vehicle_speed"]=0;
    assert(cellularSend(JsonDoc));clearSentData(LastSentRecords);
    assert(LastHeartbeatAck==heartbeatAck && HeartbeatAcknowledged);
    StartupLocationDoc.clear();StartupLocationDoc["imsi"]="fixture-device";
@@ -1025,7 +1088,7 @@ int main(int argc,char** argv){
   }
   assert(sendCalls==10);
   nowMs=ACK_INTERVAL-1;assert(!serviceHeartbeat());assert(sendCalls==10);
-  initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=2000;
   nowMs=ACK_INTERVAL;assert(serviceHeartbeat());assert(sendCalls==11);
   JsonDocument heartbeat;assert(!deserializeJson(heartbeat,SentPayloads.back()));
   assert(heartbeat["data"][0]["type"]=="heartbeat");
@@ -1130,7 +1193,7 @@ int main(int argc,char** argv){
   Services.ntpEnabled=false;Services.gnssEnabled=true;CanReady=false;CellularReady=false;
   WioNetwork.state=Network::NetworkState::Offline;
   Services.clock.seedFallback(1735689599LL,Services.now(0));loop();
-  initializeVehicleDataSchema();vehicleData["engine_rpm"]=2000;
+  initializeVehicleDataSchema(Services.now(millis()));vehicleData["engine_rpm"]=2000;
   nowMs=60000;loop();assert(HeartbeatPending && !HeartbeatAcknowledged && sendCalls==0);
   assert(StartupLocation==StartupLocationState::Pending && dataArray.size()==1);
   CellularReady=true;WioNetwork.state=Network::NetworkState::Connected;sendResult=true;
@@ -1150,7 +1213,7 @@ int main(int argc,char** argv){
   ReplyChunks={"400 {\"error\":\"Invalid payload shape\"}"};loop();
   assert(sendCalls==1 && HeartbeatPending && !HeartbeatAcknowledged);
   const auto retainedTime=HeartbeatDoc["data"][0]["time"].as<std::string>();
-  nowMs=1000;initializeVehicleDataSchema();vehicleData["vehicle_speed"]=0;
+  nowMs=1000;initializeVehicleDataSchema(Services.now(millis()));vehicleData["vehicle_speed"]=0;
   ReplyChunks={"200 {\"ok\":true}"};assert(cellularSend(JsonDoc));clearSentData(LastSentRecords);
   assert(sendCalls==2 && HeartbeatPending && !HeartbeatAcknowledged && LastHeartbeatAck==0);
   assert(HeartbeatDoc["data"][0]["time"].as<std::string>()==retainedTime);
@@ -1256,12 +1319,13 @@ int main(int argc,char** argv){
  nowMs=10360;loop();assert(dataArray.size()==0);
  can.rx.push_back({0x7E8,{4,0x41,0x0C,0x1F,0x40,0,0,0}});
  nowMs=10380;loop();assert(dataArray.size()==1);
- assert(vehicleData["time_source"]=="http_fallback");
- assert(vehicleData["engine_rpm"]==2000);assert(vehicleData["time"]=="2025-01-01T00:00:09+00:00");
+ assert(!vehicleData.containsKey("time_source"));
+ assert(vehicleData["engine_rpm"]==2000);assert(vehicleData["time"]=="2025-01-01T00:00:09.380+00:00");
  nowMs=10500;loop();assert(can.sent.back()[2]==0x0D);
  can.rx.push_back({0x7E8,{3,0x41,0x0D,42,0,0,0,0}});
- nowMs=10520;loop();assert(vehicleData["vehicle_speed"]==42);assert(vehicleData["engine_rpm"]==2000);
- assert(vehicleData.containsKey("odometer"));assert(vehicleData.containsKey("dtc_codes"));
+ nowMs=10520;loop();assert(vehicleData["vehicle_speed"]==42);assert(vehicleData["engine_rpm"].isNull());
+ assert(!vehicleData.containsKey("odometer"));assert(!vehicleData.containsKey("dtc_codes"));
+ assert(dataArray.size()==2 && dataArray[0]["engine_rpm"]==2000);
  Obd.tick(11000);nowMs=11000;sendDtcRequest();
  can.rx.push_back({0x7E9,{4,0x43,1,0x01,0xAF,0,0,0}});serviceCan();assert(DtcWaiting);
  can.rx.push_back({0x7E8,{4,0x43,1,0x01,0xAF,0,0,0}});serviceCan();assert(!DtcWaiting);
@@ -1270,7 +1334,7 @@ int main(int argc,char** argv){
  nowMs+=200;serviceCan();assert(!DtcWaiting);
  sendDtcRequest();can.rx.push_back({0x7E8,{2,0x43,0,0,0,0,0,0}});serviceCan();assert(vehicleData["dtc_count"]==0);
  sendDtcRequest();can.rx.push_back({0x7E8,{0x10,10,0x43,0,0,0,0,0}});serviceCan();assert(vehicleData["dtc_codes"]=="MULTI");assert(vehicleData["dtc_count"].isNull());
- nowMs=30001;loop();pollUntilSend(1);assert(sendCalls==1);assert(dataArray.size()==1); // failure retains samples
+ nowMs=30001;loop();pollUntilSend(1);assert(sendCalls==1);assert(dataArray.size()==5); // failure retains all individual responses
  sendResult=true;nowMs=61000;loop();pollUntilSend(2);assert(sendCalls==2);assert(dataArray.size()==0);assert(vehicleData.isNull());
  // Actual reset dispatch and off-state AT exclusion.
  Services.gnss.recover();serviceModem();assert(WioCellular.uart.resets==1);
@@ -1280,8 +1344,9 @@ int main(int argc,char** argv){
  serviceModem();assert(WioCellular.uart.tx==before);SynchronousModem=false;Services.ntpEnabled=false;
  // Sample bound and UTC leap/year formatting are preserved on actual schema.
  nowMs=70000;
- for(unsigned n=0;n<20;++n) { initializeVehicleDataSchema(); }
- assert(dataArray.size()==12);
+ for(unsigned n=0;n<130;++n) { initializeVehicleDataSchema(Services.now(millis())); }
+ assert(dataArray.size()==120);
+ assert(logCount("[QUEUE-DROP-OLDEST]")==10);
  clearData();assert(dataArray.size()==0 && vehicleData.isNull());
  attachFreshLocation();assert(JsonDoc["location"].isNull());
  assert(JsonDoc["obd"]["distance_traveled_meaning"]=="distance_since_dtc_clear");
@@ -1303,5 +1368,7 @@ with tempfile.TemporaryDirectory() as tmp:
     cpp=pathlib.Path(tmp)/'sketch.cpp';exe=pathlib.Path(tmp)/'sketch';cpp.write_text(source)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-pedantic','-fsanitize=undefined','-I'+str(root/'src'),'-I'+str(include),'-I'+str(root/'tests/gnss/fixtures/test-support'),'-I'+str(root/'tests/gnss/fixtures/upstream/src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-    for scenario in os.environ.get('SKETCH_SCENARIOS','startup-obd-early-fix startup-obd-no-fix startup-obd-gps-rejected startup-obd-first-rejected startup-obd-no-ecu gps-observability gps-upload-failures gps-payload-prefix gps-command-timeout-log qntp-utc-metadata zero-records startup-gps-delayed-fix startup-gps-first startup-gps-only startup-gps-no-fix startup-no-fix-periodic-gps startup-no-fix-no-network startup-gps-recovery startup-ntp-first bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-hourly heartbeat-retry heartbeat-unsynced heartbeat-independent-cadence heartbeat-registration heartbeat-pending-can heartbeat-keeps-polling heartbeat-offline-polling heartbeat-startup-ready heartbeat-startup-unsynced heartbeat-startup-identity heartbeat-startup-lte-backlog heartbeat-startup-retry heartbeat-gps-rejection heartbeat-sleep-deadline config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
-        subprocess.run([str(exe),scenario],check=True)
+    failures=[]
+    for scenario in os.environ.get('SKETCH_SCENARIOS','response-receipt-times unsynced-retention periodic-gps-backlog startup-obd-early-fix startup-obd-no-fix startup-obd-gps-rejected startup-obd-first-rejected startup-obd-no-ecu gps-observability gps-upload-failures gps-payload-prefix gps-command-timeout-log qntp-utc-metadata zero-records startup-gps-delayed-fix startup-gps-first startup-gps-only startup-gps-no-fix startup-no-fix-periodic-gps startup-no-fix-no-network startup-gps-recovery startup-ntp-first bounded-send-prefix bounded-backlog-drain registration-resumes-send cellular-network-wait cellular-unavailable unsynced-wake dtc-deadline missing-bitmap empty-and-400 heartbeat-hourly heartbeat-retry heartbeat-unsynced heartbeat-independent-cadence heartbeat-registration heartbeat-pending-can heartbeat-keeps-polling heartbeat-offline-polling heartbeat-startup-ready heartbeat-startup-unsynced heartbeat-startup-identity heartbeat-startup-lte-backlog heartbeat-startup-retry heartbeat-gps-rejection heartbeat-sleep-deadline config-failure pending-socket pending-clock-identity uart-failure verbose-diagnostics field-padded synthetic-padded-values utc-continuity utc-true-wrap').split():
+        if subprocess.run([str(exe),scenario]).returncode: failures.append(scenario)
+    if failures: raise RuntimeError("Failed scenarios: "+", ".join(failures))

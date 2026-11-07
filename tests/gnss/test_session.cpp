@@ -189,7 +189,8 @@ int main() {
   assert(!noAntenna.fix().valid);
   GnssSession rejected; assert(rejected.begin(0)); answer(rejected,"AT+CFUN=4",0);
   answer(rejected,"AT+QGPS=1",1,"ERROR"); restore(rejected,2);
-  assert(rejected.canSend()); assert(!rejected.ready(999999));
+  assert(rejected.canSend()); assert(!rejected.disabled());
+  assert(!rejected.ready(2+GnssSession::RetryMs-1));assert(rejected.ready(2+GnssSession::RetryMs));
   GnssSession timeout; assert(timeout.begin(0)); timeout.takeCommand(); timeout.tick(20000);
   assert(timeout.state()==GnssSession::State::ResetNeeded); assert(!timeout.canSend());
   timeout.resetIssued(20000); timeout.line("OK",20001); assert(!timeout.canSend());
@@ -199,7 +200,10 @@ int main() {
   assert(timeout.takeCommand()=="AT+CEREG?\r"); timeout.line("AT+CEREG?",26402);
   assert(timeout.line("+CEREG: 1,5",26402)); timeout.line("OK",26402);
   // Boot may already be registered before CEREG URCs are enabled: no URC required.
-  assert(timeout.canSend()); assert(!timeout.ready(999999));
+  assert(timeout.canSend());
+  assert(!timeout.disabled());
+  assert(!timeout.ready(26402+GnssSession::RetryMs-1));
+  assert(timeout.ready(26402+GnssSession::RetryMs));
   GnssSession boot; assert(boot.begin(0)); boot.tick(20000); boot.resetIssued(20000); boot.tick(50000);
   assert(boot.state()==GnssSession::State::ResetNeeded);
   GnssSession missingEcho; assert(missingEcho.begin(0)); missingEcho.takeCommand(); missingEcho.line("OK",1);

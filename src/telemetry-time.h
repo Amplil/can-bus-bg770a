@@ -35,4 +35,11 @@ inline std::string isoUtc(int64_t epoch) {
   char out[26];if(!std::strftime(out,sizeof(out),"%Y-%m-%dT%H:%M:%S+00:00",calendar))return {};
   return out;
 }
+inline std::string isoUtcMilliseconds(int64_t epochMs) {
+  const auto seconds=isoUtc(epochMs/1000);
+  if(seconds.empty() || epochMs<0)return {};
+  char fraction[5];
+  std::snprintf(fraction,sizeof(fraction),".%03u",unsigned(epochMs%1000));
+  return seconds.substr(0,19)+fraction+seconds.substr(19);
+}
 }

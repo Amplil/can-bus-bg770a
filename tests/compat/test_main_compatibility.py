@@ -6,6 +6,9 @@ import json, os, pathlib, re, subprocess, tempfile
 root=pathlib.Path(__file__).resolve().parents[2]
 BASE='93af60465fbfec11a852343c302180161a5ae251'
 def baseline(path):
+    # Explicit offline snapshot of this pinned commit, verified by caller.
+    if os.environ.get('COMPAT_BASELINE_DIR'):
+        return (pathlib.Path(os.environ['COMPAT_BASELINE_DIR'])/path).read_text()
     return subprocess.check_output(['git','show',BASE+':'+path],cwd=root,text=True)
 def function(text,signature):
     start=text.index(signature)
@@ -51,6 +54,7 @@ with tempfile.TemporaryDirectory() as folder:
         init=function(sketch,'void initCAN() {')
         for method,args in re.findall(r'can\.(setCanRate|setMask|setFilt)\(([^\n]*?)\)',init):source+='assert(can.'+method+'('+args+'));\n'
         source+='dump();\n'
+        if not is_main: source=source.replace('initializeVehicleDataSchema();','initializeVehicleDataSchema(1);')
         source+='const unsigned char pids[]={'+','.join(str(p) for p in [0,0x20,0x40,0x60,0x80,0xA0]+main_pids)+'};\n'
         if is_main:source+='for(auto pid:pids){can.sendPid(pid);dump();}\ncan.sendDtc(3);dump();\n'
         else:source+='bg770a::ObdSession session(OBD_CAN_EXTENDED);for(auto pid:pids){const unsigned char request[8]='+request+';can.send(session.requestId(),OBD_CAN_EXTENDED,0,8,request);dump();}\nconst unsigned char request[8]='+dtc_request+';can.send(session.requestId(),OBD_CAN_EXTENDED,0,8,request);dump();\n'
@@ -71,6 +75,8 @@ assert(can.receive(&id,data));for(int i=3;i>=0;--i)Serial1.tx.push_back((id>>(i*
         source=r'''
 #include <ArduinoJson.h>
 #include <telemetry-services.h>
+#include <telemetry-time.h>
+#include <telemetry-record.h>
 #include <cmath>
 #include <iostream>
 #include <string>
@@ -79,13 +85,15 @@ static bg770a::TelemetryServices Services;
 static JsonDocument JsonDoc;
 static JsonArray dataArray=JsonDoc["data"].to<JsonArray>();
 static JsonObject vehicleData;
-static std::string addMillisTime(){return "2026-11-05T00:00:00+00:00";}
+std::string addMillisTime(){return "2026-11-05T00:00:00+00:00";}
 static void trace(const char*){}
-struct Logger{template<class... T>void printf(T...){}} Serial;
+static constexpr size_t OBD_QUEUE_LIMIT=120;
+struct Logger{template<class... T>void printf(T...){} template<class T>void println(T){}} Serial;
 '''
         source+='\n'.join(re.findall(r'^#define PID_.*',main_header,re.M))+'\n'
-        source+=function(sketch,'static void initializeVehicleDataSchema() {')+'\n'+function(sketch,'void updateVehicleData(unsigned char pid,')
+        source+=function(sketch,'static void initializeVehicleDataSchema() {' if is_main else 'static void initializeVehicleDataSchema(uint64_t')+'\n'+function(sketch,'void updateVehicleData(unsigned char pid,')
         source+='\nint main(){Services.clock.seedFallback(1793836800,1);JsonDoc["imsi"]="[synthetic-identity]";initializeVehicleDataSchema();\n'
+        if not is_main: source=source.replace('initializeVehicleDataSchema();','initializeVehicleDataSchema(1);')
         source+='const unsigned char pids[]={'+','.join(str(p) for p in main_pids)+'};\n'
         source+='for(auto pid:pids){unsigned char data[8]={static_cast<unsigned char>(2+bg770a::ObdSession::length(pid)),0x41,pid,0x20,0x40,0x60,0x80,0};updateVehicleData(pid,data);}\n'
         source+='std::string json;serializeJson(JsonDoc,json);std::cout<<json;}\n'
@@ -98,6 +106,14 @@ struct Logger{template<class... T>void printf(T...){}} Serial;
     a,b=schemas
     assert set(a)==set(b)=={'imsi','data'}
     old,new=a['data'][0],b['data'][0]
-    assert all(key in new and new[key]==value and type(new[key]) is type(value) for key,value in old.items()),'Required schema/value/type drift against real main'
-    assert set(new)-set(old)=={'time_source','time_sync_state','utc_epoch_s'}
-print('Pinned main 93af604 versus current: all Mode01/config UART bytes, 12-byte RX, PID order and required JSON values/types match; sole Mode03 byte difference is PCI 02 -> 01. Synthetic host fixtures only.')
+    for key,value in old.items():
+        if key=='time':
+            assert value=='2026-11-05T00:00:00+00:00'
+            assert new[key]=='2026-11-05T00:00:00.000+00:00'
+        elif key in {'dtc_codes','dtc_count'}:
+            assert value==('' if key=='dtc_codes' else 0)
+            assert key not in new, 'Unreceived DTC must remain unavailable, not fabricated zero'
+        else:
+            assert key in new and new[key]==value and type(new[key]) is type(value), key
+    assert set(new)==set(old)-{'dtc_codes','dtc_count'}
+print('Pinned main 93af604 versus current: Mode01/config UART bytes, 12-byte RX, PID order and acquired JSON values/types match. Intentional differences: Mode03 PCI 02 -> 01, millisecond time, omitted unreceived DTC. Synthetic host fixtures only.')

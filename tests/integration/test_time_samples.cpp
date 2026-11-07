@@ -63,5 +63,18 @@ int main(){
  assert(!gw.command(0xFFFFFFF0U,1,true,false,true).empty());
  gw.tick(0x4E0FU);assert(gw.gnss.state()==bg770a::GnssSession::State::Offline);
  gw.tick(0x4E10U);assert(gw.gnss.state()==bg770a::GnssSession::State::ResetNeeded);
+ // Millisecond UTC is based on the UTC sample boundary, not raw millis%1000.
+ bg770a::TelemetryServices ms;
+ int64_t epochMs;
+ assert(!ms.clock.utcMilliseconds(ms.now(0xFFFFFFF0U),epochMs));
+ ms.clock.seedFallback(anchor,ms.now(0xFFFFFFF0U));
+ assert(ms.clock.utcMilliseconds(ms.now(0x20U),epochMs) && epochMs==anchor*1000+48);
+ assert(bg770a::isoUtcMilliseconds(epochMs)=="2026-11-05T06:38:43.048+00:00");
+ assert(!ms.clock.utcMilliseconds(0xFFFFFFEFULL,epochMs));
+ assert(ms.clock.begin(ms.now(0x30U)));ms.clock.accepted(ms.now(0x31U));
+ assert(ms.clock.urc("+QNTP: 0,\"2026/11/05,06:38:42+36\"",ms.now(0x40U)));
+ assert(ms.clock.utcMilliseconds(ms.now(0x45U),epochMs) && epochMs==anchor*1000-995);
+ assert(bg770a::isoUtcMilliseconds(1735689599999LL)=="2024-12-31T23:59:59.999+00:00");
+ assert(bg770a::isoUtcMilliseconds(1735689600000LL)=="2025-01-01T00:00:00.000+00:00");
  std::cout<<"Stale/live sample separation, first-high sample, real/late wrap, half-range contract and NTP/GNSS deadlines passed\n";
 }

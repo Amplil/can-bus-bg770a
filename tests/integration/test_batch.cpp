@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <unordered_map>
+#include <algorithm>
 
 template<class T>static std::string json(const T& value) {
   std::string output;serializeJson(value,output);return output;
@@ -31,6 +33,20 @@ class RejectAllocator:public ArduinoJson::Allocator {
   void* allocate(size_t)override{return nullptr;}
   void deallocate(void*)override{}
   void* reallocate(void*,size_t)override{return nullptr;}
+};
+class TrackingAllocator:public ArduinoJson::Allocator {
+ std::unordered_map<void*,size_t> sizes;
+ public:
+ size_t current=0,peak=0;
+ void* allocate(size_t size)override {
+  auto* p=std::malloc(size);if(p){sizes[p]=size;current+=size;peak=std::max(peak,current);}return p;
+ }
+ void deallocate(void* p)override {if(p){current-=sizes.at(p);sizes.erase(p);std::free(p);}}
+ void* reallocate(void* p,size_t size)override {
+  if(!p)return allocate(size);
+  const auto old=sizes.at(p);auto* q=std::realloc(p,size);
+  if(q){sizes.erase(p);sizes[q]=size;current=current-old+size;peak=std::max(peak,current);}return q;
+ }
 };
 int main() {
   JsonDocument source,batch;
@@ -100,6 +116,20 @@ int main() {
     assert(bg770a::makeTelemetryBatch(source,batch,1024)==0);
     assert(json(source)==unchanged && batch.isNull());
   }
+  TrackingAllocator queueMemory,batchMemory;
+  JsonDocument sparse(&queueMemory),bounded(&batchMemory);
+  sparse["imsi"]="synthetic-device";
+  auto sparseRows=sparse["data"].to<JsonArray>();
+  for(unsigned n=0;n<120;++n) {
+    auto row=sparseRows.add<JsonObject>();
+    row["time"]=std::string("2026-11-06T10:44:59.")+std::to_string(100+n)+"+00:00";
+    row["dtc_codes"]="P01AF P02AF P03AF";row["dtc_count"]=3;
+  }
+  assert(!sparse.overflowed());
+  assert(bg770a::makeTelemetryBatch(sparse,bounded,1024)>0 && measureJson(bounded)<=1024);
+  assert(queueMemory.peak<40000 && batchMemory.peak<16000);
+  std::cout<<"120 sparse DTC rows host allocator peak="<<queueMemory.peak
+           <<" bytes; prefix builder peak="<<batchMemory.peak<<" bytes\n";
   std::cout<<"Telemetry batches preserve prefix records and metadata, respect serialized byte limits, "
               "retain rejected queues, and reject oversize/invalid/allocation failures\n";
 }

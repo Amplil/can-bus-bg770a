@@ -58,7 +58,8 @@ class EndpointAck {
         if(doc["error"]=="Invalid payload: decode or JSON failed")return "payload_decode";
         if(doc["error"]=="Invalid payload shape") {
           for(const char* field:{"data","time"}) {
-            for(JsonVariantConst message:doc["details"]["fieldErrors"][field].as<JsonArrayConst>()) {
+            const JsonArrayConst messages=doc["details"]["fieldErrors"][field].as<JsonArrayConst>();
+            for(JsonVariantConst message:messages) {
               if(message=="data must contain at least one record")return "data_empty";
               if(message=="time must be ISO 8601 (e.g. 2025-08-11T23:59:54+09:00)")return "time_format";
             }

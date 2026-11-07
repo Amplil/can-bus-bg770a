@@ -22,6 +22,7 @@
 #include <can-diagnostics.h>
 #include <cellular-startup.h>
 #include <obd-dtc.h>
+#include <unsynced-responses.h>
 #include <functional>
 #include <utility>
 #ifndef TELEMETRY_NTP
@@ -63,6 +64,9 @@ JsonArray dataArray = JsonDoc["data"].to<JsonArray>();
 JsonObject vehicleData; // dataArrayに追加するJsonObject
 char deviceIMSI[20]; // SIMカードのIMSI情報を保存するための変数
 
+// Bound sparse response rows, approximately twelve full ten-PID rounds.
+// On prolonged outage evict oldest with an explicit loss diagnostic.
+static constexpr size_t OBD_QUEUE_LIMIT = 120;
 static constexpr int OBD_INTERVAL = 10000; // [ms] OBD-IIのデータ取得のためのコマンド群を送信する間隔
 //static constexpr int CELLULAR_INTERVAL = 60000; // [ms] セルラーデータの送信間隔
 static constexpr int CELLULAR_INTERVAL = 30000; // [ms] セルラーデータの送信間隔
@@ -93,6 +97,7 @@ static bool CellularReady=false;
 static uint32_t LastCellularAttempt=0;
 static size_t LastSentRecords=0;
 static bg770a::CanDiagnostics CanStats;
+static bg770a::UnsyncedResponses Unsynced;
 static bool DtcExpired=false;
 static bool DtcWaiting=false;
 static bool HeartbeatPending=false;
@@ -115,7 +120,7 @@ static void discardEmptyVehicleRecords();
 static bool cellularSend(const JsonDocument&);
 static bool serviceHeartbeat();
 static uint32_t idleSleepDuration();
-static void initializeVehicleDataSchema();
+static void initializeVehicleDataSchema(uint64_t receivedMono);
 static bool queueStartupLocation();
 static bool dispatchServiceLine(const std::string& line);
 static bool serviceStartupLocation();
@@ -289,7 +294,7 @@ static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
   }
   const bool initialGnss=allowGnss && StartupLocation==StartupLocationState::Pending &&
     StartupObdRoundComplete && StartupObdUploadAttempted && deviceIMSI[0];
-  const bool periodicGnss=allowGnss && !HeartbeatPending && StartupLocation==StartupLocationState::Complete && dataArray.size()==0;
+  const bool periodicGnss=allowGnss && !HeartbeatPending && StartupLocation==StartupLocationState::Complete;
   gpsSequence=Services.gnss.diagnostic().sequence;
   const auto command=Services.command(millis(),WioNetwork.config.pdpContextId,online,
                                       allowNtp,initialGnss || periodicGnss);
@@ -308,6 +313,9 @@ static void serviceCan() {
   unsigned long id=0; unsigned char bytes[8]={};
   for(unsigned n=0;n<8 && can.receive(&id,bytes);++n) {
     const uint32_t receivedAt=millis();
+    const uint64_t receivedMono=Services.now(receivedAt);
+    int64_t receivedEpochMs=0;
+    const bool haveUtc=Services.clock.utcMilliseconds(receivedMono,receivedEpochMs);
     // receive() may block: enforce the deadline after every returned frame.
     tickCan(receivedAt);
     ++CanStats.received;
@@ -334,9 +342,16 @@ static void serviceCan() {
     }
     if(dtc) {DtcWaiting=false;DtcExpired=false;}
     if(!telemetry && !dtc)continue;
-    int64_t epoch;
-    if(!Services.clock.utc(Services.now(millis()),epoch)) {trace("CAN-RECORD");Serial.println("accepted activity, record deferred: UTC unavailable");continue;}
-    if(vehicleData.isNull())initializeVehicleDataSchema();
+    if(!haveUtc) {
+      const bool evicted=Unsynced.retain(receivedMono,id,bytes);
+      trace(evicted?"UNSYNCED-DROP-OLDEST":"UNSYNCED-RETAIN");
+      Serial.printf("ram_only=1 records=%u dropped=%lu; no UTC, not uploaded; reboot loses buffer\n",
+        unsigned(Unsynced.size()),static_cast<unsigned long>(Unsynced.dropped()));
+      continue;
+    }
+    initializeVehicleDataSchema(receivedMono);
+    // Snapshot before logging/ticking can advance time or a later resync occurs.
+    vehicleData["time"]=bg770a::isoUtcMilliseconds(receivedEpochMs);
     if(telemetry)updateVehicleData(bytes[2],bytes);
     if(dtc)processDtcData(bytes);
   }
@@ -390,18 +405,9 @@ static bool waitForCellularNetwork(uint32_t timeout) {
   return false;
 }
 static void attachFreshLocation() {
+  // GPS is uploaded as its own row with the fix's exact gps_time. Never attach
+  // a cached position to a new OBD batch as if it were a new observation.
   JsonDoc.remove("location");
-  const auto& fix=Services.gnss.fix();
-  // LTE restoration can exceed one minute. Keep the actual GNSS UTC/date and
-  // age so the dashboard can show when this last-known position was acquired.
-  if(!bg770a::isFresh(fix,millis(),bg770a::GnssSession::RetryMs))return;
-  JsonObject location=JsonDoc["location"].to<JsonObject>();
-  location["latitude"]=fix.latitude;location["longitude"]=fix.longitude;
-  location["altitude_m"]=fix.altitude;location["hdop"]=fix.hdop;
-  location["fix_type"]=fix.fix;location["satellites"]=fix.satellites;
-  location["utc_hhmmss"]=fix.utc;location["date_ddmmyy"]=fix.date;
-  location["age_ms"]=uint32_t(millis()-fix.receivedMillis);
-  location["source"]="gnss";
 }
 
 static bool queueStartupLocation() {
@@ -971,7 +977,7 @@ static bool cellularSend(const JsonDocument &doc) {
 
     Serial.print("Sending ");
     std::string str;
-    if(&doc==&JsonDoc)attachFreshLocation(); // A slow TCP connection may outlive fix freshness.
+    if(&doc==&JsonDoc)attachFreshLocation(); // GPS is delivered only in independent fix rows.
     JsonDocument batch;
     const size_t batchRecords=bg770a::makeTelemetryBatch(doc,batch,CELLULAR_PAYLOAD_LIMIT);
     if(!batchRecords) {
@@ -1041,17 +1047,19 @@ static void discardEmptyVehicleRecords() {
   }
 }
 
-static void initializeVehicleDataSchema() {
-  if(dataArray.size()>=12)dataArray.remove(0);
-  vehicleData = dataArray.add<JsonObject>(); // Preserve bounded latest samples
-  trace("QUEUE-ADD");Serial.printf("records=%u\n",unsigned(dataArray.size()));
-  vehicleData["time_source"]=Services.clock.source();
-  vehicleData["time_sync_state"]=Services.clock.quality(Services.now(millis()));
-  int64_t epoch;
-  if(Services.clock.utc(Services.now(millis()),epoch))vehicleData["utc_epoch_s"]=epoch;
-  vehicleData["time"] = addMillisTime(); // 経過時間を計算して現在時刻を生成, String (ISO8601)
-  // Only validated replies replace null; an acquired zero remains numeric zero.
-  bg770a::initializeObdFields(vehicleData);
+static void initializeVehicleDataSchema(uint64_t receivedMono) {
+  if(dataArray.size()>=OBD_QUEUE_LIMIT) {
+    dataArray.remove(0);
+    trace("QUEUE-DROP-OLDEST");Serial.println("reason=capacity records=1 limit=120");
+  }
+  vehicleData=dataArray.add<JsonObject>();
+  int64_t epochMs;
+  if(Services.clock.utcMilliseconds(receivedMono,epochMs))
+    vehicleData["time"]=bg770a::isoUtcMilliseconds(epochMs);
+  // Sparse: only the accepted response's fields are added; zero remains zero.
+  if(vehicleData.isNull() || JsonDoc.overflowed()) {
+    trace("QUEUE-ALLOCATION-FAILED");Serial.println("response may be lost; memory exhausted");
+  }
 }
 
 template<typename T>

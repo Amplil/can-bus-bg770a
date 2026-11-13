@@ -1,8 +1,17 @@
 #pragma once
 #include "ntp-time.h"
+#include "gnss-fix.h"
 #include <ctime>
 #include <cstdio>
 namespace bg770a {
+// The fix carries UTC independently of the modem/NTP clock and upload time.
+inline std::string gnssIsoUtc(const GnssFix& fix) {
+  if(!fix.valid || !detail::dateValid(fix.date) || !detail::utcValid(fix.utc))return {};
+  char out[30];
+  std::snprintf(out,sizeof(out),"20%.2s-%.2s-%.2sT%.2s:%.2s:%.2s.%.3s+00:00",
+                fix.date+4,fix.date+2,fix.date,fix.utc,fix.utc+2,fix.utc+4,fix.utc+7);
+  return out;
+}
 inline bool parseHttpTime(const std::string& s, int64_t& epoch) {
   // WorldTimeAPI ISO8601 with optional fractional seconds and numeric zone.
   if (s.size()<25 || s[4]!='-' || s[7]!='-' || s[10]!='T') return false;

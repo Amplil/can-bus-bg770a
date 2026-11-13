@@ -3,14 +3,21 @@
 Base: `Amplil/can-bus-bg770a` main `93af60465fbfec11a852343c302180161a5ae251`.
 This ports the requested functionality, not the old main snapshot. The new main's
 `imsi` + `data[]` envelope, numeric record keys (including odometer), DTC strings,
-30-second send interval, CAN power gating and ten-minute idle sleep remain.
-Hourly heartbeat intent is retained locally; the ingest endpoint rejects empty records,
-so no empty heartbeat payload is sent. UTC ISO8601 `time` retains its string type and explicit offset;
+30-second measurement send interval and CAN power gating remain. Idle sleep is
+at most ten minutes and ends by the next hourly heartbeat deadline.
+An explicit timestamp-only heartbeat is due at startup as soon as LTE, device
+identity and validated UTC are available, including when no OBD or GPS reading
+is available. Further heartbeats are due one hour after the last acknowledged
+heartbeat, independently of measurement uploads.
+UTC ISO8601 `time` retains its string type and explicit offset;
 the previous code incorrectly relabeled local time with +09:00 and mishandled
-long uptime. Added metadata is optional for consumers. The ingest service itself
-is not available here; compatibility with strict rejection of extra fields needs
-server validation. Required numeric keys retain the main's zero defaults; these
-are placeholders for missing measurements, not evidence of PID support.
+long uptime. Added metadata is optional for consumers. The companion dashboard
+accepts the root GNSS location and preserves its acquisition time separately
+from OBD record time. Each OBD numeric field and DTC field starts as JSON `null`
+and is populated only by an accepted reply. A measured zero remains numeric `0`.
+A measurement row with no acquired OBD measurement, DTC result or valid GPS fix
+is discarded before upload. An explicit heartbeat is stored separately from
+measurement rows. A real GPS-only row is eligible while all OBD fields remain `null`.
 
 ## Complete fork inventory (2026-11-05)
 
@@ -41,10 +48,31 @@ Only a matching command echo, final OK, and valid `+QNTP` success notification
 commit an NTP sample. An initial OK does not prove synchronization. Dates, leap
 days and modem quarter-hour offsets are validated. UTC is extended from millis
 with a 64-bit monotonic counter; resync is due every six hours, stale after 24.
+The BG770A QNTP decoder treats its clock digits as UTC and validates the trailing
+timezone indicator as metadata. It does not subtract that indicator again.
+HTTP ISO timestamps use a separate offset-aware path: `22:01:57+09:00` becomes
+`13:01:57+00:00`. GNSS fixes already carry UTC. These source conversions are
+independent of the dashboard's selectable JST/UTC presentation.
+
+`NTP-SAMPLE` prints only a validated, fixed-length `response_time` and its
+`interpreted_utc`, allowing the modem's response to be checked against an
+independent clock. The supplied November 6 send trace showed `04:01:57+00:00`
+at monitor time `22:01:57` JST; the correct UTC for that monitor time is
+`13:01:57`. The subsequently inspected startup monitor also showed the nine-hour
+error immediately at `NTP-RESULT`, with `source=ntp`. Neither trace includes the
+original QNTP result. The regression response `13:01:57+36` is synthetic: the
+former offset subtraction maps it to `04:01:57`, and the QNTP-specific path
+retains `13:01:57`. Existing stored or queued records are not rewritten.
+
+Reference: [Quectel BG770A TCP/IP application note, section 2.3.14](https://quectel.com/content/uploads/2024/02/Quectel_BG770A-GLBG95xA-GL_TCPIP_Application_Note_V1.1.pdf)
+and [Seeed's BG770A clock interface](https://seeedjp.github.io/wio_cellular/classwiocellular_1_1module_1_1bg770a_1_1commands_1_1Bg770aHardwareRelatedCommands.html),
+which exposes the GMT clock and time difference separately. The diagnostic
+records the actual response so firmware-specific behavior can be distinguished.
+
 Startup services CAN while waiting for NTP (135-second overall wait). Existing
 WorldTimeAPI HTTP fallback is retained with two bounded attempts, complete JSON
 validation and offset parsing. It is labeled `http_fallback`, never `ntp`. HTTP
-is unauthenticated as in main. Failure of both sources defers timestamped records
+is unauthenticated as in main. Failure of both sources defers timestamped OBD records
 and retries fallback while online, rather than inventing a date or rebooting.
 
 `time_source`, `time_sync_state`, `utc_epoch_s` accompany each acquired record;
@@ -55,23 +83,89 @@ path's physical modem reset, restore flow control and LTE registration, disable
 further NTP/GNSS acquisition for that boot, and preserve any prior clock anchor.
 No AT is sent to a deliberately sleeping modem. Idle sleep needs an idle AT
 boundary, not successful network registration. On CAN activity after sleep the
-modem is restarted before sending. No hardware was reset or flashed in this task.
+modem is restarted before sending. Physical verification is required for each
+supported hardware and firmware configuration.
 
 ## GNSS
 
-The first normal telemetry attempt precedes GNSS; subsequent acquisitions occur
-at most every five minutes. GNSS temporarily takes LTE offline, searches for up
-to 30 seconds, stops GNSS and restores LTE/registration. A pending command may
-add its 20-second deadline. CAN receive/validation continues during this process.
-Command errors or uncertain boundaries use bounded reset/boot recovery. No-fix
-and stale-fix paths omit `location`; freshness is rechecked after TCP connection
-setup. No zero coordinates are substituted. Location is current acquisition
-metadata for the envelope, not the position of every queued historical record.
+After network/time setup and device identification, startup immediately polls
+one complete OBD round before starting GNSS. The round finishes after capability
+discovery and a pass through the ten configured telemetry PIDs: supported PIDs
+and permitted unknown PIDs receive a reply or reach their existing timeout;
+excluded PIDs are skipped. The first round starts without the normal ten-second
+group delay and is allowed to finish even if it exceeds the usual four-second
+window. Bitmap replies or the first measurement alone do not finish the round.
+The resulting OBD record becomes due for LTE transmission immediately, before
+GNSS takes the radio offline. The send attempt waits for LTE readiness and any
+pending CAN reply. An acknowledgment removes the transmitted prefix; a failed
+attempt retains it for retry and permits the GPS search to proceed. A round
+without timestamped measurements, including a silent/unavailable ECU, proceeds
+to GPS without sending a fabricated OBD row.
+
+During the GPS search, normal OBD PID polling and CAN reply collection continue.
+Accepted OBD measurements accumulate in the existing bounded 12-record queue.
+A valid fix becomes a GPS-only row and is sent as soon as LTE/registration is
+restored, independently of ECU availability or OBD responses.
+The row uses GNSS UTC seconds for `time`,
+the exact acquisition time including milliseconds for `gps_time`, and direct
+per-record `latitude`, `longitude` and `altitude`. All OBD and DTC fields remain
+`null`. Once a fix is queued or the search ends without a fix, the accumulated
+OBD queue becomes due immediately. After GNSS stops and LTE/registration is
+restored, the sender finishes any pending CAN reply, attempts the GPS row first
+when available, and drains acknowledged OBD prefixes about one second apart
+within the 1,024-byte payload limit. A rejected GPS upload retains its own row
+for the normal 30-second retry while OBD uploads proceed independently. OBD
+send failures retain the unacknowledged queue for the normal retry interval.
+The separate GPS document survives bounded OBD-queue eviction during prolonged
+delivery failure, and idle sleep waits for its acknowledgment. A no-fix result
+releases the OBD backlog without inventing coordinates or numeric zero readings.
+
+Subsequent acquisition starts are due every ten minutes, measured from the
+previous acquisition start, after the initial attempt completes and the OBD
+queue drains. If the initial attempt found a fix, its upload must first be
+confirmed. A no-fix startup result permits periodic acquisition even before any
+upload succeeds. Each valid periodic fix also creates a GPS-only row and is sent
+independently of OBD replies; any such queued fix must be acknowledged before a
+further acquisition starts. NTP, active CAN replies, queued telemetry, LTE availability and
+modem ownership can defer a periodic acquisition. GNSS temporarily takes LTE offline.
+Before the first confirmed fix in a modem power cycle, each attempt searches for
+up to 60 seconds, measured from acknowledgment of `AT+QGPS=1`; after a valid fix,
+subsequent attempts use 30 seconds.
+A no-fix result keeps the longer budget for the next eligible attempt.
+The search deadline also applies to an in-flight location query; a late reply
+cannot publish a fix. The firmware stops GNSS at a known AT boundary, or resets
+the modem when a query is still awaiting its final response, then restores
+LTE/registration. Stop, reset and network reattachment take additional time
+after the search budget. OBD polling and CAN receive/validation continue during
+this process. Command errors or uncertain boundaries use bounded reset/boot recovery.
+
+A cached fix may accompany ordinary OBD batches as root `location` for up to ten
+minutes after receipt so LTE reattachment lasting over one minute does not
+discard it. Freshness is rechecked after TCP connection setup. No-fix and
+expired-fix paths omit `location`; no zero coordinates are substituted. Each
+acquisition begins with a cleared fix. Root `location` describes the timestamped
+GNSS fix for the envelope, independently of every queued historical OBD record.
+Each queued GPS-only row retains its original acquisition time across
+LTE recovery and rejected uploads, including delivery delayed beyond the cached
+fix's ten-minute lifetime.
 
 `location`: latitude/longitude (degrees), altitude_m, hdop, fix_type, satellites,
 utc_hhmmss, date_ddmmyy, age_ms, source=gnss. Use a compatible **passive** GNSS
-antenna. Hardware, firmware, antenna, RF, SIM and LTE reattachment need physical
-validation. GNSS and LTE are exclusive; the send cadence can lengthen.
+antenna. The dashboard validates the GNSS UTC/date, attaches root `location` to one
+record in the received batch and stores the actual fix time as `gps_timestamp`
+(`gpsTimestamp` in API responses). Its nullable database migration must be
+applied before running the updated dashboard. Existing record-level GPS payloads
+remain supported. HDOP remains dimensionless and is not converted to accuracy in
+meters. Direct per-record GPS, including the startup GPS-only row, is also
+accepted without an OBD measurement. The map can show the latest received fix
+and its acquisition time before any OBD response and retain it when later OBD
+records contain no GPS. Unavailable OBD values display as `-`.
+
+Concurrent startup GPS/OBD collection, buffered delivery, the ten-minute GNSS
+cadence, position accuracy and location delivery through the updated dashboard
+require physical validation. Hardware,
+firmware, antenna, RF, SIM and LTE reattachment remain relevant. GNSS and LTE are exclusive; the send
+cadence can lengthen.
 
 ## Hustler / CAN
 
@@ -101,14 +195,23 @@ out responses remain unknown until a valid positive telemetry reply is observed.
 Discovery resets when the CAN module is reinitialized.
 A 200 ms response deadline and 100 ms minimum request gap reject unrelated,
 wrong-ECU, wrong-PID, wrong-service and malformed single-frame payloads. A
-four-second acquisition window follows the existing ten-second group interval;
-no record is created until an accepted measurement has a valid timestamp.
+four-second acquisition window follows the existing ten-second group interval
+after the initial complete round; no OBD record is created until an accepted
+measurement has a valid timestamp.
+An accepted no-fault Mode 03 reply records DTC count `0` and code string `""`,
+including when it is the first acquisition in a row. An unanswered or rejected
+DTC request leaves those fields `null`. Before sending, the sketch removes rows
+whose ten OBD numeric fields and DTC result are all unavailable and which carry
+no valid GPS fix; a second transport guard refuses such unmarked rows. Removal waits for
+outstanding CAN replies to finish. A validated zero speed, temperature, RPM or
+other measurement is eligible for upload even when no other PID returned data.
+The startup GPS-only row is eligible independently of all PID responses.
 
-Root `obd.supported_pids` exposes support state; zero defaults in required fields
-are not unsupported measurements. `distance_traveled` (PID 31) is distance since
+Root `obd.supported_pids` exposes support state independently of each record's
+nullable readings. `distance_traveled` (PID 31) is distance since
 DTC clear, not odometer. PID A6 remains `odometer`. Existing Mode 03 DTC read is
 retained with selected-ECU, pending-request and single-frame validation; declared DTC count and SF length are checked, hexadecimal digits are preserved. Multiframe DTC is still
-marked MULTI and is not reassembled. No Mode 04 clear, other control service or
+marked MULTI with a `null` count and is not reassembled. No Mode 04 clear, other control service or
 ISO-TP flow-control frames are added or sent by the cellular example.
 
 UART receive supplies ID + eight bytes but no true DLC/IDE/RTR. Application length
@@ -119,10 +222,13 @@ failed sends retain records until that bound. No unverified DBC/ECU-role claims.
 
 ## Validation and remaining physical work
 
-Run `bash tests/ntp/run_tests.sh`, `bash tests/gnss/run_tests.sh`, and
-`bash tests/integration/run_tests.sh`. ArduinoJson 7.4.3 headers are required;
-set ARDUINOJSON_INCLUDE or install PlatformIO dependencies. The integration suite
-extracts and compiles current sketch functions and loop, not an old copied loop.
+Run `bash tests/cellular/run_tests.sh` with `ARDUINOJSON_INCLUDE` and
+`WIOCELLULAR_INCLUDE` pointing to installed libraries' `src` directories.
+The configured dependencies are ArduinoJson 7.4.3 and WioCellular 0.3.16; record
+the installed versions when validating with other compatible headers. This suite
+does not invoke the separate historical compatibility test, which reads Git
+history. The integration checks extract and compile current sketch functions and
+loop, not an old copied loop.
 Transport fixtures are WioCellular 0.3.16 at
 `9275de1d15f8bd2761f562b8895edc0ee9d1a1c5` with its MIT license.
 
@@ -137,16 +243,23 @@ compare telemetry/DTC/odometer with an independent scan tool. Test no ECU, multi
 ECUs, negative/late replies, ignition transitions, sustained bus load, missing NTP
 notifications, timezone rollover, HTTP fragmentation, no GNSS antenna/fix, slow
 TCP, LTE reattachment, modem recovery, no-network idle sleep, CAN wake and heartbeat.
-No real vehicle, board, antenna, SIM or ingest server was available for these tests.
+The archived integration tests below ran without a real vehicle, board, antenna,
+SIM or ingest server.
 
-## Recorded local result
+## Archived integration validation
+
+These results precede the ten-minute GNSS and empty-record guards described
+above. They establish the earlier integration baseline. Compile validation of
+the cellular example with those guards is recorded in
+[cellular delivery validation](cellular-send.md#validation); physical validation
+of the GPS and empty-record behavior remains outstanding.
 
 All three UBSan host suites PASS. All seven PlatformIO 6.2.0 profiles PASS.
 Combined default: RAM 12,516 / 237,568 bytes; flash 145,088 / 798,720 bytes.
 The framework emits its three existing ignored `used` attribute warnings in
 startup_nrf_common.c for each clean target build; there were no build errors.
-No independent agent review was performed. Physical/end-to-end ingest tests
-remain NOT RUN for the unavailable hardware and server listed above.
+The archived baseline did not include physical/end-to-end ingest tests because
+the hardware and server listed above were unavailable.
 
 ## Review follow-up: activity and receive deadlines
 
@@ -212,11 +325,62 @@ endings were normalized while editing it. No setting is automatically swept or
 changed on a live bus after a configuration failure; check stage logs and retry
 explicit initialization with the verified settings.
 
-### Ingest acknowledgments and empty heartbeat
+### Ingest acknowledgments and hourly heartbeat
 
-The actual sender now refuses empty `data[]` before opening a socket. The hourly
-heartbeat becomes a local pending flag/log and is satisfied only by a later accepted
-measured payload. No invented zero measurement is added to satisfy the server.
+The sender refuses empty `data[]` before opening a socket. It sends a separate
+heartbeat document at startup as soon as LTE, device identity and validated UTC
+are ready, then one hour after each acknowledged heartbeat:
+
+```json
+{"imsi":"<device identity>","data":[{"time":"2026-11-06T12:00:00+00:00","type":"heartbeat"}]}
+```
+
+The modem wakes for a due heartbeat even without CAN activity. Each idle sleep
+is capped at the remaining time to that deadline. Pending CAN replies, GNSS
+radio work, LTE reattachment and unavailable UTC defer the send until the shared
+modem and a validated clock are available. A failed or unconfirmed send retains
+the original heartbeat timestamp and retries at the normal 30-second interval.
+Only a positive heartbeat acknowledgment starts the next hour. Accepted OBD
+and GPS uploads do not reset that interval, discard a pending heartbeat or
+replace its retained timestamp. Queued measurement/GPS rows do not block a due
+heartbeat. A ready startup heartbeat is attempted before initial GNSS acquisition;
+an already active acquisition finishes before the heartbeat uses the radio.
+Heartbeats do not update the vehicle-activity timer or populate any measurement.
+
+The companion dashboard accepts only explicitly marked heartbeat rows without
+readings, saves their type, and shows them as `生存確認` on its data
+page together with the latest communication and heartbeat timestamps. The page
+retries initial device discovery and periodically checks for saved records even
+while WebSocket is connected. Unmarked
+timestamp-only rows remain invalid. Heartbeats are excluded from measurement
+charts and summaries. Apply the dashboard's additive heartbeat database migration
+and update the dashboard before flashing firmware that emits this record type.
+
+Local heartbeat validation on 2026-11-06 passed the safe cellular host suite
+(NTP, GNSS, startup, OBD, telemetry services, timestamp handling, ACK parsing,
+batching, record validation and UART driver). The final extracted-sketch suite
+passed its default case and 47 named scenarios, including fifteen heartbeat cases:
+immediate ready startup before GNSS, delayed UTC/identity/LTE readiness without
+waiting an hour, startup with queued measurements, an hourly schedule independent
+of accepted OBD/GPS uploads, retained heartbeat timestamps across measurement
+acknowledgments, delivery despite a rejected GPS upload, hourly wake/send,
+timestamp retention and retry, registration recovery, pending CAN responses,
+continued CAN polling after rejection and without LTE, and sleep deadlines
+across timer wrap.
+
+At startup the USB serial log reports `[HEARTBEAT] status=due reason=startup`.
+A supported positive response then produces `[HEARTBEAT] status=accepted`.
+`status=unconfirmed` means the timestamp remains pending for retry; an unavailable
+validated clock is reported as `status=deferred reason=UTC_unavailable`.
+
+The complete sketch also compiled with the installed Arduino toolchain for
+`SeeedJP:nrf52:wio_bg770a`, board version 1.0, core 1.5.0, WioCellular 0.3.12
+and ArduinoJson 7.4.2: 176,460 bytes of program storage and 12,732 bytes of global
+RAM. These installed library versions differ from the PlatformIO pins; the
+PlatformIO profiles were not rebuilt for heartbeat validation. Host socket and
+modem responses are simulated. No board was flashed and hourly physical
+delivery, deployed dashboard behavior and the database migration still require
+verification on the target system.
 
 [SORACOM's documented TCP reply](https://users.soracom.io/ja-jp/docs/unified-endpoint/settings/)
 is numeric status plus body. Unified status 207 means partial failure; 200 means
@@ -248,7 +412,7 @@ were not copied into tests, documentation or PR text. Fixtures use synthetic lab
 Host regressions cover startup scheduling, absent/negative/malformed/late bitmap,
 finite retries and legacy telemetry availability, known exclusions, configuration
 failure with no unconfigured transmission, actual UART command/legacy PID byte
-layout, empty 30-second send, deferred heartbeat, fragmented numeric 400/207/200,
+layout, empty 30-second send, fragmented numeric 400/207/200,
 unknown/truncated ACKs and prior arbitration/sleep/DTC deadline cases. All three
 host suites and seven target profiles passed locally. Latest main remains 93af604.
 **Physical retest of this patch: NOT DONE.** No board flashing or main merge was
@@ -279,33 +443,23 @@ No new vehicle response is claimed; corrected physical retest remains NOT DONE.
 
 ### Registration hold and startup diagnostics (follow-up)
 
-The supplied later vehicle excerpts show accepted telemetry and repeated CEREG
-queries, but contain neither the CEREG responses nor a complete 30-second send
-window. They do not establish a transport failure. Synthetic regression cases
-reproduce two parser defects: spaces after the query comma and a detailed,
-quoted-location URC arriving during a query. Both now retain correct registration
-semantics; actual response/location text is never logged. Registration uncertainty
-still blocks sending safely. A blocked call no longer consumes the next 30-second
-send opportunity, and optional new GNSS acquisition yields to queued telemetry.
-`LTE-HOLD`, `QUEUE-EVICT`, registration state and `CAN-BATCH` show the reason,
-cumulative oldest-record removal and normal four-second/ten-second cadence.
-The ten telemetry frames per sample are not ten queue records.
+The supplied vehicle excerpts show accepted telemetry and repeated CEREG
+queries, but contain neither the CEREG responses nor a complete send window.
+They do not establish a transport failure. The registration parser accepts
+optional whitespace after the prefix and comma. It keeps a quoted-location
+URC available to the network handler, validates numeric query mode/status and
+exposes only the parsed registration status. Main's defer paths keep an upload
+due while waiting for registration or an available modem. Periodic location,
+startup location and heartbeat retain their separate scheduling rules.
 
-The observed Mode03 `01 43 00 00 00 00 00 00` is retained as a regression that
-fails the required declared count-byte boundary. Padding outside PCI length does
-not prove zero DTCs. PID A6 receiving PID00 remains a PID mismatch, not odometer
-telemetry or proof of unsupported capability.
+`CAN-BATCH` reports collection start and pause; `QUEUE-EVICT` reports cumulative
+oldest-record removal without logging payloads. A CAN batch does not enqueue
+one record per frame. The supplied Mode03 `01 43 00 00 00 00 00 00` fails the
+declared count-byte boundary; padding does not establish zero DTCs. PID A6
+receiving PID00 remains a PID mismatch, not proof of unsupported capability.
 
-The four subsequent BOOT events were manual resets, as clarified by the user.
-Previously `Cellular bus initialized` printed before `begin`, `powerOn` and network
-wait. STARTUP logs now bracket each stage, print bounded wait settings and failure
-results before the existing stop. The dependency's powerOn may wait twice for
-APP RDY (20 seconds each), then performs flow-control setup; network wait is
-180 seconds. No new reset/power retry is introduced. Hardware cause is unproven.
-
-The serial viewer and device UTC differ, but the viewer has no date/timezone and
-message submission time is not a capture-time anchor. NTP-ANCHOR logs only strictly
-validated modem date/zone and the parser's UTC epoch (quarter-hour zone conversion),
-separately from session acceptance. No timezone correction is guessed from the
-excerpt. Absolute clock accuracy, network registration on this device, startup
-failure stage and delivery after this patch require physical retesting.
+The four subsequent BOOT events were manual resets as clarified by the user.
+The current CAN-first initialization, cellular retry on failure and validated
+NTP-SAMPLE diagnostics are retained. The serial viewer has no date/timezone
+anchor, and submission time is not capture time. Hardware cause, device
+registration, absolute UTC accuracy and delivery require physical retesting.

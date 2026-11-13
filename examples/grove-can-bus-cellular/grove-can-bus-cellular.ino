@@ -17,7 +17,10 @@
 #include <telemetry-time.h>
 #include <obd-session.h>
 #include <endpoint-ack.h>
+#include <telemetry-batch.h>
+#include <telemetry-record.h>
 #include <can-diagnostics.h>
+#include <cellular-startup.h>
 #include <obd-dtc.h>
 #include <functional>
 #include <utility>
@@ -48,6 +51,11 @@ static const char HOST[] = "uni.soracom.io";
 static constexpr int PORT = 23080;
 static constexpr int POWER_ON_TIMEOUT = 1000 * 20;     // [ms]
 static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 3;  // [ms]
+static constexpr uint32_t RADIO_OFF_TIMEOUT = 20000; // Registration polling, excluding AT command timeouts
+static constexpr uint32_t CELLULAR_RETRY_INTERVAL = 60000;
+// Conservative application batch size, below one BG770A QISEND (1460 bytes).
+// Plain TCP can still be segmented by the network; this is not message framing.
+static constexpr size_t CELLULAR_PAYLOAD_LIMIT = 1024;
 static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // [ms]
 static JsonDocument JsonDoc;
 //JsonObject vehicleData = JsonDoc.to<JsonObject>();
@@ -72,11 +80,25 @@ static constexpr unsigned long ABORT_TIME = 1000 * 60 * 5; // ABORTが発生し�
 WioCAN can;
 static bg770a::TelemetryServices Services;
 static bg770a::ObdSession Obd(OBD_CAN_EXTENDED, OBD_ALLOW_UNKNOWN_PIDS);
-static bool CanReady=false, TelemetryAttempted=false, HaveCanActivity=false, ModemSleeping=false, SynchronousModem=false;
+static bool CanReady=false, HaveCanActivity=false, ModemSleeping=false, SynchronousModem=false;
+enum class StartupLocationState { Pending, Acquiring, Upload, Complete };
+static StartupLocationState StartupLocation=StartupLocationState::Pending;
+static JsonDocument StartupLocationDoc;
+static bool StartupObdFlushPending=false;
+static bool StartupObdRoundComplete=false;
+static bool StartupObdUploadAttempted=false;
+static bool StartupLocationAttempted=false;
+static uint32_t StartupLocationLastAttempt=0;
+static bool CellularReady=false;
+static uint32_t LastCellularAttempt=0;
+static size_t LastSentRecords=0;
 static bg770a::CanDiagnostics CanStats;
 static bool DtcExpired=false;
 static bool DtcWaiting=false;
 static bool HeartbeatPending=false;
+static JsonDocument HeartbeatDoc;
+static uint32_t LastHeartbeatAck=0, LastHeartbeatAttempt=0;
+static bool HeartbeatAcknowledged=false, HeartbeatAttempted=false;
 static uint32_t DtcStarted=0;
 static uint32_t LastCanActivity=0;
 using ServiceHandler = decltype(std::declval<WioCellularModule&>().registerUrcHandler2(
@@ -88,8 +110,15 @@ void processDtcData(unsigned char*);
 String dtcToString(unsigned char, unsigned char);
 void updateVehicleData(unsigned char, unsigned char*);
 void clearData();
+static void clearSentData(size_t);
+static void discardEmptyVehicleRecords();
 static bool cellularSend(const JsonDocument&);
+static bool serviceHeartbeat();
+static uint32_t idleSleepDuration();
 static void initializeVehicleDataSchema();
+static bool queueStartupLocation();
+static bool dispatchServiceLine(const std::string& line);
+static bool serviceStartupLocation();
 bool getIMSI(char*);
 bool getTime(char*);
 String formatTime(char*);
@@ -100,12 +129,95 @@ void netPowerOffWait();
 template<typename T> void printData(T&, const void*, size_t);
 
 static bool canIdle() { return !Obd.waiting() && !DtcWaiting; }
+static bool cellularOnline() {
+  const int registration=Services.gnss.registrationStatus();
+  // A successful CEREG query can confirm recovery without a new network URC.
+  return registration<0 ? WioNetwork.getNetworkState()==WioCellularNetwork::NetworkState::Connected :
+                         registration==1 || registration==5;
+}
 static void trace(const char* event) {
   Serial.printf("[%lu ms] [%s] ",static_cast<unsigned long>(millis()),event);
   int64_t epoch;
   if(Services.clock.utc(Services.now(millis()),epoch)) {
     Serial.print(bg770a::isoUtc(epoch).c_str());Serial.print(" ");
   } else Serial.print("UTC=unsynced ");
+}
+static void logGpsDiagnostic() {
+  const auto& diagnostic=Services.gnss.diagnostic();
+  using E=bg770a::GnssSession::Event;
+  if(diagnostic.event==E::None)return;
+  if(diagnostic.event==E::FixAcquired) {
+    const auto& fix=Services.gnss.fix();
+    if(!fix.valid)return;
+    trace("GPS-FIX");Serial.printf("status=acquired gps_utc=%s latitude=%.6f longitude=%.6f altitude_m=%.1f hdop=%.1f satellites=%u fix_type=%u polls=%u elapsed_ms=%lu\n",
+      bg770a::gnssIsoUtc(fix).c_str(),fix.latitude,fix.longitude,fix.altitude,fix.hdop,
+      fix.satellites,fix.fix,diagnostic.pollCount,static_cast<unsigned long>(diagnostic.elapsedMs));
+    return;
+  }
+  if(diagnostic.event==E::AcquisitionStarted) {
+    trace("GPS-ACQUIRE");Serial.printf("status=started search_timeout_ms=%lu\n",
+      static_cast<unsigned long>(Services.gnss.acquisitionTimeoutMs()));return;
+  }
+  if(diagnostic.event==E::PollNoFix || diagnostic.event==E::PollError ||
+     diagnostic.event==E::InvalidResponse || diagnostic.event==E::DuplicateFix) {
+    const char* status=diagnostic.event==E::InvalidResponse?"invalid_response":
+      diagnostic.event==E::DuplicateFix?"duplicate_fix":
+      diagnostic.event==E::PollNoFix || diagnostic.cmeError==516?"no_fix":"modem_error";
+    trace("GPS-POLL");Serial.printf("status=%s cme_error=%d polls=%u elapsed_ms=%lu\n",
+      status,diagnostic.cmeError,diagnostic.pollCount,static_cast<unsigned long>(diagnostic.elapsedMs));return;
+  }
+  if(diagnostic.event==E::AcquisitionTimeout) {
+    trace("GPS-ACQUIRE");Serial.printf("status=no_fix_timeout cme_error=%d polls=%u elapsed_ms=%lu disabled=%u\n",
+      diagnostic.cmeError,diagnostic.pollCount,static_cast<unsigned long>(diagnostic.elapsedMs),unsigned(Services.gnss.disabled()));return;
+  }
+  static const char* const states[]={"Idle","Offline","Start","PollWait","Poll","Stop","Online",
+    "RestoreUrc","Registration","FlowControl","FlowSettle","ResetNeeded","BootWait","BootSettle"};
+  const char* status=diagnostic.event==E::CommandError?"command_error":
+    diagnostic.event==E::CommandTimeout?"command_timeout":
+    diagnostic.event==E::ReattachmentTimeout?"reattachment_timeout":"recovery";
+  trace("GPS-ERROR");Serial.printf("status=%s state=%s cme_error=%d polls=%u elapsed_ms=%lu disabled=%u\n",
+    status,states[unsigned(diagnostic.state)],diagnostic.cmeError,diagnostic.pollCount,
+    static_cast<unsigned long>(diagnostic.elapsedMs),unsigned(Services.gnss.disabled()));
+}
+static bool hasGpsPosition(JsonObjectConst record) {
+  if(!record["latitude"].is<double>() || !record["longitude"].is<double>())return false;
+  const double latitude=record["latitude"].as<double>(),longitude=record["longitude"].as<double>();
+  return std::isfinite(latitude) && latitude>=-90 && latitude<=90 &&
+    std::isfinite(longitude) && longitude>=-180 && longitude<=180;
+}
+static size_t gpsRowCount(const JsonDocument& doc) {
+  size_t count=0;
+  for(JsonObjectConst record:doc["data"].as<JsonArrayConst>())if(hasGpsPosition(record))++count;
+  return count;
+}
+static std::string gpsPayloadTime(JsonObjectConst record,bool rootLocation) {
+  if(!rootLocation) {
+    const char* timestamp=record["gps_time"].as<const char*>();int64_t epoch;
+    return timestamp && bg770a::parseHttpTime(timestamp,epoch)?timestamp:"unknown";
+  }
+  const char* utc=record["utc_hhmmss"].as<const char*>();
+  const char* date=record["date_ddmmyy"].as<const char*>();
+  if(!utc || !date || !bg770a::detail::utcValid(utc) || !bg770a::detail::dateValid(date))return "unknown";
+  bg770a::GnssFix fix;fix.valid=true;
+  std::memcpy(fix.utc,utc,sizeof(fix.utc));std::memcpy(fix.date,date,sizeof(fix.date));
+  return bg770a::gnssIsoUtc(fix);
+}
+static void logGpsPosition(const char* source,JsonObjectConst record,bool rootLocation=false) {
+  if(!hasGpsPosition(record))return;
+  trace("GPS-POSITION");Serial.printf("source=%s gps_utc=%s latitude=%.6f longitude=%.6f",
+    source,gpsPayloadTime(record,rootLocation).c_str(),record["latitude"].as<double>(),record["longitude"].as<double>());
+  const auto altitude=record[rootLocation?"altitude_m":"altitude"];
+  if(altitude.is<double>() && std::isfinite(altitude.as<double>()))Serial.printf(" altitude_m=%.1f",altitude.as<double>());
+  else Serial.print(" altitude_m=unknown");
+  if(rootLocation && record["age_ms"].is<unsigned long>())Serial.printf(" cache_age_ms=%lu",record["age_ms"].as<unsigned long>());
+  Serial.println();
+}
+static void logGpsPayload(const JsonDocument& batch) {
+  const bool rootLocation=hasGpsPosition(batch["location"].as<JsonObjectConst>());
+  trace("GPS-PAYLOAD");Serial.printf("direct_gps_rows=%u root_location=%u records=%u\n",
+    unsigned(gpsRowCount(batch)),unsigned(rootLocation),unsigned(batch["data"].size()));
+  for(JsonObjectConst record:batch["data"].as<JsonArrayConst>())logGpsPosition("record",record);
+  if(rootLocation)logGpsPosition("root_location",batch["location"].as<JsonObjectConst>(),true);
 }
 static const char* rejectionName(bg770a::ObdSession::Reject reason) {
   using R=bg770a::ObdSession::Reject;
@@ -151,29 +263,43 @@ static void canSummary() {
 
 static void serviceModem(bool allowNtp=true, bool allowGnss=false) {
   Services.now(millis());
-  if(ModemSleeping)return;
+  if(!CellularReady || ModemSleeping)return;
   for(int i=0;i<4;++i) WioCellular.doWork(0);
   if(SynchronousModem)return;
+  auto gpsSequence=Services.gnss.diagnostic().sequence;
   Services.tick(millis());
+  if(Services.gnss.diagnostic().sequence!=gpsSequence)logGpsDiagnostic();
   static int lastNtp=-1,lastGnss=-1;
   const int ntp=int(Services.ntp.phase()),gnss=int(Services.gnss.state());
   if(ntp!=lastNtp || gnss!=lastGnss) {
     trace("MODEM-STATE");const char* const ntpNames[]={"Idle","Echo","Ack","Result","Quarantined","Disabled"};
     const char* const gnssNames[]={"Idle","Offline","Start","PollWait","Poll","Stop","Online","RestoreUrc","Registration","FlowControl","FlowSettle","ResetNeeded","BootWait","BootSettle"};
-    Serial.printf("ntp=%s gnss=%s registered=%u clock=%s quality=%s\n",ntpNames[ntp],gnssNames[gnss],unsigned(Services.gnss.registered()),Services.clock.source(),Services.clock.quality(Services.now(millis())));
+    Serial.printf("ntp=%s gnss=%s clock=%s quality=%s\n",ntpNames[ntp],gnssNames[gnss],Services.clock.source(),Services.clock.quality(Services.now(millis())));
     lastNtp=ntp;lastGnss=gnss;
   }
   static int lastOnline=-1;
-  const bool online=WioNetwork.getNetworkState()==WioCellularNetwork::NetworkState::Connected;
+  const bool online=cellularOnline();
   if(lastOnline!=int(online)) {trace("LTE-STATE");Serial.printf("online=%u\n",unsigned(online));lastOnline=int(online);}
   // Never introduce command writes or a blocking reset into an OBD wait window.
   if(!canIdle())return;
   if(Services.gnss.state()==bg770a::GnssSession::State::ResetNeeded) {
+    trace("MODEM-RESET");Serial.printf("recovery requested; registration=%d; no pending OBD\n",Services.gnss.registrationStatus());
     WioCellular.getInterface().reset();
     Services.gnss.resetIssued(millis());
   }
+  const bool initialGnss=allowGnss && StartupLocation==StartupLocationState::Pending &&
+    StartupObdRoundComplete && StartupObdUploadAttempted && deviceIMSI[0];
+  const bool periodicGnss=allowGnss && !HeartbeatPending && StartupLocation==StartupLocationState::Complete && dataArray.size()==0;
+  gpsSequence=Services.gnss.diagnostic().sequence;
   const auto command=Services.command(millis(),WioNetwork.config.pdpContextId,online,
-                                      allowNtp,allowGnss && TelemetryAttempted && dataArray.size()==0);
+                                      allowNtp,initialGnss || periodicGnss);
+  if(Services.gnss.diagnostic().sequence!=gpsSequence)logGpsDiagnostic();
+  if((initialGnss || periodicGnss) && command=="AT+CFUN=4\r") {
+    StartupLocation=StartupLocationState::Acquiring;
+    StartupLocationAttempted=false;
+    trace("GPS-STARTUP");Serial.println(initialGnss ? "initial OBD round/upload finished; acquiring first location" :
+      "acquiring periodic location; fix will be uploaded independently of OBD");
+  }
   if(!command.empty()) {trace("MODEM-TX");Serial.println(command.c_str());WioCellular.writeBinary(command.data(),command.size());}
 }
 
@@ -220,10 +346,55 @@ static void cooperativeDelay(uint32_t duration) {
   do { serviceModem();serviceCan();delay(1); }
   while(uint32_t(millis()-start)<duration);
 }
+static bool initializeCellular() {
+  CellularReady=false;
+  const uint32_t started=millis();
+  trace("CELLULAR-POWER");Serial.println("powerOn starting; APP RDY timeout=20000 ms per attempt, plus library AT timeouts");
+  const auto powerResult=WioCellular.powerOn(POWER_ON_TIMEOUT);
+  trace("CELLULAR-POWER");Serial.printf("result=%s elapsed_ms=%lu\n",WioCellularResultToString(powerResult),static_cast<unsigned long>(millis()-started));
+  if(powerResult!=WioCellularResult::Ok) {
+    LastCellularAttempt=millis();
+    trace("CELLULAR-ERROR");Serial.println("powerOn failed; CAN continues, modem retry in 60 s");
+    return false;
+  }
+  Services.powerCycle();
+  CellularReady=bg770a::beginCellularNetwork(WioCellular,WioNetwork,RADIO_OFF_TIMEOUT,
+    []() -> uint32_t {return millis();},
+    [](uint32_t duration) {
+      const uint32_t began=millis();
+      do {WioCellular.doWork(10);serviceCan();delay(1);} while(uint32_t(millis()-began)<duration);
+    },
+    [](const char* stage,WioCellularResult result,int registration) {
+      trace("CELLULAR-INIT");Serial.printf("stage=%s result=%s registration=%d\n",stage,WioCellularResultToString(result),registration);
+    });
+  LastCellularAttempt=millis();
+  trace("CELLULAR-INIT");Serial.println(CellularReady ? "configuration complete; radio enabled" : "failed; CAN continues, modem retry in 60 s");
+  return CellularReady;
+}
+static bool waitForCellularNetwork(uint32_t timeout) {
+  const uint32_t started=millis();
+  uint32_t lastStatus=started;
+  bool first=true;
+  while(CellularReady) {
+    if(first || uint32_t(millis()-lastStatus)>=5000) {
+      first=false;lastStatus=millis();
+      trace("LTE-WAIT");Serial.printf("state=%s elapsed_ms=%lu timeout_ms=%lu\n",
+        WioCellularNetwork::networkStateToString(WioNetwork.getNetworkState()),
+        static_cast<unsigned long>(millis()-started),static_cast<unsigned long>(timeout));
+      if(WioNetwork.canCommunicate()) {trace("LTE-READY");Serial.println("PDP communication available");return true;}
+    }
+    if(uint32_t(millis()-started)>=timeout)break;
+    WioCellular.doWork(10);serviceCan();delay(1);
+  }
+  trace("LTE-TIMEOUT");Serial.println("continuing CAN; LTE registration will continue in the main loop");
+  return false;
+}
 static void attachFreshLocation() {
   JsonDoc.remove("location");
   const auto& fix=Services.gnss.fix();
-  if(!bg770a::isFresh(fix,millis()))return;
+  // LTE restoration can exceed one minute. Keep the actual GNSS UTC/date and
+  // age so the dashboard can show when this last-known position was acquired.
+  if(!bg770a::isFresh(fix,millis(),bg770a::GnssSession::RetryMs))return;
   JsonObject location=JsonDoc["location"].to<JsonObject>();
   location["latitude"]=fix.latitude;location["longitude"]=fix.longitude;
   location["altitude_m"]=fix.altitude;location["hdop"]=fix.hdop;
@@ -231,6 +402,105 @@ static void attachFreshLocation() {
   location["utc_hhmmss"]=fix.utc;location["date_ddmmyy"]=fix.date;
   location["age_ms"]=uint32_t(millis()-fix.receivedMillis);
   location["source"]="gnss";
+}
+
+static bool queueStartupLocation() {
+  const auto& fix=Services.gnss.fix();
+  const auto timestamp=bg770a::gnssIsoUtc(fix);
+  int64_t epoch;
+  if(timestamp.empty() || !bg770a::parseHttpTime(timestamp,epoch))return false;
+  StartupLocationDoc.clear();
+  StartupLocationDoc["imsi"]=deviceIMSI;
+  JsonObject record=StartupLocationDoc["data"].to<JsonArray>().add<JsonObject>();
+  bg770a::initializeObdFields(record);
+  record["time"]=bg770a::isoUtc(epoch);
+  record["gps_time"]=timestamp;
+  record["latitude"]=fix.latitude;record["longitude"]=fix.longitude;
+  record["altitude"]=fix.altitude;
+  record["time_source"]="gnss";record["time_sync_state"]="synced";
+  record["utc_epoch_s"]=epoch;
+  if(StartupLocationDoc.overflowed() || !bg770a::hasTelemetryMeasurement(record))return false;
+  trace("GPS-QUEUE");Serial.printf("status=queued gps_utc=%s records=1 retained_until_ack=1\n",timestamp.c_str());
+  logGpsPosition("queued",record);
+  return true;
+}
+
+static bool dispatchServiceLine(const std::string& line) {
+  const auto gpsSequence=Services.gnss.diagnostic().sequence;
+  const bool handled=Services.line(line,millis());
+  if(Services.gnss.diagnostic().sequence!=gpsSequence)logGpsDiagnostic();
+  // Capture a validated fix at the response boundary, before a later GNSS stop
+  // or LTE recovery failure can clear the session's live fix.
+  if(StartupLocation==StartupLocationState::Acquiring && queueStartupLocation()) {
+    StartupLocation=StartupLocationState::Upload;
+    StartupObdFlushPending=true;
+    trace("GPS-STARTUP");Serial.println("fix queued; waiting for LTE to send first");
+  }
+  if(line.compare(0,7,"+QNTP: ")==0) {
+    trace("NTP-RESULT");Serial.printf("source=%s quality=%s result=%s\n",Services.clock.source(),Services.clock.quality(Services.now(millis())),Services.clock.lastError());
+    // Print only a validated, fixed-length clock sample, never arbitrary URCs.
+    // This distinguishes modem clock digits from the timezone metadata and
+    // makes a future firmware-specific interpretation mismatch observable.
+    int64_t epoch;
+    if(line.size()==33 && line.compare(7,3,"0,\"")==0 && line.back()=='"' &&
+       ntp_candidate::parseQntpUtc(line.substr(10,22),epoch)) {
+      trace("NTP-SAMPLE");Serial.printf("response_time=%s interpreted_utc=%s\n",
+        line.substr(10,22).c_str(),bg770a::isoUtc(epoch).c_str());
+    }
+  }
+  return handled;
+}
+
+// GPS owns the modem during acquisition, while OBD polling keeps filling its
+// queue. A separate document retains each fix across LTE recovery/retries.
+// The return value holds OBD uploads, never PID requests or CAN collection.
+static bool serviceStartupLocation() {
+  if(StartupLocation==StartupLocationState::Complete)return false;
+  if(!Services.gnssEnabled) {StartupLocation=StartupLocationState::Complete;return false;}
+  serviceModem(true,true);
+  if(StartupLocation==StartupLocationState::Acquiring) {
+    if(queueStartupLocation()) {
+      StartupLocation=StartupLocationState::Upload;
+      StartupObdFlushPending=true;
+      trace("GPS-STARTUP");Serial.println("fix queued; waiting for LTE to send first");
+    } else if(Services.atIdle() || Services.gnss.disabled()) {
+      StartupLocation=StartupLocationState::Complete;
+      StartupObdFlushPending=true;
+      trace("GPS-STARTUP");Serial.println("no fix within bounded attempt; queued OBD due after LTE recovery");
+    }
+  }
+  if(StartupLocation==StartupLocationState::Pending && Services.gnss.disabled()) {
+    StartupLocation=StartupLocationState::Complete;
+    StartupObdFlushPending=true;
+    trace("GPS-STARTUP");Serial.println("GNSS unavailable after recovery; queued OBD due after LTE recovery");
+  }
+  if(StartupLocation==StartupLocationState::Upload && CellularReady && !ModemSleeping &&
+     canIdle() && Services.idle() && deviceIMSI[0] &&
+     (!StartupLocationAttempted || uint32_t(millis()-StartupLocationLastAttempt)>=CELLULAR_INTERVAL)) {
+    StartupLocationAttempted=true;StartupLocationLastAttempt=millis();
+    StartupLocationDoc["imsi"]=deviceIMSI;
+    if(cellularSend(StartupLocationDoc)) {
+      StartupLocationDoc.clear();StartupLocation=StartupLocationState::Complete;
+      trace("GPS-STARTUP");Serial.println("location acknowledged; OBD collection continues");
+    }
+  }
+  if(StartupLocation==StartupLocationState::Upload) {
+    static uint32_t lastWait=0;static const char* lastReason="";
+    const char* reason=!CellularReady?"modem_not_ready":ModemSleeping?"modem_sleeping":
+      !canIdle()?"OBD_response_pending":!Services.atIdle()?"modem_recovery_or_AT_busy":
+      !Services.gnss.canSend()?"lte_registration":!deviceIMSI[0]?"device_identity":"retry_interval";
+    if(std::strcmp(lastReason,reason)!=0 || uint32_t(millis()-lastWait)>=5000) {
+      lastWait=millis();lastReason=reason;
+      const uint32_t elapsed=uint32_t(millis()-StartupLocationLastAttempt);
+      const uint32_t retry=StartupLocationAttempted && elapsed<CELLULAR_INTERVAL?CELLULAR_INTERVAL-elapsed:0;
+      trace("GPS-UPLOAD");Serial.printf("status=waiting reason=%s registration=%d direct_gps_rows_pending=%u next_retry_ms=%lu retained=1\n",
+        reason,Services.gnss.registrationStatus(),unsigned(gpsRowCount(StartupLocationDoc)),static_cast<unsigned long>(retry));
+    }
+  }
+  // With no network/modem, retain startup intent while continuing CAN collection.
+  return StartupLocation==StartupLocationState::Acquiring ||
+    (StartupLocation==StartupLocationState::Pending &&
+     (!StartupObdRoundComplete || StartupObdUploadAttempted) && CellularReady && cellularOnline());
 }
 
 
@@ -267,46 +537,25 @@ void setup() {
 
   digitalWrite(LED_BUILTIN, HIGH);
 
-  Serial.println("Cellular bus initialized");
+  trace("CELLULAR-BEGIN");Serial.println("initializing board/modem interface");
   // Network configuration
   WioNetwork.config.searchAccessTechnology = SEARCH_ACCESS_TECHNOLOGY;
   WioNetwork.config.ltemBand = LTEM_BAND;
   WioNetwork.config.apn = APN;
-  trace("STARTUP");Serial.println("cellular begin starting");
   WioCellular.begin();
-  trace("STARTUP");Serial.printf("powerOn starting timeout_ms=%lu\n",(unsigned long)POWER_ON_TIMEOUT);
-  // Power on the cellular module
-  const auto powerResult=WioCellular.powerOn(POWER_ON_TIMEOUT);
-  trace("STARTUP");Serial.printf("powerOn finished result=%s\n",WioCellularResultToString(powerResult));
-  if(powerResult!=WioCellularResult::Ok) {Serial.println("STARTUP FAILED: modem powerOn; stopping before network/CAN initialization");abort();}
+  trace("CELLULAR-BEGIN");Serial.println("board/modem interface initialized");
+  // begin() switches Grove power off, so CAN must be initialized after it.
+  Serial.println("Initializing CAN bus before LTE connection");
+  initCAN();
   Services.ntpEnabled=TELEMETRY_NTP;
   Services.gnssEnabled=TELEMETRY_GNSS;
-  ServicesHandler=WioCellular.registerUrcHandler2([](const std::string& line) {
-    // Print only a strictly validated timestamp, never an arbitrary modem line.
-    if(line.size()==33 && line.compare(0,10,"+QNTP: 0,\"")==0 && line.back()=='"') {
-      int64_t epoch;
-      const auto stamp=line.substr(10,22);
-      if(ntp_candidate::parse(stamp,epoch)) {
-        trace("NTP-ANCHOR");Serial.printf("modem_date=%s parsed_utc_epoch_s=%lld zone_units=15min; acceptance follows session validation\n",stamp.c_str(),(long long)epoch);
-      }
-    }
-    const bool handled=Services.line(line,millis());
-    if(line.compare(0,7,"+QNTP: ")==0) {
-      trace("NTP-RESULT");Serial.printf("source=%s quality=%s result=%s\n",Services.clock.source(),Services.clock.quality(Services.now(millis())),Services.clock.lastError());
-    }
-    return handled;
-  });
-  trace("STARTUP");Serial.println("network begin starting");
-  WioNetwork.begin();
-  trace("STARTUP");Serial.printf("network wait starting timeout_ms=%lu\n",(unsigned long)NETWORK_TIMEOUT);
-  // Wait for communication available
-  if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) {
-    trace("STARTUP-FAILED");Serial.println("network wait timeout; stopping before CAN initialization");abort();
-  }
-  trace("STARTUP");Serial.println("network communication available");
-
-  Serial.println("CAN bus initialized");
-  initCAN();
+  ServicesHandler=WioCellular.registerUrcHandler2(dispatchServiceLine);
+  WioNetwork.abortHandler=[](const char* file,int line) {
+    trace("CELLULAR-ERROR");Serial.printf("network library AT failure at %s:%d\n",file,line);
+    abort();
+  };
+  if(initializeCellular())waitForCellularNetwork(NETWORK_TIMEOUT);
+  else Serial.println("LTE unavailable; CAN diagnostics remain active; timestamped records wait for UTC");
 
   char startupTime[64];
   // Preserve bounded HTTP fallback when NTP cannot provide a validated sample.
@@ -332,23 +581,103 @@ void setup() {
   Serial.println("========================================");
 }
 
+static bool serviceHeartbeat() {
+  if(!HeartbeatPending) {
+    if(HeartbeatAcknowledged && uint32_t(millis()-LastHeartbeatAck)<ACK_INTERVAL)return false;
+    HeartbeatPending=true;
+    trace("HEARTBEAT");Serial.printf("status=due reason=%s; awaiting idle modem, UTC and endpoint acknowledgment\n",
+      HeartbeatAcknowledged?"hourly":"startup");
+  }
+  // Finish radio acquisition before sending, but queued OBD/GPS records do not
+  // postpone an explicit startup/hourly heartbeat or consume its acknowledgment.
+  if(StartupLocation==StartupLocationState::Acquiring)return false;
+  if(!canIdle() || !Services.atIdle())return false;
+  if(ModemSleeping) {
+    netPowerOnRestart();
+    return true;
+  }
+  // Waiting for delivery must not stop acquiring later vehicle measurements.
+  // The main loop keeps polling CAN, but suppresses idle sleep while due.
+  if(!CellularReady || !Services.idle() || !deviceIMSI[0])return false;
+  if(HeartbeatAttempted && uint32_t(millis()-LastHeartbeatAttempt)<CELLULAR_INTERVAL)return false;
+  HeartbeatAttempted=true;LastHeartbeatAttempt=millis();
+  if(HeartbeatDoc["data"].size()==0) {
+    int64_t epoch;
+    if(!Services.clock.utc(Services.now(millis()),epoch)) {
+      char time[64];
+      if(!getTime(time) || !Services.clock.utc(Services.now(millis()),epoch)) {
+        LastHeartbeatAttempt=millis();
+        trace("HEARTBEAT");Serial.println("status=deferred reason=UTC_unavailable");
+        return true;
+      }
+    }
+    const auto timestamp=bg770a::isoUtc(epoch);
+    if(timestamp.empty())return true;
+    HeartbeatDoc.clear();
+    HeartbeatDoc["imsi"]=deviceIMSI;
+    JsonObject record=HeartbeatDoc["data"].to<JsonArray>().add<JsonObject>();
+    record["time"]=timestamp;record["type"]="heartbeat";
+  }
+  if(cellularSend(HeartbeatDoc)) {
+    HeartbeatDoc.clear();HeartbeatPending=false;HeartbeatAttempted=false;
+    trace("HEARTBEAT");Serial.println("status=accepted; next heartbeat due in one hour independently of measurement uploads");
+  } else {
+    LastHeartbeatAttempt=millis();
+    trace("HEARTBEAT");Serial.println("status=unconfirmed; timestamp retained for retry");
+  }
+  return true;
+}
+
+// Cap each idle sleep at the next heartbeat deadline, including repeated
+// ten-minute sleeps while the modem is already powered off.
+static uint32_t idleSleepDuration() {
+  if(!HeartbeatAcknowledged)return 0;
+  const uint32_t elapsed=uint32_t(millis()-LastHeartbeatAck);
+  if(elapsed>=ACK_INTERVAL)return 0;
+  const uint32_t remaining=ACK_INTERVAL-elapsed;
+  return remaining<uint32_t(POWER_OFF_INTERVAL)?remaining:uint32_t(POWER_OFF_INTERVAL);
+}
+
 void loop() {
   serviceCan();
+  if(Services.gnssEnabled && StartupLocation==StartupLocationState::Pending &&
+     !StartupObdRoundComplete && canIdle() && (!CanReady || Obd.initialRoundComplete())) {
+    StartupObdRoundComplete=true;
+    StartupObdFlushPending=true;
+    // A silent/unavailable ECU or missing UTC produces no measurement to send.
+    StartupObdUploadAttempted=dataArray.size()==0;
+    // Preserve this completed OBD row while later polling collects during GPS.
+    vehicleData=JsonObject();
+    trace("OBD-STARTUP");Serial.printf("status=%s records=%u; first OBD upload due before GPS\n",
+      CanReady ? "round_complete" : "CAN_unavailable",unsigned(dataArray.size()));
+  }
+  if(!CellularReady && canIdle() && Services.atIdle() && uint32_t(millis()-LastCellularAttempt)>=CELLULAR_RETRY_INTERVAL) {
+    initializeCellular();
+  }
   serviceModem();
   canSummary();
   if(HaveCanActivity && ModemSleeping && Services.atIdle() && canIdle())netPowerOnRestart();
-  if(canIdle() && Services.idle() && !ModemSleeping && !deviceIMSI[0] && getIMSI(deviceIMSI))JsonDoc["imsi"]=deviceIMSI;
+  if(CellularReady && canIdle() && Services.idle() && !ModemSleeping && !deviceIMSI[0] && getIMSI(deviceIMSI))JsonDoc["imsi"]=deviceIMSI;
+  if(serviceHeartbeat()) {cooperativeDelay(10);return;}
+  const bool startupLocationBusy=serviceStartupLocation();
+  if(!startupLocationBusy && StartupObdFlushPending && dataArray.size()==0 && canIdle())StartupObdFlushPending=false;
   static uint32_t lastClockRetry=millis();
-  if(canIdle() && Services.idle() && !ModemSleeping && uint32_t(millis()-lastClockRetry)>=60000 &&
+  if(!HeartbeatPending && CellularReady && canIdle() && Services.idle() && !ModemSleeping && uint32_t(millis()-lastClockRetry)>=60000 &&
       strcmp(Services.clock.source(),"unsynced")==0) {
     char time[64]; getTime(time);lastClockRetry=millis();
   }
   static uint32_t lastCellularSend=millis(), lastRotateSend=0, batchStarted=0;
-  static uint32_t lastDtcSend=millis(), lastDataReceivedTime=millis(), lastACKTime=millis();
+  static uint32_t lastDtcSend=millis(), lastDataReceivedTime=millis();
   static bool batch=false;
   const uint32_t now=millis();
+  // Finish any outstanding CAN reply, then give the startup backlog the next
+  // modem-idle window before beginning another PID or DTC request.
+  const bool flushReady=StartupObdFlushPending && !startupLocationBusy &&
+    dataArray.size()>0 && CellularReady && !ModemSleeping && Services.idle() && deviceIMSI[0];
+  const bool initialObdRound=Services.gnssEnabled && StartupLocation==StartupLocationState::Pending &&
+    !StartupObdRoundComplete;
   if(HaveCanActivity) { lastDataReceivedTime=LastCanActivity; HaveCanActivity=false; }
-  if(uint32_t(now-lastRotateSend)>=OBD_INTERVAL) {
+  if(!flushReady && (initialObdRound || uint32_t(now-lastRotateSend)>=OBD_INTERVAL)) {
     if(!batch) {
       vehicleData=JsonObject(); batch=true; batchStarted=now;
       trace("CAN-BATCH");Serial.println("begin 4000 ms sampling window");
@@ -365,12 +694,13 @@ void loop() {
       Serial.println(Obd.support(pid)==bg770a::Support::Unknown ? " (capability unknown)" : "");
     }
     // Allow discovery through PID A0 and all current telemetry within the batch.
-    if(uint32_t(now-batchStarted)>=4000 && !Obd.waiting()) {
+    if(uint32_t(now-batchStarted)>=4000 && !Obd.waiting() &&
+       (!initialObdRound || Obd.initialRoundComplete() || !CanReady)) {
       lastRotateSend=now;batch=false;
-      trace("CAN-BATCH");Serial.printf("pause; next window in %lu ms\n",(unsigned long)OBD_INTERVAL);
+      trace("CAN-BATCH");Serial.printf("pause; next window in %lu ms\n",static_cast<unsigned long>(OBD_INTERVAL));
     }
   }
-  if(uint32_t(now-lastDtcSend)>=DTC_INTERVAL && !Obd.waiting() && !DtcWaiting) {
+  if(!flushReady && uint32_t(now-lastDtcSend)>=DTC_INTERVAL && !Obd.waiting() && !DtcWaiting) {
     if(CanReady && Obd.selected())sendDtcRequest();
     lastDtcSend=now;
   }
@@ -390,20 +720,26 @@ void loop() {
   JsonDoc["time_sync_state"]=Services.clock.quality(Services.now(millis()));
 
   static bool deferLogged=false;
-  if(millis()-lastCellularSend>CELLULAR_INTERVAL && !canIdle()) {
+  const bool cellularDue=StartupObdFlushPending || uint32_t(millis()-lastCellularSend)>CELLULAR_INTERVAL;
+  if(cellularDue && !canIdle()) {
     ++CanStats.syncDeferred;
     if(!deferLogged) {trace("LTE-DEFER");Serial.println("OBD response pending; synchronous modem work postponed");deferLogged=true;}
   } else deferLogged=false;
-  if(millis() - lastCellularSend > CELLULAR_INTERVAL && Services.atIdle() && canIdle()) {
+  static uint32_t lastModemDefer=0;
+  if(cellularDue && canIdle() && !ModemSleeping &&
+      (!CellularReady || !Services.idle()) && uint32_t(millis()-lastModemDefer)>=5000) {
+    trace("LTE-DEFER");Serial.printf("reason=%s registration=%d queue=%u; send remains due\n",
+      !CellularReady?"modem_not_initialized":!Services.atIdle()?"AT_owner_busy":"registration_pending",
+      Services.gnss.registrationStatus(),unsigned(dataArray.size()));
+    lastModemDefer=millis();
+  }
+  if(!startupLocationBusy && cellularDue && CellularReady && Services.atIdle() && canIdle() &&
+      (Services.idle() || ModemSleeping || dataArray.size()==0)) {
+    discardEmptyVehicleRecords();
     if(arrayEmptyCheck(JsonDoc["data"])) {
       Serial.println("doc data is empty.");
       unsigned long emptyDuration = millis() - lastDataReceivedTime;
-      if(emptyDuration > DATA_EMPTY_TIMEOUT) { // DATA_EMPTY_TIMEOUT時間経過チェック
-        unsigned long lastACKDuration = millis() - lastACKTime;
-        if(lastACKDuration > ACK_INTERVAL && !HeartbeatPending) {
-          HeartbeatPending=true;
-          Serial.println("Heartbeat pending: ingest requires measured records; empty send deferred");
-        }
+      if(CellularReady && !HeartbeatPending && StartupLocation==StartupLocationState::Complete && emptyDuration > DATA_EMPTY_TIMEOUT) { // DATA_EMPTY_TIMEOUT時間経過チェック
         Serial.print("OBD2の受信データが");Serial.print(emptyDuration / 1000);Serial.println("秒間なかったためWioCellularとCAN BUSをOFFにします。");
         digitalWrite(PIN_VGROVE_ENABLE, VGROVE_ENABLE_OFF);
         netPowerOffWait();
@@ -423,11 +759,24 @@ void loop() {
       lastDataReceivedTime = millis(); // 最後にデータを受信した時刻を更新
       //lastDataReceivedDuration=0;
     }
-    // The ingest contract rejects data:[]; retain heartbeat intent locally.
-    if(dataArray.size()==0) { lastCellularSend=millis();cooperativeDelay(10);return; }
-    TelemetryAttempted=false;
-    if(cellularSend(JsonDoc)) { clearData();lastACKTime=millis();HeartbeatPending=false; } // 送信後、データをクリア
-    if(TelemetryAttempted)lastCellularSend = millis();
+    // Heartbeats use their own explicit timestamp-only document.
+    if(dataArray.size()==0) {
+      if(StartupObdRoundComplete)StartupObdUploadAttempted=true;
+      StartupObdFlushPending=false;lastCellularSend=millis();cooperativeDelay(10);return;
+    }
+    const bool delivered=cellularSend(JsonDoc);
+    if(StartupLocation==StartupLocationState::Pending && StartupObdRoundComplete && !StartupObdUploadAttempted) {
+      StartupObdUploadAttempted=true;
+      trace("OBD-STARTUP");Serial.printf("upload=%s; initial GPS eligible; unacknowledged records retained\n",
+        delivered ? "acknowledged" : "unconfirmed");
+    }
+    StartupObdFlushPending=false;
+    if(delivered) {
+      clearSentData(LastSentRecords);
+    }
+    lastCellularSend = millis();
+    // Drain accepted prefixes promptly; failures keep the normal retry interval.
+    if(delivered && dataArray.size()>0)lastCellularSend-=CELLULAR_INTERVAL-1000;
   }
   
   // Optional: Enable debug mode by sending commands through Serial monitor
@@ -476,7 +825,7 @@ String dtcToString(unsigned char highByte, unsigned char lowByte) {
 // DTCデータを処理
 void processDtcData(unsigned char* data) {
   if((data[0]&0xF0)==0x10) {
-    vehicleData["dtc_codes"]="MULTI";vehicleData["dtc_count"]=0;
+    vehicleData["dtc_codes"]="MULTI";vehicleData["dtc_count"]=nullptr;
     trace("DTC");Serial.println("multiframe unsupported; no reassembly/flow control");return;
   }
   if(!bg770a::dtcSingleFrame(data))return;
@@ -578,19 +927,27 @@ void clearData() {
   vehicleData=JsonObject();
   Serial.println("dataArrayをクリアしました。");
 }
+static void clearSentData(size_t count) {
+  if(count>dataArray.size())return;
+  const size_t removed=count;
+  while(count--)dataArray.remove(0);
+  vehicleData=JsonObject();
+  trace("QUEUE-ACK");Serial.printf("removed=%u remaining=%u\n",unsigned(removed),unsigned(dataArray.size()));
+}
 
 static bool cellularSend(const JsonDocument &doc) {
-  const char* blocked=!canIdle()?"OBD pending":!Services.atIdle()?"AT busy":
-    !Services.gnss.canSend()?"registration unconfirmed":!deviceIMSI[0]?"identity pending":
-    ModemSleeping?"modem sleeping":doc["data"].size()==0?"empty queue":nullptr;
-  if(blocked) {
-    static uint32_t last=0;static const char* previous=nullptr;
-    if(previous!=blocked || uint32_t(millis()-last)>=5000) {
-      trace("LTE-HOLD");Serial.println(blocked);last=millis();previous=blocked;
-    }
-    return false;
+  LastSentRecords=0;
+  const bool initialObdUpload=&doc==&JsonDoc && StartupLocation==StartupLocationState::Pending &&
+    StartupObdRoundComplete && !StartupObdUploadAttempted;
+  if(Services.gnssEnabled &&
+     (StartupLocation==StartupLocationState::Pending || StartupLocation==StartupLocationState::Acquiring) &&
+     !initialObdUpload && &doc!=&StartupLocationDoc && &doc!=&HeartbeatDoc)return false;
+  if(!CellularReady || !canIdle() || !Services.idle() || !deviceIMSI[0] || ModemSleeping || doc["data"].size()==0)return false;
+  // Enforce the invariant again at the transport boundary, including direct
+  // callers. The loop removes empty rows only after pending CAN replies finish.
+  for(JsonObjectConst record:doc["data"].as<JsonArrayConst>()) {
+    if(!bg770a::hasTelemetryRecord(record))return false;
   }
-  TelemetryAttempted=true;
   trace("LTE-SEND");Serial.printf("queue=%u; payload redacted\n",unsigned(doc["data"].size()));
   Serial.println("### Sending Combined Vehicle Data Object");
   Serial.print("Connecting ");
@@ -603,25 +960,39 @@ static bool cellularSend(const JsonDocument &doc) {
     trace("LTE-OPEN");Serial.println("starting synchronous socket open (no pending OBD)");
     if (!client.open(WioNetwork.config.pdpContextId, HOST, PORT)) {
       Serial.printf("ERROR: Failed to open %s\n", WioCellularResultToString(client.getLastResult()));
+      trace("GPS-UPLOAD");Serial.printf("status=open_failed direct_gps_rows_pending=%u retained=1\n",unsigned(gpsRowCount(doc)));
       return false;
     }
 
     trace("LTE-CONNECT");Serial.println("waiting for TCP connection (no pending OBD)");
     if (!client.waitForConnect()) {
       Serial.printf("ERROR: Failed to connect %s\n", WioCellularResultToString(client.getLastResult()));
+      trace("GPS-UPLOAD");Serial.printf("status=connect_failed direct_gps_rows_pending=%u retained=1\n",unsigned(gpsRowCount(doc)));
       return false;
     }
 
     Serial.print("Sending ");
     std::string str;
-    attachFreshLocation(); // A slow TCP connection may outlive fix freshness.
-    serializeJson(doc, str);
+    if(&doc==&JsonDoc)attachFreshLocation(); // A slow TCP connection may outlive fix freshness.
+    JsonDocument batch;
+    const size_t batchRecords=bg770a::makeTelemetryBatch(doc,batch,CELLULAR_PAYLOAD_LIMIT);
+    if(!batchRecords) {
+      trace("LTE-PAYLOAD");Serial.println("single record/envelope exceeds byte limit or allocation failed; retaining queue");
+      trace("GPS-UPLOAD");Serial.printf("status=batch_failed direct_gps_rows_pending=%u retained=1\n",unsigned(gpsRowCount(doc)));return false;
+    }
+    serializeJson(batch, str);
     Serial.print(str.size());Serial.print(" bytes (payload redacted)");
     Serial.println();
+    trace("LTE-BATCH");Serial.printf("records=%u total_queue=%u bytes=%u limit=%u\n",unsigned(batchRecords),unsigned(doc["data"].size()),unsigned(str.size()),unsigned(CELLULAR_PAYLOAD_LIMIT));
+    const size_t gpsRows=gpsRowCount(batch);
+    const bool rootLocation=hasGpsPosition(batch["location"].as<JsonObjectConst>());
+    logGpsPayload(batch);
     if (!client.send(str.data(), str.size())) {
       Serial.printf("ERROR: Failed to send socket %s\n", WioCellularResultToString(client.getLastResult()));
+      trace("GPS-UPLOAD");Serial.printf("status=send_failed direct_gps_rows_pending=%u root_location=%u retained=1\n",unsigned(gpsRows),unsigned(rootLocation));
       return false;
     }
+    trace("GPS-UPLOAD");Serial.printf("status=awaiting_ack direct_gps_rows=%u root_location=%u\n",unsigned(gpsRows),unsigned(rootLocation));
 
     Serial.println("Receiving");
     static uint8_t recvData[WioCellular.RECEIVE_SOCKET_SIZE_MAX];
@@ -629,27 +1000,54 @@ static bool cellularSend(const JsonDocument &doc) {
     const uint32_t began=millis();
     for(unsigned part=0;part<16 && uint32_t(millis()-began)<RECEIVE_TIMEOUT;++part) {
       size_t recvSize=0;
-      const int remaining=RECEIVE_TIMEOUT-int(uint32_t(millis()-began));
-      if(!client.receive(recvData,sizeof(recvData),&recvSize,remaining))return false;
+      const uint32_t elapsed=uint32_t(millis()-began);
+      if(elapsed>=RECEIVE_TIMEOUT)break;
+      const int remaining=RECEIVE_TIMEOUT-int(elapsed);
+      if(!client.receive(recvData,sizeof(recvData),&recvSize,remaining)) {
+        trace("LTE-RECEIVE");Serial.printf("result=%s; response unconfirmed, retaining queue\n",WioCellularResultToString(client.getLastResult()));break;
+      }
       if(recvSize==0) { ack.finish();break; }
-      if(ack.feed(recvData,recvSize)!=bg770a::EndpointAck::Result::Pending)break;
+      const auto result=ack.feed(recvData,recvSize);
+      if(result==bg770a::EndpointAck::Result::Accepted ||
+         (result==bg770a::EndpointAck::Result::Rejected && ack.diagnosticComplete()))break;
     }
     trace("LTE-ACK");Serial.print("Endpoint status: ");Serial.println(ack.status());
     if(ack.result()!=bg770a::EndpointAck::Result::Accepted) {
+      trace("LTE-REJECT");Serial.printf("status=%u reason=%s response_bytes=%u; response body redacted\n",ack.status(),ack.diagnostic(),unsigned(ack.receivedBytes()));
+      trace("GPS-ACK");Serial.printf("status=unconfirmed server_status=%u direct_gps_rows=%u root_location=%u retained=1\n",ack.status(),unsigned(gpsRows),unsigned(rootLocation));
       Serial.println("Endpoint rejected/unconfirmed; retaining records");return false;
     }
+    trace("GPS-ACK");Serial.printf("status=accepted server_status=%u direct_gps_rows=%u root_location=%u\n",ack.status(),unsigned(gpsRows),unsigned(rootLocation));
+    LastSentRecords=batchRecords;
 
   }
 
   Serial.println("### Completed");
 
+  if(&doc==&HeartbeatDoc) {
+    LastHeartbeatAck=millis();HeartbeatAcknowledged=true;
+  }
   return true;
+}
+
+static void discardEmptyVehicleRecords() {
+  size_t removed=0;
+  for(size_t n=dataArray.size();n>0;--n) {
+    if(!bg770a::hasTelemetryMeasurement(dataArray[n-1].as<JsonObjectConst>())) {
+      dataArray.remove(n-1);++removed;
+    }
+  }
+  if(removed) {
+    vehicleData=JsonObject();
+    trace("QUEUE-DROP-EMPTY");Serial.printf("removed=%u remaining=%u\n",unsigned(removed),unsigned(dataArray.size()));
+  }
 }
 
 static void initializeVehicleDataSchema() {
   if(dataArray.size()>=12) {
     static uint32_t evicted=0;
-    dataArray.remove(0);trace("QUEUE-EVICT");Serial.printf("oldest record removed; total=%lu capacity=12\n",(unsigned long)++evicted);
+    dataArray.remove(0);
+    trace("QUEUE-EVICT");Serial.printf("oldest record removed; total=%lu capacity=12\n",static_cast<unsigned long>(++evicted));
   }
   vehicleData = dataArray.add<JsonObject>(); // Preserve bounded latest samples
   trace("QUEUE-ADD");Serial.printf("records=%u\n",unsigned(dataArray.size()));
@@ -658,19 +1056,8 @@ static void initializeVehicleDataSchema() {
   int64_t epoch;
   if(Services.clock.utc(Services.now(millis()),epoch))vehicleData["utc_epoch_s"]=epoch;
   vehicleData["time"] = addMillisTime(); // 経過時間を計算して現在時刻を生成, String (ISO8601)
-  // Ingest API (Zod) expects every key present on each record; OBD updates overwrite below.
-  vehicleData["engine_rpm"] = 0;
-  vehicleData["vehicle_speed"] = 0;
-  vehicleData["coolant_temp"] = 0;
-  vehicleData["engine_load"] = 0;
-  vehicleData["intake_air_temp"] = 0;
-  vehicleData["throttle_position"] = 0;
-  vehicleData["distance_traveled"] = 0;
-  vehicleData["odometer"] = 0;
-  vehicleData["control_module_voltage"] = 0;
-  vehicleData["ambient_air_temp"] = 0;
-  vehicleData["dtc_codes"] = "";
-  vehicleData["dtc_count"] = 0;
+  // Only validated replies replace null; an acquired zero remains numeric zero.
+  bg770a::initializeObdFields(vehicleData);
 }
 
 template<typename T>
@@ -683,7 +1070,7 @@ void printData(T &stream, const void *data, size_t size) {
 
 // Get IMSI from SIM card
 bool getIMSI(char* imsi) {
-  if(!canIdle() || !Services.idle())return false;
+  if(!CellularReady || !canIdle() || !Services.idle())return false;
   trace("MODEM-IDENTITY");Serial.println("query starting; value remains redacted");
   Serial.println("Getting IMSI...");
   
@@ -792,9 +1179,9 @@ static bool getTimeFromWorldTimeApiHttp(char* time) {
 }
 
 bool getTime(char* time) {
-  if(!canIdle())return false;
+  if(!CellularReady || !canIdle())return false;
   trace("TIME");Serial.println("synchronization/fallback requested");
-  if(WioNetwork.getNetworkState()!=WioCellularNetwork::NetworkState::Connected)return false;
+  if(!cellularOnline())return false;
   const uint32_t start=millis();
   while(TELEMETRY_NTP && uint32_t(millis()-start)<135000) {
     serviceModem();serviceCan();
@@ -836,14 +1223,14 @@ bool arrayEmptyCheck(JsonArrayConst arr) { // doc["data"]のすべての要素�
 }
 
 void netPowerOffWait() {
-  if(!canIdle() || !Services.atIdle())return;
+  if(!CellularReady || !canIdle() || !Services.atIdle())return;
   trace("POWER-OFF");Serial.println("idle, no pending OBD");
   ModemSleeping=true;
   // Power off the cellular module
   // WioCellularがOFFになっているかどうか確かめる
   if (!WioCellular.getInterface().isActive()) {
     Serial.println("WioCellularはすでにOFFになっていたため、delay関数でPOWER_OFF_INTERVAL時間待ち、OFFを継続します。");
-    delay(POWER_OFF_INTERVAL);
+    delay(idleSleepDuration());
     return;
   }
   WioCellular.doWorkUntil(POWER_OFF_DELAY_TIME);
@@ -859,31 +1246,15 @@ void netPowerOffWait() {
 
   start = millis();
   Serial.print("WioCellular.doWorkUntil(POWER_OFF_INTERVAL)が開始されます。");Serial.println(start);
-  WioCellular.doWorkUntil(POWER_OFF_INTERVAL);  
+  WioCellular.doWorkUntil(idleSleepDuration());
   Serial.print("WioCellular.doWorkUntil(POWER_OFF_INTERVAL)完了にかかった時間(ms)");Serial.println(millis() - start);
 }
 
 void netPowerOnRestart() { // powerOnを開始する
   if(!canIdle())return;
   trace("POWER-ON");Serial.println("restarting modem; no pending OBD");
-  // Power on the cellular module
-  auto start = millis(); // 計測用
-  Serial.print("powerOn開始");Serial.println(start);
-  if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) abort();
-  Serial.print("powerOn完了にかかった時間(ms)");Serial.println(millis() - start);
-  
-  Services.powerCycle();
-  WioNetwork.begin();
-  start = millis();
-  Serial.print("ネットワーク再開を開始します。");Serial.println(start);
-  const bool networkFlag=WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT);
-  if (networkFlag) {
-    ModemSleeping=false;
-    Serial.print("ネットワークが再開できるまでの時間(ms)");Serial.println(millis() - start);
-  }
-  else{
-    Serial.print("ERROR: ネットワークが再開できませんでした。");Serial.println(millis());
-  }
+  ModemSleeping=false;
+  if(initializeCellular())waitForCellularNetwork(NETWORK_TIMEOUT);
 }
 
 void initCAN() {

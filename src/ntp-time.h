@@ -5,8 +5,10 @@
 // Strict modem NTP date parser and wrap-safe monotonic extension.
 namespace ntp_candidate {
 inline bool leap(int y) { return y % 4 == 0 && (y % 100 != 0 || y % 400 == 0); }
-inline bool parse(const std::string& s, int64_t& epoch) {
-  // QNTP payload, without enclosing quotes. Fail closed on all malformed fields.
+enum class CalendarBasis { Offset, Utc };
+inline bool parseCalendar(const std::string& s, int64_t& epoch, CalendarBasis basis) {
+  // Modem-style calendar grammar, without enclosing quotes. Validate the
+  // timezone indicator even when the command's clock digits are already UTC.
   if (s.size() != 22 || s[4]!='/' || s[7]!='/' || s[10]!=',' ||
       s[13]!=':' || s[16]!=':' || (s[19]!='+' && s[19]!='-')) return false;
   for (unsigned i=0;i<s.size();++i) {
@@ -24,8 +26,18 @@ inline bool parse(const std::string& s, int64_t& epoch) {
   for(int year=1970;year<y;++year) days+=365+leap(year);
   for(int month=1;month<m;++month) days+=mdays[month-1]+(month==2&&leap(y));
   days+=d-1;
-  epoch=days*86400+h*3600+min*60+sec-tz*15*60;
+  epoch=days*86400+h*3600+min*60+sec;
+  if(basis==CalendarBasis::Offset)epoch-=tz*15*60;
   return true;
+}
+// Offset-bearing civil time, used by the ISO HTTP fallback adapter.
+inline bool parse(const std::string& s, int64_t& epoch) {
+  return parseCalendar(s,epoch,CalendarBasis::Offset);
+}
+// BG770A QNTP supplies UTC clock digits with a separate timezone indicator.
+// Applying that indicator as an ISO offset subtracts the local offset twice.
+inline bool parseQntpUtc(const std::string& s, int64_t& epoch) {
+  return parseCalendar(s,epoch,CalendarBasis::Utc);
 }
 // Observe with every forward gap strictly below 2^31 ms (~24.85 days), including offline.
 // Half-range ordering distinguishes a real forward wrap from a stale sample.

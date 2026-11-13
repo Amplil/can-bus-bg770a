@@ -1,0 +1,22 @@
+{
+  "provenance": "Read from the Arduino IDE Serial Monitor on 2026-11-06. Narrow transcription of observed events only; no device identifiers, raw payload, or private response body. Not a post-fix capture.",
+  "events": [
+    {"local_time": "19:44:27.612", "millis": 28538, "kind": "lte_ready", "message": "PDP communication available"},
+    {"local_time": "19:44:28.032", "millis": 28924, "kind": "time_ready", "source": "ntp"},
+    {"local_time": "19:44:58.035", "millis": 58938, "kind": "send", "queue": 3, "payload_bytes": 1440, "tcp_open_and_connect_succeeded": true},
+    {"local_time": "19:44:59.152", "millis": 60049, "kind": "endpoint_status", "status": 400, "response_body_available": false, "queue_retained": true},
+    {"local_time": "19:44:59.152", "millis": 60054, "kind": "modem_command", "command": "AT+CFUN=4"},
+    {"local_time": "19:45:29.333", "millis": 90251, "kind": "modem_command", "command": "AT+QGPSEND"},
+    {"local_time": "19:45:29.379", "millis": 90257, "kind": "modem_command", "command": "AT+CFUN=1"},
+    {"local_time": "19:45:31.031", "millis": 91919, "kind": "modem_command", "command": "AT+CEREG=1"},
+    {"local_time": "19:45:31.350", "millis": 92260, "kind": "modem_command", "command": "AT+CEREG?"},
+    {"local_time": "19:45:31.381", "millis": 92275, "kind": "gnss_state", "state": "Idle", "raw_registration_status_available": false},
+    {"local_time": "19:48:01.885", "millis": 242770, "kind": "modem_command", "command": "AT+CEREG?"},
+    {"local_time": "19:48:04.368", "millis": 245271, "kind": "can_summary", "queue": 12, "tx_uart": 432, "telemetry": 381}
+  ],
+  "limits": [
+    "The 400 response reason was not printed by the running firmware.",
+    "The repeated registration polls establish a closed send gate, but do not distinguish actual deregistration from a parser error.",
+    "Synthetic diagnostic bodies, registration responses, and batching tests are not reconstructed field data."
+  ]
+}

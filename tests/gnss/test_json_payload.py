@@ -9,7 +9,16 @@ include = pathlib.Path(os.environ.get('ARDUINOJSON_INCLUDE', root / '.pio/libdep
 if not (include / 'ArduinoJson.h').exists():
     raise SystemExit('ArduinoJson missing: run PlatformIO build or set ARDUINOJSON_INCLUDE')
 sketch = (root / 'examples/grove-can-bus-cellular/grove-can-bus-cellular.ino').read_text()
-function = sketch[sketch.index('static void attachFreshLocation() {'):sketch.index('\nstatic void abortHandler')]
+start = sketch.index('static void attachFreshLocation() {')
+end = sketch.index('{', start) + 1
+depth = 1
+while depth:
+    if sketch[end] == '{':
+        depth += 1
+    elif sketch[end] == '}':
+        depth -= 1
+    end += 1
+function = sketch[start:end]
 source = r'''
 #include <ArduinoJson.h>
 #include <telemetry-services.h>
@@ -35,7 +44,12 @@ int main() {
   attachFreshLocation(); assert(JsonDoc["location"]["latitude"].as<double>()==35.12345);
   assert(JsonDoc["location"]["source"]=="gnss");
   nowMs=61000; attachFreshLocation(); assert(!JsonDoc["location"].isNull());
-  nowMs=61001; attachFreshLocation(); assert(JsonDoc["location"].isNull());
+  nowMs=121000; attachFreshLocation(); assert(!JsonDoc["location"].isNull());
+  assert(JsonDoc["location"]["age_ms"]==120000);
+  assert(JsonDoc["location"]["utc_hhmmss"]=="123456.000");
+  assert(JsonDoc["location"]["date_ddmmyy"]=="041126");
+  nowMs=601000; attachFreshLocation(); assert(!JsonDoc["location"].isNull());
+  nowMs=601001; attachFreshLocation(); assert(JsonDoc["location"].isNull());
   std::string payload; serializeJson(JsonDoc,payload);
   assert(payload.find("location")==std::string::npos);
   assert(JsonDoc["data"].size()==1); assert(JsonDoc["data"][0]["vehicle_speed"]==12);

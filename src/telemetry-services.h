@@ -3,7 +3,7 @@
 #include "gnss-session.h"
 namespace bg770a {
 // Shared AT owner, also used by the sketch: synchronous modem work is allowed
-// only when idle(). NTP has priority; GNSS begins only after telemetry attempted.
+// only when idle(). NTP has priority; the sketch schedules startup/periodic GNSS.
 class TelemetryServices {
  public:
   ntp_candidate::Uptime64 uptime;

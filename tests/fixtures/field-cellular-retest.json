@@ -1,0 +1,35 @@
+{
+  "provenance": "Read from Arduino IDE Serial Monitor after the user-approved firmware upload through COM3 on 2026-11-06. Narrow transcription, without identity, raw telemetry payload, or private response body.",
+  "events": [
+    {"local_time": "20:00:22.438", "millis": 69579, "kind": "batch", "records": 1, "queue": 3, "bytes": 762, "limit": 1024},
+    {"local_time": "20:00:23.226", "millis": 70388, "kind": "endpoint_status", "status": 200},
+    {"local_time": "20:00:23.226", "millis": 70393, "kind": "queue_ack", "removed": 1, "remaining": 2},
+    {"local_time": "20:00:24.352", "millis": 71497, "kind": "batch", "records": 1, "queue": 2, "bytes": 762, "limit": 1024},
+    {"local_time": "20:00:25.140", "millis": 72280, "kind": "endpoint_status", "status": 200},
+    {"local_time": "20:00:25.140", "millis": 72284, "kind": "queue_ack", "removed": 1, "remaining": 1},
+    {"local_time": "20:00:26.292", "millis": 73425, "kind": "batch", "records": 1, "queue": 1, "bytes": 761, "limit": 1024},
+    {"local_time": "20:00:27.062", "millis": 74188, "kind": "endpoint_status", "status": 200},
+    {"local_time": "20:00:27.062", "millis": 74192, "kind": "queue_ack", "removed": 1, "remaining": 0},
+    {"local_time": "20:00:27.062", "millis": 74195, "kind": "modem_command", "command": "AT+CFUN=4"},
+    {"local_time": "20:01:32.103", "millis": 139209, "kind": "send_deferred", "reason": "registration_pending", "registration": 0, "queue": 5},
+    {"local_time": "20:03:10.669", "millis": 237768, "kind": "gnss_state", "state": "BootSettle"},
+    {"local_time": "20:03:12.827", "millis": 239968, "kind": "modem_command", "command": "AT+IFC=2,2"},
+    {"local_time": "20:03:17.033", "millis": 244181, "kind": "lte_state", "online": true},
+    {"local_time": "20:03:27.058", "millis": 254180, "kind": "endpoint_status", "status": 200},
+    {"local_time": "20:03:27.058", "millis": 254186, "kind": "queue_ack", "removed": 1, "remaining": 10},
+    {"local_time": "20:03:28.991", "millis": 256113, "kind": "endpoint_status", "status": 200},
+    {"local_time": "20:03:31.182", "millis": 258312, "kind": "endpoint_status", "status": 200},
+    {"local_time": "20:03:33.247", "millis": 260347, "kind": "endpoint_status", "status": 200},
+    {"local_time": "20:03:33.247", "millis": 260352, "kind": "queue_ack", "removed": 1, "remaining": 7},
+    {"local_time": "20:05:06.015", "millis": 353151, "kind": "endpoint_status", "status": 200},
+    {"local_time": "20:05:07.936", "millis": 355072, "kind": "endpoint_status", "status": 200},
+    {"local_time": "20:05:09.856", "millis": 356977, "kind": "endpoint_status", "status": 200},
+    {"local_time": "20:05:09.856", "millis": 356981, "kind": "queue_ack", "removed": 1, "remaining": 0},
+    {"local_time": "20:05:09.856", "millis": 356992, "kind": "can_summary", "queue": 0}
+  ],
+  "limits": [
+    "Acknowledgments establish endpoint acceptance; the dashboard database was not independently queried.",
+    "Original 400 body and network packet boundaries were not captured.",
+    "No GNSS fix or persisted priority state is inferred from the trace."
+  ]
+}

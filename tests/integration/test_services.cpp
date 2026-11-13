@@ -25,7 +25,7 @@ int main(){
   inject(command+"\r\n+CEREG: 1\r\nOK\r\n");assert(other==1);assert(!s.idle());
   assert(s.command(nowMs=2,1,true,true,true).empty()); // wait for QNTP result before GNSS
   inject("+QNTP: 0,\"2026/11/05,10:00:00+36\"\r\n");assert(s.idle());
-  int64_t epoch;assert(s.clock.utc(s.now(2),epoch));assert(bg770a::isoUtc(epoch)=="2026-11-05T01:00:00+00:00");
+  int64_t epoch;assert(s.clock.utc(s.now(2),epoch));assert(bg770a::isoUtc(epoch)=="2026-11-05T10:00:00+00:00");
   nowMs=3;assert(s.command(nowMs,1,true,true,true)=="AT+CFUN=4\r");assert(!s.idle());
   assert(s.command(nowMs=4,1,true,true,true).empty());
   inject("AT+CFUN=4\r\r\nOK\r\n");assert(s.command(nowMs=4,1,false,true,true)=="AT+QGPS=1\r");
@@ -63,6 +63,8 @@ int main(){
   assert(s.command(nowMs=0,1,true,true,true).empty());assert(s.idle());}
  int64_t e;assert(bg770a::parseHttpTime("2024-02-29T23:59:59.123+09:00",e));
  assert(bg770a::isoUtc(e+1)=="2024-02-29T15:00:00+00:00");
+ assert(bg770a::parseHttpTime("2026-11-06T22:01:57+09:00",e));
+ assert(bg770a::isoUtc(e)=="2026-11-06T13:01:57+00:00");
  assert(!bg770a::parseHttpTime("2023-02-29T00:00:00+09:00",e));
  assert(!bg770a::parseHttpTime("2024-01-01T00:00:00+99:99",e));
  assert(!bg770a::parseHttpTime("2024-01-01T00:00:00x+09:00",e));

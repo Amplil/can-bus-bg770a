@@ -69,7 +69,7 @@ public:
     if(payload.empty() || payload[0]<'0' || payload[0]>'9') return true;
     result_=true; receivedMono_=now;
     resultOk_=payload.size()==26 && payload.compare(0,3,"0,\"")==0 &&
-              payload.back()=='"' && parse(payload.substr(3,22),receivedEpoch_);
+              payload.back()=='"' && parseQntpUtc(payload.substr(3,22),receivedEpoch_);
     finish(now);
     return true;
   }

@@ -71,6 +71,7 @@ assert(can.receive(&id,data));for(int i=3;i>=0;--i)Serial1.tx.push_back((id>>(i*
         source=r'''
 #include <ArduinoJson.h>
 #include <telemetry-services.h>
+#include <telemetry-record.h>
 #include <cmath>
 #include <iostream>
 #include <string>
@@ -98,6 +99,10 @@ struct Logger{template<class... T>void printf(T...){}} Serial;
     a,b=schemas
     assert set(a)==set(b)=={'imsi','data'}
     old,new=a['data'][0],b['data'][0]
-    assert all(key in new and new[key]==value and type(new[key]) is type(value) for key,value in old.items()),'Required schema/value/type drift against real main'
+    dtc_fields={'dtc_codes','dtc_count'}
+    assert old['dtc_codes']=='' and old['dtc_count']==0
+    # Current main keeps DTC values unknown until a Mode03 reply is measured.
+    assert all(key in new and new[key] is None for key in dtc_fields)
+    assert all(key in new and new[key]==value and type(new[key]) is type(value) for key,value in old.items() if key not in dtc_fields),'Measured schema/value/type drift against pinned main'
     assert set(new)-set(old)=={'time_source','time_sync_state','utc_epoch_s'}
-print('Pinned main 93af604 versus current: all Mode01/config UART bytes, 12-byte RX, PID order and required JSON values/types match; sole Mode03 byte difference is PCI 02 -> 01. Synthetic host fixtures only.')
+print('Pinned main 93af604 versus current: all Mode01/config UART bytes, 12-byte RX, PID order and measured JSON values/types match; unmeasured DTC fields are null, sole Mode03 byte difference is PCI 02 -> 01. Synthetic host fixtures only.')

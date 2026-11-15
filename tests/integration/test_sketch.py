@@ -1347,6 +1347,7 @@ int main(int argc,char** argv){
  for(unsigned n=0;n<130;++n) { initializeVehicleDataSchema(Services.now(millis())); }
  assert(dataArray.size()==120);
  assert(logCount("[QUEUE-DROP-OLDEST]")==10);
+ assert(Serial.output.find("oldest record removed; total=10 capacity=120") != std::string::npos);
  clearData();assert(dataArray.size()==0 && vehicleData.isNull());
  attachFreshLocation();assert(JsonDoc["location"].isNull());
  assert(JsonDoc["obd"]["distance_traveled_meaning"]=="distance_since_dtc_clear");

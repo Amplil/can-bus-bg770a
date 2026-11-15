@@ -17,6 +17,8 @@ int main(){
  data[2]=0;data[0]=5;assert(!s.accept(0x7E8,data,8,4));assert(s.rejection()==S::Reject::Length);
  data[0]=6;assert(!s.accept(0x7E8,data,8,200));assert(s.rejection()==S::Reject::Deadline);assert(s.takeTimeout());assert(!s.takeTimeout());
  const uint8_t one[]={4,0x43,1,0x01,0xAF,0,0,0};assert(bg770a::dtcSingleFrame(one));
+ // Exact supplied vehicle frame: service-only declaration contains no count.
+ const uint8_t fieldShort[]={1,0x43,0,0,0,0,0,0};assert(!bg770a::dtcSingleFrame(fieldShort));
  const uint8_t zero[]={2,0x43,0,0,0,0,0,0};assert(bg770a::dtcSingleFrame(zero));
  const uint8_t two[]={6,0x43,2,0x01,0xAF,0xC0,0x10,0};assert(bg770a::dtcSingleFrame(two));
  const uint8_t uncouned[]={3,0x43,0x01,0xAF,0,0,0,0};assert(!bg770a::dtcSingleFrame(uncouned));

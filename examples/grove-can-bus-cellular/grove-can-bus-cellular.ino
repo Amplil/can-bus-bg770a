@@ -680,6 +680,7 @@ void loop() {
   if(!flushReady && (initialObdRound || uint32_t(now-lastRotateSend)>=OBD_INTERVAL)) {
     if(!batch) {
       vehicleData=JsonObject(); batch=true; batchStarted=now;
+      trace("CAN-BATCH");Serial.println("begin 4000 ms sampling window");
       if(!CanReady)Serial.println("CAN polling disabled: module configuration unconfirmed");
     }
     unsigned char pid;
@@ -696,6 +697,7 @@ void loop() {
     if(uint32_t(now-batchStarted)>=4000 && !Obd.waiting() &&
        (!initialObdRound || Obd.initialRoundComplete() || !CanReady)) {
       lastRotateSend=now;batch=false;
+      trace("CAN-BATCH");Serial.printf("pause; next window in %lu ms\n",static_cast<unsigned long>(OBD_INTERVAL));
     }
   }
   if(!flushReady && uint32_t(now-lastDtcSend)>=DTC_INTERVAL && !Obd.waiting() && !DtcWaiting) {
@@ -1042,7 +1044,11 @@ static void discardEmptyVehicleRecords() {
 }
 
 static void initializeVehicleDataSchema() {
-  if(dataArray.size()>=12)dataArray.remove(0);
+  if(dataArray.size()>=12) {
+    static uint32_t evicted=0;
+    dataArray.remove(0);
+    trace("QUEUE-EVICT");Serial.printf("oldest record removed; total=%lu capacity=12\n",static_cast<unsigned long>(++evicted));
+  }
   vehicleData = dataArray.add<JsonObject>(); // Preserve bounded latest samples
   trace("QUEUE-ADD");Serial.printf("records=%u\n",unsigned(dataArray.size()));
   vehicleData["time_source"]=Services.clock.source();

@@ -232,8 +232,8 @@ public:
   }
   bool line(const std::string& text, uint32_t now) {
     // Observe but do not swallow registration notifications needed by WioNetwork.
-    if (text.compare(0,8,"+CEREG: ") == 0) {
-      const std::string value = text.substr(8);
+    if (text.compare(0,7,"+CEREG:") == 0) {
+      const std::string value = text.substr(7);
       const auto comma=value.find(',');
       if (state_ == State::Registration && echo_ && comma != std::string::npos) {
         auto second=comma+1;

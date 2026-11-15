@@ -320,6 +320,18 @@ int main() {
     assert(restored.canSend() && restored.state()==GnssSession::State::Idle);
   }
 
+  // Synthetic responses: optional spaces and a detailed URC during a query.
+  GnssSession noPrefixSpace;
+  noPrefixSpace.line("+CEREG:0",0);noPrefixSpace.tick(5000);
+  assert(noPrefixSpace.takeCommand()=="AT+CEREG?\r");
+  noPrefixSpace.line("AT+CEREG?",5000);
+  assert(noPrefixSpace.line("+CEREG:1, 5",5001));
+  noPrefixSpace.line("OK",5002);assert(noPrefixSpace.canSend() && noPrefixSpace.registrationStatus()==5);
+  noPrefixSpace.line("+CEREG: 0",5003);noPrefixSpace.tick(10003);
+  noPrefixSpace.takeCommand();noPrefixSpace.line("AT+CEREG?",10003);
+  assert(!noPrefixSpace.line("+CEREG:1,\"1234\",\"5678\",7",10004));
+  noPrefixSpace.line("OK",10005);assert(noPrefixSpace.canSend() && noPrefixSpace.registrationStatus()==1);
+
   GnssSession registrationError;
   registrationError.line("+CEREG: 0",0); registrationError.tick(5000);
   answer(registrationError,"AT+CEREG?",5000,"ERROR");

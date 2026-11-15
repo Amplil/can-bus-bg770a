@@ -454,7 +454,10 @@ startup location and heartbeat retain their separate scheduling rules.
 
 `CAN-BATCH` reports collection start and pause; `QUEUE-EVICT` reports cumulative
 oldest-record removal without logging payloads. A CAN batch does not enqueue
-one record per frame. The supplied Mode03 `01 43 00 00 00 00 00 00` fails the
+one record per frame in the original main implementation. The response-receipt
+change now queues one sparse record per accepted Mode01/Mode03 response, with
+a 120-record bound and immutable millisecond receipt time; see
+[the response timestamp contract](response-receipt-timestamps.md). The supplied Mode03 `01 43 00 00 00 00 00 00` fails the
 declared count-byte boundary; padding does not establish zero DTCs. PID A6
 receiving PID00 remains a PID mismatch, not proof of unsupported capability.
 

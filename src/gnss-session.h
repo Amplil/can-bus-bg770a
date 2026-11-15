@@ -29,7 +29,7 @@ private:
   State state_ = State::Idle;
   uint32_t since_ = 0, acquisition_ = 0, lastAttempt_ = 0;
   bool attempted_ = false, disabled_ = false, pendingWrite_ = false;
-  bool hasAcquiredFix_ = false;
+  bool hasAcquiredFix_ = false, resumeAfterRecovery_ = false;
   bool echo_ = false, registered_ = true, queryRegistered_ = false;
   uint32_t lastRegistrationPoll_ = 0;
   uint32_t reattachmentStarted_ = 0;
@@ -94,6 +94,18 @@ private:
            state_ == State::Stop || state_ == State::Online || state_ == State::RestoreUrc ||
            state_ == State::Registration || state_ == State::FlowControl;
   }
+  void confirmRegistration(uint32_t now) {
+    if(!registered_ || !modemIdle())return;
+    awaitingReattachment_=false;
+    if(resumeAfterRecovery_) {
+      // Only completed recovery commands can reach Idle here. An explicit
+      // ERROR has a known AT boundary; uncertain outcomes still require reset.
+      // A later registration URC is as valid as the initial successful query.
+      disabled_=false;resumeAfterRecovery_=false;
+      attempted_=true;lastAttempt_=now;
+      report(Event::Recovery,now);
+    }
+  }
   void resetNeeded() {
     fix_ = GnssFix{}; candidate_ = GnssFix{}; registered_ = false;
     awaitingReattachment_ = false;
@@ -115,11 +127,11 @@ private:
     switch (state_) {
     case State::Offline:
       if (ok) command(State::Start, "AT+QGPS=1", now);
-      else { disabled_ = true; command(State::Online, "AT+CFUN=1", now); }
+      else { disabled_ = true; resumeAfterRecovery_=true; command(State::Online, "AT+CFUN=1", now); }
       break;
     case State::Start:
       if (ok) { state_ = State::PollWait; acquisition_ = since_ = now; }
-      else { disabled_ = true; command(State::Stop, "AT+QGPSEND", now); }
+      else { disabled_ = true; resumeAfterRecovery_=true; command(State::Stop, "AT+QGPSEND", now); }
       break;
     case State::Poll:
       lastPollError_=ok ? -1 : cmeError;
@@ -157,7 +169,7 @@ private:
     case State::Registration:
       if (ok) { registered_ = queryRegistered_; state_ = State::Idle;
         registrationStatus_=queryRegistrationStatus_;
-        if(registered_)awaitingReattachment_=false;
+        confirmRegistration(now);
         lastRegistrationPoll_ = now; }
       else resetNeeded();
       break;
@@ -198,7 +210,7 @@ public:
   // Call after physically resetting the modem. Never send AT across an unknown
   // timed-out transaction boundary. A hardware reset establishes a new boundary.
   void resetIssued(uint32_t now) {
-    state_ = State::BootWait; since_ = now;
+    state_ = State::BootWait; since_ = now;resumeAfterRecovery_=true;
     registrationStatus_=-1;queryRegistrationStatus_=-1;awaitingReattachment_=false;
   }
   void tick(uint32_t now) {
@@ -207,7 +219,7 @@ public:
       report(Event::CommandTimeout,now);resetNeeded();return;
     }
     // Returning from GNSS must not leave queued telemetry waiting forever for
-    // LTE reattachment. Recovery disables optional GNSS for the rest of the boot.
+    // LTE reattachment. Unknown command outcomes require physical reset before retry.
     if(awaitingReattachment_ && !registered_ &&
        uint32_t(now-reattachmentStarted_)>=ReattachmentMs) {
       report(Event::ReattachmentTimeout,now);resetNeeded();return;
@@ -253,7 +265,7 @@ public:
       int status=-1;
       if(!registrationToken(value,0,comma==std::string::npos?value.size():comma,status))return false;
       registrationStatus_=status;registered_=status==1 || status==5;
-      if(registered_ && modemIdle())awaitingReattachment_=false;
+      confirmRegistration(now);
       if (state_ == State::Registration && echo_) {
         queryRegistered_=registered_;queryRegistrationStatus_=status;
       }

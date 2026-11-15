@@ -73,6 +73,13 @@ public:
     finish(now);
     return true;
   }
+  // Millisecond resolution is not a claim of NTP/network accuracy. The UTC
+  // anchor remains the received whole-second sample, including across resync.
+  bool utcMilliseconds(uint64_t now, int64_t& epochMs) const {
+    if(!valid_ || now<anchorMono_)return false;
+    epochMs=anchorEpoch_*1000+static_cast<int64_t>(now-anchorMono_);
+    return true;
+  }
   bool utc(uint64_t now, int64_t& epoch) const {
     if(!valid_ || now<anchorMono_) return false;
     epoch=anchorEpoch_+static_cast<int64_t>((now-anchorMono_)/1000);
